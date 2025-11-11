@@ -1,24 +1,23 @@
-# mlx-swift-lm
+# MLX Swift LM
 
-`mlx-swift-lm` is a Swift package for can be used to build
-tools and applications using large language models (LLMs) and visual language 
-models (VLMs) implemented with MLX.
+MLX Swift LM is a Swift package to build tools and applications with large
+language models (LLMs) and vision language models (VLMs) in [MLX Swift]((https://github.com/ml-explore/mlx-swift).
 
 Some key features include:
 
 - Integration with the Hugging Face Hub to easily use thousands of LLMs with a single command.
-- Low-rank and full model fine-tuning with support for quantized models.
-- Many model architectures for both LLM and VLMs.
+- Low-rank (LoRA) and full model fine-tuning with support for quantized models.
+- Many model architectures for both LLMs and VLMs.
 
-- [MLX Swift](https://github.com/ml-explore/mlx-swift) -- Swift version of MLX
-- [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples) -- Example applications and tools that use `mlx-swift-lm`
+For some example applications and tools that use MLX Swift LM check out
+the [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples).
 
-# Using mlx-swift-lm
+# Using MLX Swift LM
 
 The MLXLLM, MLXVLM, MLXLMCommon, and MLXEmbedders libraries are available
 as Swift Packages.
 
-Add the following dependency to your Package.swift
+Add the following dependency to your Package.swift:
 
 ```swift
 .package(url: "https://github.com/ml-explore/mlx-swift-lm/", branch: "main"),
@@ -40,13 +39,14 @@ Then add one or more libraries to the target as a dependency:
     ]),
 ```
 
-Alternatively, add `https://github.com/ml-explore/mlx-swift-lm/` to the `Project Dependencies` and set the `Dependency Rule` to `Branch` and `main` in Xcode.
+Alternatively, add `https://github.com/ml-explore/mlx-swift-lm/` to the
+`Project Dependencies` and set the `Dependency Rule` to `Branch` and `main` in
+Xcode.
 
 # Quick Start
 
-See also [MLXLMCommon](Libraries/MLXLMCommon).  You can easily use
-a wide variety of open weight LLM and VLMs in your code.  You can use
-this simplified API:
+See also [MLXLMCommon](Libraries/MLXLMCommon). You can get started with a wide
+variety of open weights LLMs and VLMs using this simplified API:
 
 ```swift
 let model = try await loadModel(id: "mlx-community/Qwen3-4B-4bit")
@@ -66,9 +66,3 @@ Developers can use these examples in their own programs -- just import the swift
 - [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm) -- large language model example implementations
 - [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm) -- vision language model example implementations
 - [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders) -- popular Encoders / Embedding models example implementations
-
-
-# MLX Swift Examples
-
-See also [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples) for
-a variety of command line tools and applications that make use of these libraries.
