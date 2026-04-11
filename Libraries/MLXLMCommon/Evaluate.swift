@@ -1508,6 +1508,27 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
     )
 }
 
+/// Compatibility overload that preserves the original public signature.
+///
+/// This forwards to ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:tools:wiredMemoryTicket:)``
+/// with `tools` unset.
+public func generateTask(
+    promptTokenCount: Int,
+    modelConfiguration: ModelConfiguration,
+    tokenizer: Tokenizer,
+    iterator: consuming TokenIterator,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) -> (AsyncStream<Generation>, Task<Void, Never>) {
+    generateTask(
+        promptTokenCount: promptTokenCount,
+        modelConfiguration: modelConfiguration,
+        tokenizer: tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        tools: nil
+    )
+}
+
 /// Generates raw token IDs asynchronously using the provided language model input, parameters, and context.
 ///
 /// This is similar to `generate(input:cache:parameters:context:)`, but yields raw token IDs instead of decoded text/tool calls.
@@ -1983,8 +2004,8 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
                 }
             }
 
-            // Check if we have a complete tool call.
-            if let toolCall = toolCallProcessor.toolCalls.popLast() {
+            // Emit all complete tool calls in parse order.
+            for toolCall in toolCallProcessor.drainToolCalls() {
                 if case .terminated = emit(.toolCall(toolCall)) {
                     return false
                 }
@@ -2004,9 +2025,15 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
-        toolCallProcessor.processEOS()
+        if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
+            !bufferedText.isEmpty
+        {
+            if case .terminated = emit(.chunk(bufferedText)) {
+                return
+            }
+        }
 
-        for toolCall in toolCallProcessor.toolCalls {
+        for toolCall in toolCallProcessor.drainToolCalls() {
             if case .terminated = emit(.toolCall(toolCall)) {
                 break
             }
