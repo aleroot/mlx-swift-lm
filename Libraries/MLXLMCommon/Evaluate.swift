@@ -1510,7 +1510,7 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
 
 /// Compatibility overload that preserves the original public signature.
 ///
-/// This forwards to ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:tools:wiredMemoryTicket:)``
+/// This forwards to ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:tools:)``
 /// with `tools` unset.
 public func generateTask(
     promptTokenCount: Int,
