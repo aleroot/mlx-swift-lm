@@ -7,6 +7,7 @@ import MLX
 import MLXEmbedders
 import MLXLLM
 import MLXLMCommon
+import MLXRerankers
 import MLXVLM
 
 #if canImport(CoreImage)
@@ -761,6 +762,148 @@ public enum EmbedderTests {
                 "Similarity mismatch for \(documentNames[index]): expected \(expectedSimilarities[index]), got \(resultSimilarity)"
             )
         }
+    }
+}
+
+// MARK: - Reranker Tests
+
+/// End-to-end checks against reference checkpoint outputs.
+///
+/// These checks download large model weights and belong in the separate IntegrationTesting
+/// project rather than the package test suite.
+public enum RerankerIntegrationTests {
+    /// Validate BGE v2 M3 logits against the values published in its model card.
+    public static func bgeV2M3(
+        downloader: any Downloader,
+        tokenizerLoader: any TokenizerLoader
+    ) async throws {
+        let modelID = "BAAI/bge-reranker-v2-m3"
+        let reranker = try await RerankerModelFactory.shared.loadContainer(
+            from: downloader, using: tokenizerLoader,
+            configuration: ModelConfiguration(
+                id: modelID,
+                revision: "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"),
+            progressHandler: logProgress(modelID))
+        let response = try await reranker.scores(
+            query: "what is panda?",
+            documents: [
+                "hi",
+                "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China.",
+            ])
+
+        try check(
+            response.scoreKind == .normalizedRelevance,
+            "BGE must return normalized relevance scores")
+        try check(response.results.count == 2, "BGE returned an unexpected score count")
+        let logits = try response.results.map {
+            try inverseSigmoid($0.score, modelID: modelID)
+        }
+        try check(
+            abs(logits[0] - -8.1875) < 0.15,
+            "BGE irrelevant-passage logit diverged: expected -8.1875, received \(logits[0])")
+        try check(
+            abs(logits[1] - 5.261_718_75) < 0.15,
+            "BGE relevant-passage logit diverged: expected 5.26171875, received \(logits[1])")
+    }
+
+    /// Validate Qwen3 reranker logit margins against its published reference values.
+    public static func qwen3(
+        downloader: any Downloader,
+        tokenizerLoader: any TokenizerLoader
+    ) async throws {
+        let modelID = "Qwen/Qwen3-Reranker-0.6B"
+        let reranker = try await RerankerModelFactory.shared.loadContainer(
+            from: downloader, using: tokenizerLoader,
+            configuration: ModelConfiguration(
+                id: modelID,
+                revision: "e61197ed45024b0ed8a2d74b80b4d909f1255473"),
+            progressHandler: logProgress(modelID))
+        let response = try await reranker.scores(
+            query: "What is the capital of China?",
+            documents: [
+                "The capital of China is Beijing.",
+                "Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
+            ])
+        let sequentialResponse = try await reranker.scores(
+            query: "What is the capital of China?",
+            documents: [
+                "The capital of China is Beijing.",
+                "Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
+            ],
+            options: .init(maxBatchSize: 1))
+
+        try check(
+            response.scoreKind == .normalizedRelevance,
+            "Qwen3 must return normalized relevance scores")
+        try check(response.results.count == 2, "Qwen3 returned an unexpected score count")
+        let margins = try response.results.map {
+            try inverseSigmoid($0.score, modelID: modelID)
+        }
+        let sequentialMargins = try sequentialResponse.results.map {
+            try inverseSigmoid($0.score, modelID: modelID)
+        }
+        for index in margins.indices {
+            try check(
+                abs(margins[index] - sequentialMargins[index]) < 0.01,
+                "Qwen3 batched and sequential margins diverged at index \(index): \(margins[index]) versus \(sequentialMargins[index])"
+            )
+        }
+        try check(
+            abs(margins[0] - 7.625) < 0.25,
+            "Qwen3 relevant-passage logit margin diverged: expected 7.625, received \(margins[0])")
+        try check(
+            abs(margins[1] - -11.375) < 1,
+            "Qwen3 irrelevant-passage logit margin diverged: expected -11.375, received \(margins[1])"
+        )
+    }
+
+    /// Validate Jina reranker v3 scores against its published MLX implementation.
+    public static func jinaV3(
+        downloader: any Downloader,
+        tokenizerLoader: any TokenizerLoader
+    ) async throws {
+        let modelID = "jinaai/jina-reranker-v3-mlx"
+        let reranker = try await RerankerModelFactory.shared.loadContainer(
+            from: downloader, using: tokenizerLoader,
+            configuration: ModelConfiguration(
+                id: modelID,
+                revision: "1d19fe38ae4e6658221479747c1152d6136dd6ab"),
+            progressHandler: logProgress(modelID))
+        let response = try await reranker.scores(
+            query: "What is the capital of China?",
+            documents: [
+                "Gravity attracts bodies toward one another.",
+                "Beijing is the capital city of China.",
+            ])
+
+        try check(
+            response.scoreKind == .cosineSimilarity,
+            "Jina must return cosine-similarity scores")
+        try check(response.results.count == 2, "Jina returned an unexpected score count")
+        // Generated by rerank.py from the pinned Jina checkpoint revision above.
+        let expectedScores = [-0.156_369_954_347_610_47, 0.402_552_098_035_812_4]
+        // Quantized kernels can vary slightly with backend evaluation order.
+        let tolerance = 3e-3
+        for index in expectedScores.indices {
+            let result = response.results[index]
+            try check(
+                result.index == index,
+                "Jina scores did not preserve document order at index \(index)")
+            try check(
+                abs(result.score - expectedScores[index]) < tolerance,
+                "Jina score diverged at index \(index): expected \(expectedScores[index]), received \(result.score)"
+            )
+        }
+        try check(
+            response.results[1].score > response.results[0].score,
+            "Jina did not score the relevant passage above the irrelevant passage")
+    }
+
+    private static func inverseSigmoid(_ score: Double, modelID: String) throws -> Double {
+        try check(
+            score > 0 && score < 1,
+            "\(modelID) returned a normalized score at a non-invertible boundary")
+        return Foundation.log(score / (1 - score))
     }
 }
 
