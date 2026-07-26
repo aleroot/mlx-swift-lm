@@ -257,6 +257,69 @@ public enum ChatSessionTests {
         }
     }
 
+    /// Exercises the structured continuation path used by clients that execute
+    /// tool calls outside `ChatSession` and feed the results back afterward.
+    ///
+    /// Conversation-aware templates must receive the original user query and
+    /// assistant tool call again on the result turn. Rendering only the new
+    /// `.tool` message reproduces the Qwen Jinja "No user query found" failure.
+    public static func structuredToolContinuation(container: LLModelContainer) async throws {
+        let session = ChatSession(
+            container,
+            instructions:
+                "Use the weather tool whenever weather is requested. After receiving its result, answer the user briefly.",
+            generateParameters: GenerateParameters(maxTokens: 150, temperature: 0),
+            additionalContext: ["enable_thinking": false],
+            tools: [weatherToolSchema]
+        )
+
+        var firstPassCalls: [ToolCall] = []
+        for try await generation in session.streamDetails(
+            to: "What's the weather in Tokyo? Use the weather tool.",
+            images: [],
+            videos: [])
+        {
+            if case .toolCall(let call) = generation {
+                firstPassCalls.append(call)
+            }
+        }
+
+        guard let call = firstPassCalls.first else {
+            throw IntegrationTestFailure("Expected the first pass to call get_weather")
+        }
+        try check(
+            call.function.name == "get_weather",
+            "Expected get_weather, got \(call.function.name)")
+
+        var followUpText = ""
+        var followUpCalls: [ToolCall] = []
+        var completion: GenerateCompletionInfo?
+        for try await generation in session.streamDetails(to: [
+            .tool(
+                #"{"location":"Tokyo","temperature_celsius":24,"conditions":"clear"}"#,
+                id: call.id)
+        ]) {
+            switch generation {
+            case .chunk(let text):
+                followUpText += text
+            case .toolCall(let call):
+                followUpCalls.append(call)
+            case .info(let info):
+                completion = info
+            }
+        }
+
+        try check(
+            completion != nil,
+            "Expected structured tool continuation to complete generation")
+        try check(
+            !followUpText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "Expected a final text response after the tool result")
+        try check(
+            followUpCalls.isEmpty,
+            "Expected the tool result to resolve the request, got another tool call")
+    }
+
     public static func toolInvocation(container: LLModelContainer) async throws {
         struct EmptyInput: Codable {}
 

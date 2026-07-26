@@ -94,6 +94,12 @@ struct ToolCallIntegrationTests {
         try await ToolCallTests.qwen35EndToEndGeneration(container: container)
     }
 
+    @Test func qwen35StructuredToolContinuation() async throws {
+        let container = try await models.llmContainer(
+            for: .init(id: IntegrationTestModelIDs.qwen35))
+        try await ChatSessionTests.structuredToolContinuation(container: container)
+    }
+
     @Test func qwen35MultiTool() async throws {
         let container = try await models.llmContainer(
             for: .init(id: IntegrationTestModelIDs.qwen35))
