@@ -363,7 +363,7 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertFalse(calls[1].contains { $0.content == "first instruction" })
     }
 
-    func testEmptyGenerationDoesNotAppendAssistantMessage() async throws {
+    func testEmptyGenerationRollsBackIncompleteTurn() async throws {
         let (recordedMessages, continuation) = AsyncStream<[RecordedMessage]>.makeStream()
         let processor = TestInputProcessor(
             tokenizer: TestTokenizer(),
@@ -386,10 +386,11 @@ public class ChatSessionTests: XCTestCase {
 
         XCTAssertEqual(calls.count, 2)
         XCTAssertEqual(calls[0].map(\.role), [.user])
-        XCTAssertEqual(calls[1].map(\.role), [.user, .user])
+        XCTAssertEqual(calls[1].map(\.role), [.user])
+        XCTAssertEqual(calls[1].first?.content, "second question")
     }
 
-    func testInterruptedGenerationDoesNotAppendPartialAssistantMessage() async throws {
+    func testInterruptedGenerationRollsBackIncompleteTurn() async throws {
         let (recordedMessages, continuation) = AsyncStream<[RecordedMessage]>.makeStream()
         let processor = TestInputProcessor(
             tokenizer: TestTokenizer(),
@@ -415,7 +416,8 @@ public class ChatSessionTests: XCTestCase {
 
         XCTAssertEqual(calls.count, 2)
         XCTAssertEqual(calls[0].map(\.role), [.user])
-        XCTAssertEqual(calls[1].map(\.role), [.user, .user])
+        XCTAssertEqual(calls[1].map(\.role), [.user])
+        XCTAssertEqual(calls[1].first?.content, "second question")
     }
 
     func testEmptyPreparedInputThrowsClearError() async throws {

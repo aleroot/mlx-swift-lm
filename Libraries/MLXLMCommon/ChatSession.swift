@@ -157,18 +157,19 @@ public final class ChatSession {
         /// cache offset is an invalidated ledger and forces a rebuild.
         var cachedTokens: [Int]
 
+        @discardableResult
         mutating func record(
             _ assistant: AssistantGeneration,
             generatedTokens: [Int],
             cacheOffset: Int?
-        ) {
+        ) -> Bool {
             guard assistant.shouldRecord else {
                 // A cancelled or semantically empty generation has no
                 // assistant turn to replay. Its cache may nevertheless
                 // contain generated or lookahead tokens, so invalidate
                 // the ledger and rebuild from the retained messages.
                 cachedTokens.removeAll()
-                return
+                return false
             }
 
             let cachedTokenCount = cachedTokens.count
@@ -189,6 +190,7 @@ public final class ChatSession {
                 .assistant(
                     assistant.content,
                     toolCalls: assistant.toolCalls.isEmpty ? nil : assistant.toolCalls))
+            return true
         }
     }
 
@@ -745,11 +747,15 @@ public final class ChatSession {
                     // loop can restart on tool calls
                     restart: while !pendingMessages.isEmpty {
                         let templateMessages: [Chat.Message]
+                        let conversationMessageCountBeforePending: Int?
                         if var currentConversation = conversation {
+                            conversationMessageCountBeforePending =
+                                currentConversation.messages.count
                             currentConversation.messages.append(contentsOf: pendingMessages)
                             templateMessages = leadingMessages + currentConversation.messages
                             conversation = currentConversation
                         } else {
+                            conversationMessageCountBeforePending = nil
                             // A cache restored without its transcript cannot be reconciled
                             // against a complete chat template. Preserve the legacy prefix
                             // continuation behavior for this explicitly low-level API.
@@ -1064,10 +1070,20 @@ public final class ChatSession {
                         let generatedTokens = await generation.task.value
 
                         if var currentConversation = conversation {
-                            currentConversation.record(
+                            let recordedAssistant = currentConversation.record(
                                 assistant,
                                 generatedTokens: generatedTokens,
                                 cacheOffset: kvCache.first?.offset)
+                            if !recordedAssistant,
+                                let conversationMessageCountBeforePending
+                            {
+                                // A cancelled or empty generation did not commit an
+                                // assistant turn. Roll back this restart's pending input
+                                // so a later request cannot produce invalid role sequences
+                                // such as user/user on strict chat templates.
+                                currentConversation.messages.removeSubrange(
+                                    conversationMessageCountBeforePending...)
+                            }
                             conversation = currentConversation
                         }
 
