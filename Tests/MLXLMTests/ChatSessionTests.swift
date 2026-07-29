@@ -479,7 +479,7 @@ public class ChatSessionTests: XCTestCase {
             history.map(\.role) + [.tool, .assistant, .tool, .assistant, .user])
     }
 
-    func testCompleteTranscriptContinuationPrefillsOnlyUncachedSuffix() async throws {
+    func testLegacyStringContinuationPrefillsOnlyUncachedSuffix() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()
         let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
@@ -497,6 +497,38 @@ public class ChatSessionTests: XCTestCase {
 
         var completionInfo: GenerateCompletionInfo?
         for try await item in session.streamDetails(to: "second") {
+            if let info = item.info {
+                completionInfo = info
+            }
+        }
+
+        let info = try XCTUnwrap(completionInfo)
+        let secondRenderedLength = await lengthIterator.next()
+        let fullSecondPromptLength = try XCTUnwrap(secondRenderedLength)
+        XCTAssertLessThan(info.promptTokenCount, fullSecondPromptLength)
+        XCTAssertEqual(
+            info.promptTokenCount,
+            fullSecondPromptLength - firstPromptLength - 3)
+    }
+
+    func testStructuredContinuationPrefillsOnlyUncachedSuffix() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: [.user("first")])
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+
+        var completionInfo: GenerateCompletionInfo?
+        for try await item in session.streamDetails(to: [.user("second")]) {
             if let info = item.info {
                 completionInfo = info
             }
