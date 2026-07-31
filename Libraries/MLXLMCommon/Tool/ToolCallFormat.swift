@@ -22,7 +22,8 @@ public protocol ToolCallParser: Sendable {
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
     ///   - content: The text content to parse (may include tags)
-    ///   - tools: Optional tool schemas for type-aware parsing
+    ///   - tools: Optional tool schemas for type-aware argument parsing. Tool
+    ///     authorization is enforced by ``ToolCallProcessor`` after parsing.
     /// - Returns: A `ToolCall` if parsing succeeds, `nil` otherwise
     func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall?
 

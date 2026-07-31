@@ -2433,18 +2433,8 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
             }
         }
 
-        if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
-            !bufferedText.isEmpty
-        {
-            if case .terminated = emit(.chunk(bufferedText)) {
-                return
-            }
-        }
-
-        for toolCall in toolCallProcessor.drainToolCalls() {
-            if case .terminated = emit(.toolCall(toolCall)) {
-                break
-            }
+        if case .cancelled = emitOutputs(toolCallProcessor.processEOSOutputs(), emit: emit) {
+            return
         }
     }
 
@@ -2460,14 +2450,20 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
             return .more
         }
 
-        if let textToYield = toolCallProcessor.processChunk(text) {
-            if case .terminated = emit(.chunk(textToYield)) {
-                return .cancelled
-            }
-        }
+        return emitOutputs(toolCallProcessor.processChunkOutputs(text), emit: emit)
+    }
 
-        for toolCall in toolCallProcessor.drainToolCalls() {
-            if case .terminated = emit(.toolCall(toolCall)) {
+    private func emitOutputs(
+        _ outputs: [ToolCallProcessor.Output],
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> TokenLoopDisposition {
+        for output in outputs {
+            let result =
+                switch output {
+                case .response(let text): emit(.chunk(text))
+                case .toolCall(let call): emit(.toolCall(call))
+                }
+            if case .terminated = result {
                 return .cancelled
             }
         }

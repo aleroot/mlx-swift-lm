@@ -35,6 +35,7 @@ public class ToolCallProcessor {
     private let format: ToolCallFormat
     private let parser: any ToolCallParser
     private let tools: [[String: any Sendable]]?
+    private let allowedToolNames: Set<String>?
     private let supportsBareJSONFallback: Bool
     private let maxJSONFallbackBufferLength = 32_768
     private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
@@ -67,11 +68,20 @@ public class ToolCallProcessor {
     /// Initialize with a specific tool call format.
     /// - Parameters:
     ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
-    ///   - tools: Optional tool schemas for type-aware parsing
+    ///   - tools: Optional tool schemas for type-aware parsing and tool authorization.
+    ///     When schemas are present, calls to undeclared tools are consumed but not emitted.
     public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
         self.format = format
         self.parser = format.createParser()
         self.tools = tools
+        if let tools, !tools.isEmpty {
+            self.allowedToolNames = Set(
+                tools.compactMap { tool in
+                    (tool["function"] as? [String: any Sendable])?["name"] as? String
+                })
+        } else {
+            self.allowedToolNames = nil
+        }
         self.supportsBareJSONFallback = format == .json
     }
 
@@ -210,11 +220,13 @@ public class ToolCallProcessor {
                 state = .collectingToolCall
 
                 if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
-                    recordResponse(leading.replacingOccurrences(of: "<|python_tag|>", with: ""))
+                    let response =
+                        leading.replacingOccurrences(of: "<|python_tag|>", with: "")
+                    recordResponse(response)
                     appendToolCall(toolCall)
                     toolCallBuffer = ""
                     state = .normal
-                    return leading.isEmpty ? nil : leading
+                    return response.isEmpty ? nil : response
                 }
 
                 // Still collecting — check if the first JSON object is complete (would mean parse
@@ -367,8 +379,9 @@ public class ToolCallProcessor {
 
             let callText = String(remaining[..<argsRange.upperBound]) + split.object
             guard let call = parser.parse(content: callText, tools: tools) else { break }
-            appendToolCall(call)
-            outputs.append(.toolCall(toolCalls.removeLast()))
+            if isAuthorized(call) {
+                outputs.append(.toolCall(normalizedToolCall(call)))
+            }
             remaining = split.trailing
         }
 
@@ -400,8 +413,9 @@ public class ToolCallProcessor {
             let callText = String(remaining[startRange.lowerBound ... callEnd])
             guard let call = parser.parse(content: callText, tools: tools) else { break }
             appendResponse(stripProtocolSpans(from: responsePrefix), to: &outputs)
-            appendToolCall(call)
-            outputs.append(.toolCall(toolCalls.removeLast()))
+            if isAuthorized(call) {
+                outputs.append(.toolCall(normalizedToolCall(call)))
+            }
             remaining = String(remaining[remaining.index(after: callEnd)...])
         }
 
@@ -700,7 +714,12 @@ public class ToolCallProcessor {
         }
     }
 
+    private func isAuthorized(_ call: ToolCall) -> Bool {
+        allowedToolNames?.contains(call.function.name) ?? true
+    }
+
     private func appendToolCall(_ call: ToolCall) {
+        guard isAuthorized(call) else { return }
         let normalized = normalizedToolCall(call)
         toolCalls.append(normalized)
         if orderedOutputEnabled {

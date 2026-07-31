@@ -3,6 +3,12 @@ import MLXLMCommon
 import Testing
 
 struct ToolTests {
+    private func toolSchemas(_ names: String...) -> [[String: any Sendable]] {
+        names.map { name in
+            ["function": ["name": name] as [String: any Sendable]]
+        }
+    }
+
     @Test("ChatConventionsProviding defaults to nil for both properties")
     func chatConventionsOptInDefaults() {
         struct Bare: ChatConventionsProviding {}
@@ -140,6 +146,17 @@ struct ToolTests {
 
         #expect(toolCall.function.name == "get_weather")
         #expect(toolCall.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("JSON parser leaves tool authorization to the processor")
+    func testJSONParserParsesUndeclaredTool() throws {
+        let parser = JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = #"<tool_call>{"name":"not_declared","arguments":{}}</tool_call>"#
+
+        let toolCall = try #require(
+            parser.parse(content: content, tools: toolSchemas("get_weather")))
+
+        #expect(toolCall.function.name == "not_declared")
     }
 
     @Test("Test JSON Tool Call Parser - Custom Tags")
@@ -364,10 +381,8 @@ struct ToolTests {
         #expect(processor.toolCalls.isEmpty)
     }
 
-    @Test(
-        "Test JSON Format via ToolCallProcessor - Unknown Tool Name Stays Text When Tools Are Provided"
-    )
-    func testJSONFormatProcessorUnknownToolNameStaysTextWithTools() {
+    @Test("Test JSON Format via ToolCallProcessor - Unknown Bare Tool Is Rejected")
+    func testJSONFormatProcessorUnknownBareToolIsRejected() {
         struct EmptyInput: Codable {}
         struct EmptyOutput: Codable { let ok: Bool }
 
@@ -385,7 +400,7 @@ struct ToolTests {
         let output = processor.processChunk(chunk)
         let eosOutput = processor.processEOS(returnBufferedText: true)
 
-        #expect(output == chunk)
+        #expect(output == nil)
         #expect(eosOutput == nil)
         #expect(processor.toolCalls.isEmpty)
     }
@@ -416,9 +431,9 @@ struct ToolTests {
     }
 
     @Test(
-        "Test JSON Format via ToolCallProcessor - Unknown Tagged Tool Preserved And Continues Parsing"
+        "Test JSON Format via ToolCallProcessor - Unknown Tagged Tool Rejected And Continues Parsing"
     )
-    func testJSONFormatProcessorUnknownTaggedToolPreservedAndContinuesParsing() throws {
+    func testJSONFormatProcessorUnknownTaggedToolRejectedAndContinuesParsing() throws {
         struct EmptyInput: Codable {}
         struct EmptyOutput: Codable { let ok: Bool }
 
@@ -437,7 +452,7 @@ struct ToolTests {
         let output = processor.processChunk(chunk)
         let eosOutput = processor.processEOS(returnBufferedText: true)
 
-        #expect(output == "<tool_call>{\"name\":\"not_declared\",\"arguments\":{}}</tool_call>")
+        #expect(output == nil)
         #expect(eosOutput == nil)
         #expect(processor.toolCalls.count == 1)
 
@@ -446,9 +461,9 @@ struct ToolTests {
     }
 
     @Test(
-        "Test JSON Format via ToolCallProcessor - Unknown Tagged Tool With Leading Text Preserved"
+        "Test JSON Format via ToolCallProcessor - Unknown Tagged Tool Preserves Only Leading Text"
     )
-    func testJSONFormatProcessorUnknownTaggedToolWithLeadingTextPreserved() throws {
+    func testJSONFormatProcessorUnknownTaggedToolPreservesOnlyLeadingText() throws {
         struct EmptyInput: Codable {}
         struct EmptyOutput: Codable { let ok: Bool }
 
@@ -467,8 +482,7 @@ struct ToolTests {
         let output = processor.processChunk(chunk)
         let eosOutput = processor.processEOS(returnBufferedText: true)
 
-        #expect(
-            output == "Preface <tool_call>{\"name\":\"not_declared\",\"arguments\":{}}</tool_call>")
+        #expect(output == "Preface ")
         #expect(eosOutput == nil)
         #expect(processor.toolCalls.count == 1)
 
@@ -702,6 +716,17 @@ struct ToolTests {
         #expect(toolCall.function.arguments["expression"] == .string("2+2"))
     }
 
+    @Test("LFM2 EOS output consumes undeclared calls")
+    func testLFM2EOSOutputRejectsUndeclaredCall() {
+        let processor = ToolCallProcessor(format: .lfm2, tools: toolSchemas("calculator"))
+
+        #expect(
+            processor.processChunkOutputs(
+                "<|tool_call_start|>[not_declared()]after"
+            ).isEmpty)
+        #expect(processor.processEOSOutputs() == [.response("after")])
+    }
+
     // MARK: - XML Function Format Tests (Qwen3 Coder)
 
     @Test("Test XML Function Parser - Qwen3 Coder Format")
@@ -741,6 +766,17 @@ struct ToolTests {
         #expect(toolCall.function.name == "set_temperature")
         #expect(toolCall.function.arguments["value"] == .int(25))
         #expect(toolCall.function.arguments["enabled"] == .bool(true))
+    }
+
+    @Test("XML parser leaves tool authorization to the processor")
+    func testXMLFunctionParserParsesUndeclaredTool() throws {
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = "<function=example_function_name></function>"
+
+        let toolCall = try #require(
+            parser.parse(content: content, tools: toolSchemas("get_weather")))
+
+        #expect(toolCall.function.name == "example_function_name")
     }
 
     @Test("Test XML Function Parser - Multiline Content (Qwen3.5 style)")
@@ -832,6 +868,42 @@ struct ToolTests {
         let toolCall = try #require(processor.toolCalls.first)
         #expect(toolCall.function.name == "get_current_datetime")
         #expect(toolCall.function.arguments.isEmpty)
+    }
+
+    @Test("XML processor rejects undeclared calls and continues parsing")
+    func testXMLProcessorRejectsUndeclaredCallAndContinuesParsing() throws {
+        let processor = ToolCallProcessor(
+            format: .xmlFunction, tools: toolSchemas("get_weather"))
+        let content =
+            "<tool_call><function=example_function_name></function></tool_call>"
+            + "<tool_call><function=get_weather></function></tool_call>"
+
+        #expect(processor.processChunk(content) == nil)
+        #expect(processor.processEOS(returnBufferedText: true) == nil)
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "get_weather")
+    }
+
+    @Test("Ordered XML output removes malformed protocol but preserves surrounding text")
+    func testOrderedXMLOutputSuppressesMalformedProtocol() {
+        let processor = ToolCallProcessor(
+            format: .xmlFunction, tools: toolSchemas("get_weather"))
+
+        #expect(
+            processor.processChunkOutputs(
+                "before <tool_call><function=broken></tool_call> after"
+            ) == [.response("before "), .response(" after")])
+        #expect(processor.processEOSOutputs().isEmpty)
+    }
+
+    @Test("Ordered XML output removes unfinished protocol at EOS")
+    func testOrderedXMLOutputSuppressesUnfinishedProtocolAtEOS() {
+        let processor = ToolCallProcessor(
+            format: .xmlFunction, tools: toolSchemas("get_weather"))
+
+        #expect(
+            processor.processChunkOutputs("<tool_call><function=broken>").isEmpty)
+        #expect(processor.processEOSOutputs().isEmpty)
     }
 
     // MARK: - GLM4 Format Tests
@@ -1061,6 +1133,21 @@ struct ToolTests {
         #expect(toolCalls6[1].function.arguments["location"] == .string("London"))
     }
 
+    @Test("Inline processor consumes undeclared calls")
+    func testInlineProcessorRejectsUndeclaredCall() {
+        let content = #"<|python_tag|>{"name":"not_declared","arguments":{}}"#
+
+        let legacyProcessor = ToolCallProcessor(
+            format: .llama3, tools: toolSchemas("run_script"))
+        #expect(legacyProcessor.processChunk(content) == nil)
+        #expect(legacyProcessor.toolCalls.isEmpty)
+
+        let orderedProcessor = ToolCallProcessor(
+            format: .llama3, tools: toolSchemas("run_script"))
+        #expect(orderedProcessor.processChunkOutputs(content).isEmpty)
+        #expect(orderedProcessor.processEOSOutputs().isEmpty)
+    }
+
     // MARK: - ToolCallFormat Serialization Tests
 
     @Test("Test ToolCallFormat Raw Values for Serialization")
@@ -1243,6 +1330,17 @@ struct ToolTests {
         let toolCall = try #require(processor.toolCalls.first)
         #expect(toolCall.function.name == "get_weather")
         #expect(toolCall.function.arguments["location"] == .string("Berlin"))
+    }
+
+    @Test("Mistral EOS output consumes undeclared calls")
+    func testMistralEOSOutputRejectsUndeclaredCall() {
+        let processor = ToolCallProcessor(format: .mistral, tools: toolSchemas("get_weather"))
+
+        #expect(
+            processor.processChunkOutputs(
+                "[TOOL_CALLS]not_declared[ARGS]{}after"
+            ).isEmpty)
+        #expect(processor.processEOSOutputs() == [.response("after")])
     }
 
     @Test("Test Mistral Format Processor Multiple Tool Calls")
