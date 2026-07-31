@@ -742,9 +742,15 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
+        let inputLength = input.text.cacheSequenceLength
 
         switch try model.prepare(input, cache: cache, state: state, windowSize: windowSize) {
         case .tokens(let tokens):
+            let remainingLength = tokens.cacheSequenceLength
+            precondition(
+                remainingLength <= inputLength,
+                "LanguageModel.prepare returned more tokens than it received")
+            cacheStorage.commitProcessedTokens(inputLength - remainingLength)
             y = tokens
 
             // evaluate the remainder of the prompt -- this primes the pump
@@ -753,6 +759,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             asyncEval(y.tokens)
 
         case .logits(let result):
+            cacheStorage.commitProcessedTokens(inputLength)
             // carry the prefill state into decode, as step(previous:) does for later steps
             self.state = result.state
             y = .init(tokens: convertToToken(logits: result.logits))
@@ -782,6 +789,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         let result = withPreparedCache(cache, lengths: previous.sequenceLengths) {
             model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         }
+        cacheStorage.commitProcessedTokens(previous.cacheSequenceLength)
         self.state = result.state
 
         // Apply dynamic cache quantization after each step
@@ -943,6 +951,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             "Speculative caches must use the same KV-cache plan")
         let mainCacheStorage = try kvCachePlan.validated(mainCacheStorage)
         let draftCacheStorage = try kvCachePlan.validated(draftCacheStorage)
+        guard mainCacheStorage.processedTokenCount == draftCacheStorage.processedTokenCount else {
+            throw KVCacheError(
+                message: "Speculative caches must represent the same processed-token position.")
+        }
         guard
             canTrimPromptCache(mainCacheStorage.cache),
             canTrimPromptCache(draftCacheStorage.cache)
@@ -972,14 +984,21 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     /// Prefill both main and draft models with the prompt, priming caches for generation
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
+        let inputLength = input.text.cacheSequenceLength
 
         // Prefill main model
         switch try mainModel.prepare(
             input, cache: mainCache, state: mainState, windowSize: windowSize)
         {
         case .tokens(let tokens):
+            let remainingLength = tokens.cacheSequenceLength
+            precondition(
+                remainingLength <= inputLength,
+                "Main model prepare returned more tokens than it received")
+            mainCacheStorage.commitProcessedTokens(inputLength - remainingLength)
             y = tokens
         case .logits(let result):
+            mainCacheStorage.commitProcessedTokens(inputLength)
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
@@ -992,8 +1011,14 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         switch try draftModel.prepare(input, cache: draftCache, state: nil, windowSize: windowSize)
         {
         case .tokens(let tokens):
+            let remainingLength = tokens.cacheSequenceLength
+            precondition(
+                remainingLength <= inputLength,
+                "Draft model prepare returned more tokens than it received")
+            draftCacheStorage.commitProcessedTokens(inputLength - remainingLength)
             draftY = tokens
         case .logits(let result):
+            draftCacheStorage.commitProcessedTokens(inputLength)
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
@@ -1020,6 +1045,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         for _ in 0 ..< numDraft {
             let draftResult = draftModel(
                 draftY[text: .newAxis], cache: draftCache, state: draftState)
+            draftCacheStorage.commitProcessedTokens(draftY.cacheSequenceLength)
             draftState = draftResult.state
             var draftLogits = draftResult.logits[0..., -1, 0...]
             draftLogits = draftProcessor?.process(logits: draftLogits) ?? draftLogits
@@ -1035,6 +1061,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyInput = LMInput.Text(tokens: concatenated(verifyTokens))
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
         let mainResult = mainModel(verifyInput[text: .newAxis], cache: mainCache, state: mainState)
+        mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
         let mainLogits = mainResult.logits
         mainState = mainResult.state
 
@@ -1084,8 +1111,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         )
 
         // Rewind caches for rejected tokens
-        trimPromptCache(mainCache, numTokens: numDraft - accepted)
-        trimPromptCache(draftCache, numTokens: Swift.max(numDraft - accepted - 1, 0))
+        mainCacheStorage.trim(numDraft - accepted)
+        draftCacheStorage.trim(Swift.max(numDraft - accepted - 1, 0))
 
         // Apply dynamic cache quantization after rewind
         kvCachePlan.apply(to: mainCacheStorage)

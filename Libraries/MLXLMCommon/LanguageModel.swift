@@ -105,6 +105,13 @@ public struct LMInput {
             guard tokens.ndim == 2 else { return nil }
             return Array(repeating: tokens.dim(1), count: tokens.dim(0))
         }
+
+        /// Number of logical sequence positions consumed by one model call.
+        /// Batch dimensions do not duplicate the shared cache timeline.
+        @inline(__always)
+        package var cacheSequenceLength: Int {
+            tokens.ndim == 0 ? 0 : tokens.dim(-1)
+        }
     }
 
     /// Representation of prepared input image(s).

@@ -59,4 +59,38 @@ struct KVCachePlanBenchmark {
                     "[KVCACHEBENCH] terminal %.1f ns/call | traversal floor %.1f ns/call | %.1fx faster",
                 terminal, traversal, traversal / terminal))
     }
+
+    @Test func sharedProgressReadAvoidsLayerScan() {
+        let caches: [KVCache] = (0 ..< 64).map { _ in
+            let cache = KVCacheSimple()
+            cache.offset = 1_024
+            return cache
+        }
+        let storage = KVCacheStorage(
+            caches, plan: .disabled, processedTokenCount: 1_024)
+        let iterations = 100_000
+        let clock = ContinuousClock()
+        var directMatches = 0
+        var scannedMatches = 0
+
+        var start = clock.now
+        for _ in 0 ..< iterations {
+            if storage.processedTokenCount == 1_024 { directMatches += 1 }
+        }
+        let direct = nanosecondsPerCall(clock.now - start, iterations: iterations)
+
+        start = clock.now
+        for _ in 0 ..< iterations {
+            if caches.allSatisfy({ $0.offset == 1_024 }) { scannedMatches += 1 }
+        }
+        let scan = nanosecondsPerCall(clock.now - start, iterations: iterations)
+
+        #expect(directMatches == iterations)
+        #expect(scannedMatches == iterations)
+        print(
+            String(
+                format:
+                    "[KVCACHEBENCH] progress %.1f ns/read | 64-layer scan %.1f ns/read | %.1fx faster",
+                direct, scan, scan / direct))
+    }
 }

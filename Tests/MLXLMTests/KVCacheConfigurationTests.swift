@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXNN
 import Testing
 
 @testable import MLXLMCommon
@@ -134,6 +135,7 @@ struct KVCacheConfigurationTests {
         #expect(report.compressedLayerCount == 1)
         #expect(report.pendingLayerCount == 0)
         #expect(report.skippedLayerCount == 1)
+        #expect(report.processedTokenCount == nil)
         #expect(report.layers.count == 3)
         #expect(report.layers[0].path == [0, 0])
         #expect(report.layers[0].state == .notApplicable)
@@ -328,6 +330,50 @@ struct KVCacheConfigurationTests {
         #expect(storage.cache[0] is QuantizedKVCache)
     }
 
+    @Test func modelCacheOwnsHybridProgressAcrossPrefillAndDecode() throws {
+        let model = HybridProgressModel()
+        let storage = KVCacheStorage(model.newCache(parameters: nil), plan: .disabled)
+        var iterator = try TokenIterator(
+            input: LMInput(tokens: MLXArray([1, 2, 3])),
+            model: model,
+            cacheStorage: storage,
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0))
+
+        #expect(storage.processedTokenCount == 3)
+        let recurrent = try #require(storage.cache[0] as? MambaCache)
+        let attention = try #require(storage.cache[1] as? KVCacheSimple)
+        #expect(recurrent.offset == 0)
+        #expect(attention.offset == 3)
+        #expect(storage.nativeAttentionOffsetsAreAligned)
+
+        _ = iterator.next()
+
+        #expect(storage.processedTokenCount == 4)
+        #expect(recurrent.offset == 0)
+        #expect(attention.offset == 4)
+        #expect(storage.nativeAttentionOffsetsAreAligned)
+    }
+
+    @Test func modelCacheCopyAndTrimPreserveOneTimeline() throws {
+        let attention = KVCacheSimple()
+        _ = attention.update(
+            keys: MLXArray.zeros([1, 1, 8, 4]),
+            values: MLXArray.zeros([1, 1, 8, 4]))
+        let storage = KVCacheStorage([attention], plan: .disabled)
+
+        #expect(storage.processedTokenCount == 8)
+        let snapshot = storage.copy()
+        let trimmed = snapshot.trim(3)
+
+        #expect(trimmed == 3)
+        #expect(snapshot.processedTokenCount == 5)
+        #expect(snapshot.cache[0].offset == 5)
+        #expect(storage.processedTokenCount == 8)
+        #expect(storage.cache[0].offset == 8)
+        let snapshotAttention = try #require(snapshot.cache[0] as? KVCacheSimple)
+        #expect(snapshotAttention !== attention)
+    }
+
     @Test func turboRuntimeReportMarksDifferentRequestedStrategy() {
         let configuration = KVCacheConfiguration(strategy: .affine(.fourBit))
         let cache: [KVCache] = [
@@ -379,5 +425,37 @@ struct KVCacheConfigurationTests {
             MLXArray.zeros([1, 1, 1, headDimension]),
         ]
         return cache
+    }
+
+    private final class HybridProgressModel: Module, LanguageModel {
+        func prepare(
+            _ input: LMInput,
+            cache: [KVCache],
+            state: LMOutput.State?,
+            windowSize: Int?
+        ) throws -> PrepareResult {
+            .tokens(input.text)
+        }
+
+        func callAsFunction(
+            _ input: LMInput.Text,
+            cache: [KVCache]?,
+            state: LMOutput.State?
+        ) -> LMOutput {
+            let length = input.cacheSequenceLength
+            if let recurrent = cache?[0] as? MambaCache {
+                recurrent.advance(length)
+            }
+            if let attention = cache?[1] as? KVCacheSimple {
+                _ = attention.update(
+                    keys: MLXArray.zeros([1, 1, length, 4]),
+                    values: MLXArray.zeros([1, 1, length, 4]))
+            }
+            return LMOutput(logits: MLXArray.zeros([1, length, 8]))
+        }
+
+        func newCache(parameters: GenerateParameters?) -> [KVCache] {
+            [MambaCache(), KVCacheSimple()]
+        }
     }
 }

@@ -80,6 +80,17 @@ package struct KVCachePlan: Sendable, Equatable {
     package func report(for cache: [KVCache]) -> KVCacheRuntimeReport? {
         configuration.map { kvCacheRuntimeReport(cache: cache, configuration: $0) }
     }
+
+    package func report(for storage: KVCacheStorage) -> KVCacheRuntimeReport? {
+        configuration.map { configuration in
+            let report = kvCacheRuntimeReport(
+                cache: storage.cache, configuration: configuration)
+            return KVCacheRuntimeReport(
+                requestedConfiguration: report.requestedConfiguration,
+                layers: report.layers,
+                processedTokenCount: storage.processedTokenCount)
+        }
+    }
 }
 
 /// Shared ownership for a realized cache and its dynamic application state.
@@ -94,14 +105,87 @@ package final class KVCacheStorage: @unchecked Sendable {
     }
     package let plan: KVCachePlan
     package fileprivate(set) var isApplicationTerminal = false
+    /// Authoritative logical position represented by this model cache.
+    ///
+    /// Individual cache entries retain their native offsets and metadata, but
+    /// the model-wide timeline lives here exactly once. Generation updates this
+    /// value after successful model calls and rolls it back with cache trims.
+    package private(set) var processedTokenCount: Int
 
-    package init(_ cache: [KVCache], plan: KVCachePlan) {
+    package init(
+        _ cache: [KVCache],
+        plan: KVCachePlan,
+        processedTokenCount: Int? = nil
+    ) {
         self.cache = cache
         self.plan = plan
+        self.processedTokenCount =
+            processedTokenCount ?? Self.inferProcessedTokenCount(from: cache)
     }
 
     package func replace(with cache: [KVCache]) {
         self.cache = cache
+    }
+
+    /// Commit tokens after a successful model evaluation.
+    @inline(__always)
+    package func commitProcessedTokens(_ count: Int) {
+        precondition(count >= 0, "Processed token count cannot move backwards")
+        let (updated, overflow) = processedTokenCount.addingReportingOverflow(count)
+        precondition(!overflow, "Processed token count overflow")
+        processedTokenCount = updated
+    }
+
+    /// Trim cache state and the shared logical timeline atomically.
+    @discardableResult
+    package func trim(_ count: Int) -> Int {
+        precondition(count >= 0, "Trim count cannot be negative")
+        let trimmed = trimPromptCache(cache, numTokens: count)
+        precondition(
+            trimmed <= processedTokenCount,
+            "Cache trimmed beyond its processed-token timeline")
+        processedTokenCount -= trimmed
+        return trimmed
+    }
+
+    /// Create an independent snapshot while preserving plan and progress.
+    package func copy() -> KVCacheStorage {
+        let copy = KVCacheStorage(
+            cache.map { $0.copy() },
+            plan: plan,
+            processedTokenCount: processedTokenCount)
+        copy.isApplicationTerminal = isApplicationTerminal
+        return copy
+    }
+
+    /// Debug-only consistency audit for native attention offsets. Recurrent
+    /// entries intentionally do not participate in the shared timeline.
+    package var nativeAttentionOffsetsAreAligned: Bool {
+        KVCacheTree.leaves(in: cache)
+            .filter(\.isAttentionCache)
+            .allSatisfy { $0.cache.offset == processedTokenCount }
+    }
+
+    /// One-time compatibility inference for caches created outside the shared
+    /// container API. Hot generation and reuse paths never scan child caches.
+    private static func inferProcessedTokenCount(from cache: [KVCache]) -> Int {
+        let leaves = KVCacheTree.leaves(in: cache)
+        let attentionOffsets = leaves.filter(\.isAttentionCache).map { $0.cache.offset }
+        if let inferred = attentionOffsets.min() {
+            assert(
+                attentionOffsets.allSatisfy { $0 == inferred },
+                "Attention cache offsets diverged before storage adoption")
+            return inferred
+        }
+
+        // Compatibility for recurrent-only caches created by older call sites
+        // that used the inherited offset as a model-wide progress counter.
+        let legacyOffsets = leaves.map { $0.cache.offset }
+        let inferred = legacyOffsets.min() ?? 0
+        assert(
+            legacyOffsets.allSatisfy { $0 == inferred },
+            "Recurrent cache offsets diverged before storage adoption")
+        return inferred
     }
 }
 

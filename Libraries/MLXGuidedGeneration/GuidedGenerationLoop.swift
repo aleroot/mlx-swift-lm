@@ -121,16 +121,24 @@ public enum GuidedGenerationLoop {
 
         // Prefill prompt and get first set of logits
         var logits: MLXArray
+        let inputLength = input.text.cacheSequenceLength
         switch try model.prepare(
             input, cache: cacheStorage.cache, state: nil, windowSize: 512)
         {
         case .tokens(let tokens):
+            let remainingLength = tokens.cacheSequenceLength
+            precondition(
+                remainingLength <= inputLength,
+                "LanguageModel.prepare returned more tokens than it received")
+            cacheStorage.commitProcessedTokens(inputLength - remainingLength)
             let result = model(
                 tokens[text: .newAxis], cache: cacheStorage.cache, state: nil)
+            cacheStorage.commitProcessedTokens(remainingLength)
             modelState = result.state
             logits = result.logits
 
         case .logits(let result):
+            cacheStorage.commitProcessedTokens(inputLength)
             modelState = result.state
             logits = result.logits
         }
@@ -382,6 +390,7 @@ public enum GuidedGenerationLoop {
                         cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
                         state: modelState
                     )
+                    cacheStorage.commitProcessedTokens(tokenInput.cacheSequenceLength)
                     modelState = result.state
                     // Only need logits from the last FF token
                     if i == ffTokens.count - 1 {
@@ -411,6 +420,7 @@ public enum GuidedGenerationLoop {
                     cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
                     state: modelState
                 )
+                cacheStorage.commitProcessedTokens(nextInput.cacheSequenceLength)
                 modelState = result.state
                 logits = result.logits
 

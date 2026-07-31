@@ -153,15 +153,15 @@ public final class ChatSession {
     private struct Conversation {
         var messages: [Chat.Message]
         /// Exact tokens represented by the main KV cache when its count
-        /// matches the cache offset. An empty value paired with a nonzero
-        /// cache offset is an invalidated ledger and forces a rebuild.
+        /// matches the model-cache progress. An empty value paired with
+        /// nonzero progress is an invalidated ledger and forces a rebuild.
         var cachedTokens: [Int]
 
         @discardableResult
         mutating func record(
             _ assistant: AssistantGeneration,
             generatedTokens: [Int],
-            cacheOffset: Int?
+            processedTokenCount: Int
         ) -> Bool {
             guard assistant.shouldRecord else {
                 // A cancelled or semantically empty generation has no
@@ -173,12 +173,12 @@ public final class ChatSession {
             }
 
             let cachedTokenCount = cachedTokens.count
-            if let cacheOffset,
-                cacheOffset >= cachedTokenCount,
-                cacheOffset - cachedTokenCount <= generatedTokens.count
+            if processedTokenCount >= cachedTokenCount,
+                processedTokenCount - cachedTokenCount <= generatedTokens.count
             {
                 cachedTokens.append(
-                    contentsOf: generatedTokens.prefix(cacheOffset - cachedTokenCount))
+                    contentsOf: generatedTokens.prefix(
+                        processedTokenCount - cachedTokenCount))
             } else {
                 // The iterator/cache relationship could not be proven
                 // (for example, a speculative iterator retained
@@ -872,31 +872,27 @@ public final class ChatSession {
                         if var currentConversation = conversation {
                             let fullTokenIds = input.text.tokens.asArray(Int.self)
                             let cachedTokenIds = currentConversation.cachedTokens
-                            let cacheOffset = kvCache.cache.first?.offset
-                            let allMainCachesAreAligned =
-                                !kvCache.cache.isEmpty
-                                && kvCache.cache.allSatisfy {
-                                    $0.offset == cachedTokenIds.count
-                                }
+                            assert(
+                                kvCache.nativeAttentionOffsetsAreAligned,
+                                "Main attention cache offsets diverged from model-cache progress")
+                            let mainCacheIsAligned =
+                                kvCache.processedTokenCount == cachedTokenIds.count
                             let draftCacheIsAligned: Bool
-                            let allDraftCachesAreAligned: Bool
                             if let draftKVCache {
+                                assert(
+                                    draftKVCache.nativeAttentionOffsetsAreAligned,
+                                    "Draft attention cache offsets diverged from model-cache progress"
+                                )
                                 draftCacheIsAligned =
-                                    draftKVCache.cache.first?.offset == cachedTokenIds.count
-                                allDraftCachesAreAligned =
-                                    !draftKVCache.cache.isEmpty
-                                    && draftKVCache.cache.allSatisfy {
-                                        $0.offset == cachedTokenIds.count
-                                    }
+                                    draftKVCache.processedTokenCount == cachedTokenIds.count
                             } else {
                                 // Tentatively reuse the main cache. If speculative
                                 // decoding is admitted below, both caches are rebuilt
                                 // from `preparedInput`; a fallback can keep this suffix.
                                 draftCacheIsAligned = true
-                                allDraftCachesAreAligned = true
                             }
                             let extendsCachedPrefix =
-                                cacheOffset == cachedTokenIds.count
+                                mainCacheIsAligned
                                 && draftCacheIsAligned
                                 && fullTokenIds.starts(with: cachedTokenIds)
 
@@ -911,7 +907,7 @@ public final class ChatSession {
                                     && !willFallBackBeforeLoadingDraft
                                     && draftKVCache == nil
                                     && !cachedTokenIds.isEmpty
-                            } else if cacheOffset != 0 {
+                            } else if kvCache.processedTokenCount != 0 {
                                 let commonPrefixCount = zip(fullTokenIds, cachedTokenIds)
                                     .prefix { $0 == $1 }
                                     .count
@@ -922,8 +918,8 @@ public final class ChatSession {
                                     commonPrefixCount > 0
                                     && commonPrefixCount < fullTokenIds.count
                                     && trimCount > 0
-                                    && allMainCachesAreAligned
-                                    && allDraftCachesAreAligned
+                                    && mainCacheIsAligned
+                                    && draftCacheIsAligned
                                     && !containsNewMedia
                                     && !hasPreparedMedia
                                     && input.text.mask == nil
@@ -932,23 +928,19 @@ public final class ChatSession {
                                     && (draftKVCache.map { canTrimPromptCache($0.cache) } ?? true)
 
                                 if canReuseCommonPrefix {
-                                    let mainTrimmed = trimPromptCache(
-                                        kvCache.cache, numTokens: trimCount)
+                                    let mainTrimmed = kvCache.trim(trimCount)
                                     let draftTrimmed = draftKVCache.map {
-                                        trimPromptCache($0.cache, numTokens: trimCount)
+                                        $0.trim(trimCount)
                                     }
                                     let mainTrimIsAligned =
                                         mainTrimmed == trimCount
-                                        && kvCache.cache.allSatisfy {
-                                            $0.offset == commonPrefixCount
-                                        }
+                                        && kvCache.processedTokenCount == commonPrefixCount
                                     let draftTrimIsAligned: Bool
                                     if let draftKVCache {
                                         draftTrimIsAligned =
                                             draftTrimmed == trimCount
-                                            && draftKVCache.cache.allSatisfy {
-                                                $0.offset == commonPrefixCount
-                                            }
+                                            && draftKVCache.processedTokenCount
+                                                == commonPrefixCount
                                     } else {
                                         draftTrimIsAligned = true
                                     }
@@ -1158,7 +1150,7 @@ public final class ChatSession {
                             let recordedAssistant = currentConversation.record(
                                 assistant,
                                 generatedTokens: generatedTokens,
-                                cacheOffset: kvCache.cache.first?.offset)
+                                processedTokenCount: kvCache.processedTokenCount)
                             if !recordedAssistant,
                                 let conversationMessageCountBeforePending
                             {
@@ -1258,7 +1250,7 @@ public final class ChatSession {
             guard case .kvcache(let stored) = cache else { return nil }
             try stored.requirePlan(kvCachePlan)
             _ = try stored.main.plan.validated(stored.main.cache)
-            return stored.main.plan.report(for: stored.main.cache)
+            return stored.main.plan.report(for: stored.main)
         }
     }
 
@@ -1275,6 +1267,17 @@ public final class ChatSession {
             default:
                 return try await body(nil)
             }
+        }
+    }
+
+    /// Return model-wide cache progress for test support.
+    func cacheProgress() async -> (main: Int, draft: Int?)? {
+        await cache.read { cache in
+            guard case .kvcache(let stored) = cache else { return nil }
+            return (
+                main: stored.main.processedTokenCount,
+                draft: stored.draft?.processedTokenCount
+            )
         }
     }
 

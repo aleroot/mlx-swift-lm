@@ -318,6 +318,19 @@ public struct KVCacheRuntimeReport: Sendable, Hashable {
 
     public let requestedConfiguration: KVCacheConfiguration
     public let layers: [Layer]
+    /// Authoritative model-wide position when the report comes from shared
+    /// cache storage. Raw array reports leave this value `nil`.
+    public let processedTokenCount: Int?
+
+    package init(
+        requestedConfiguration: KVCacheConfiguration,
+        layers: [Layer],
+        processedTokenCount: Int? = nil
+    ) {
+        self.requestedConfiguration = requestedConfiguration
+        self.layers = layers
+        self.processedTokenCount = processedTokenCount
+    }
 
     public var compressedLayerCount: Int {
         layers.filter {
