@@ -440,6 +440,8 @@ public enum ChatSessionTests {
                 responseText += text
             case .toolCall(let toolCall):
                 toolCalls.append(toolCall)
+            case .rejectedToolCall(let rejection):
+                throw RejectedToolCallError(rejection)
             case .info(let completionInfo):
                 info = completionInfo
             }
@@ -520,6 +522,8 @@ public enum ChatSessionTests {
                 followUpText += text
             case .toolCall(let call):
                 followUpCalls.append(call)
+            case .rejectedToolCall(let rejection):
+                throw RejectedToolCallError(rejection)
             case .info(let info):
                 completion = info
             }
@@ -1074,6 +1078,8 @@ public enum ToolCallTests {
                     text += chunk
                 case .toolCall(let toolCall):
                     toolCalls.append(toolCall)
+                case .rejectedToolCall(let rejection):
+                    throw RejectedToolCallError(rejection)
                 case .info:
                     break
                 }
