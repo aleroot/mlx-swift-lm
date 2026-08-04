@@ -1696,11 +1696,12 @@ public func maybeTurboQuantizeKVCache(
     let leaves = KVCacheTree.leaves(in: cache)
     logRotatingKVCacheSkipOnce(leaves: leaves)
 
-    // Boundary layer protection: the first and last attention layers are
-    // disproportionately sensitive to KV quantization, keeping 2 on each
-    // end at FP16 recovers 37-91% of the quality gap at minimal
-    // compression cost. Non-attention layers (Mamba/wrapper caches) are
-    // excluded from the rank count so hybrids protect the right layers.
+    // Boundary layer protection: the first and last TurboQuant-eligible
+    // attention layers are disproportionately sensitive to KV quantization.
+    // Two on each end use near-lossless 8-bit affine protection instead of
+    // the requested fragile strategy. Recurrent, rotating, and unsupported
+    // cache kinds are excluded from the rank count so mixed topologies protect
+    // the right global-attention layers.
     let protectedPaths = KVCacheTree.turboQuantProtectedPaths(
         in: leaves, keyBits: keyBits, valueBits: valueBits)
 

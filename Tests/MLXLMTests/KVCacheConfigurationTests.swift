@@ -414,6 +414,35 @@ struct KVCacheConfigurationTests {
         #expect(report.layers[3].reason == .awaitingCompressionStart)
     }
 
+    @Test func turboBoundaryProtectionExcludesRotatingLayersFromRanking() throws {
+        let rotating = (0 ..< 4).map { _ in RotatingKVCache(maxSize: 128) }
+        let simple = (0 ..< 6).map { _ in populatedSimpleCache(headDimension: 64) }
+        var cache: [KVCache] = [
+            rotating[0], simple[0], rotating[1], simple[1], simple[2],
+            simple[3], rotating[2], simple[4], simple[5], rotating[3],
+        ]
+        let turbo = try TurboQuantKVCacheConfiguration(
+            keyPrecision: .twoBit,
+            valuePrecision: .fourBit)
+        let configuration = KVCacheConfiguration(
+            strategy: .turboQuant(turbo),
+            compatibility: .allowPartial)
+
+        _ = try applyKVCacheConfiguration(cache: &cache, configuration: configuration)
+
+        for index in [0, 2, 6, 9] { #expect(cache[index] is RotatingKVCache) }
+        for index in [1, 3, 7, 8] { #expect(cache[index] is QuantizedKVCache) }
+        for index in [4, 5] { #expect(cache[index] is TurboQuantKVCache) }
+
+        let report = kvCacheRuntimeReport(cache: cache, configuration: configuration)
+        for index in [1, 3, 7, 8] {
+            #expect(report.layers[index].reason == .boundaryProtection)
+        }
+        for index in [0, 2, 6, 9] {
+            #expect(report.layers[index].reason == .slidingWindow)
+        }
+    }
+
     private func mixedShapeCache() -> [KVCache] {
         [populatedSimpleCache(headDimension: 64), populatedSimpleCache(headDimension: 48)]
     }

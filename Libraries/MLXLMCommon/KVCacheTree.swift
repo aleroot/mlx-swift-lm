@@ -37,6 +37,20 @@ struct KVCacheLeaf {
         }
     }
 
+    /// Whether this leaf participates in TurboQuant boundary protection.
+    ///
+    /// The ranking must remain stable as simple caches are replaced by their
+    /// affine or TurboQuant representations. Rotating and unsupported caches
+    /// are excluded because TurboQuant cannot rewrite them; including them
+    /// would shift protection away from the first and last eligible layers in
+    /// mixed cache topologies.
+    var participatesInTurboQuantBoundaryProtection: Bool {
+        switch kind {
+        case .simple, .affine, .turboQuant: true
+        case .recurrent, .rotating, .unsupported: false
+        }
+    }
+
     /// Whether this leaf can satisfy a compression strategy. `nil` identifies
     /// state that is not an attention cache and does not participate.
     func supports(
@@ -109,11 +123,14 @@ enum KVCacheTree {
         let fragile = (keyBits > 0 && keyBits < 8) || valueBits <= 2
         guard fragile else { return [] }
 
-        let attentionPaths = leaves.filter(\.isAttentionCache).map(\.path)
-        let boundaryCount = min(2, attentionPaths.count / 2)
+        let eligiblePaths =
+            leaves
+            .filter(\.participatesInTurboQuantBoundaryProtection)
+            .map(\.path)
+        let boundaryCount = min(2, eligiblePaths.count / 2)
         guard boundaryCount > 0 else { return [] }
-        return Set(attentionPaths.prefix(boundaryCount))
-            .union(attentionPaths.suffix(boundaryCount))
+        return Set(eligiblePaths.prefix(boundaryCount))
+            .union(eligiblePaths.suffix(boundaryCount))
     }
 
     private static func appendLeaves(

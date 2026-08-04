@@ -98,8 +98,10 @@ package struct KVCachePlan: Sendable, Equatable {
 /// Cache arrays have value semantics, but dynamic compression replaces array
 /// elements. Sharing this storage keeps sessions and iterators on the same
 /// realized array while the cache objects themselves remain reference types.
-/// Access is externally serialized by generation/session ownership.
-package final class KVCacheStorage: @unchecked Sendable {
+/// Access is externally serialized by generation/session ownership. This type
+/// is intentionally not `Sendable`: sharing it across isolation domains would
+/// permit unsynchronized mutation of both the cache and its progress state.
+package final class KVCacheStorage {
     package var cache: [KVCache] {
         didSet { isApplicationTerminal = false }
     }
