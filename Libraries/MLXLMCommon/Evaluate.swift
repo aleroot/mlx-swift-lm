@@ -578,6 +578,12 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     mutating func discardGeneratedToken()
 }
 
+/// Internal hook for iterators that evaluate more tokens than they have
+/// returned to the generation loop.
+protocol TokenIteratorCacheFinalizing: TokenIteratorProtocol {
+    mutating func finalizeCache()
+}
+
 extension TokenIteratorProtocol {
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
     public mutating func discardGeneratedToken() {}
@@ -891,6 +897,11 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     // Buffer of accepted tokens from the current speculation round
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
+    /// Pending tokens already represented by each cache. The final token in a
+    /// speculative round is sampled from the verifier logits but is not fed
+    /// back into either model yet, so it is deliberately excluded.
+    private var mainCommittedPendingTokenCount = 0
+    private var draftCommittedPendingTokenCount = 0
 
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
@@ -1103,6 +1114,12 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         let finalToken = mainTokens[accepted ... accepted]
         processor?.didSample(token: finalToken)
         pendingTokens.append(mainTokensList[accepted])
+        mainCommittedPendingTokenCount = accepted
+        // When every draft is accepted the draft cache still trails the main
+        // cache by one accepted token; `draftY` carries that token into the
+        // next round. Otherwise both caches contain the accepted prefix.
+        draftCommittedPendingTokenCount =
+            accepted == numDraft ? Swift.max(accepted - 1, 0) : accepted
 
         telemetry.recordRound(
             drafted: numDraft,
@@ -1152,6 +1169,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         // across the whole generation.
         pendingTokens.removeAll(keepingCapacity: true)
         pendingIndex = 0
+        mainCommittedPendingTokenCount = 0
+        draftCommittedPendingTokenCount = 0
         autoreleasepool { speculateRound() }
 
         if pendingTokens.isEmpty {
@@ -1163,7 +1182,26 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         telemetry.recordGeneratedToken()
         return token
     }
+
+    mutating func finalizeCache() {
+        // Trim through the storages so the model-wide processed-token timeline
+        // rewinds with the caches; `ChatSession` reconciles its ledger against
+        // that timeline, not against per-entry offsets.
+        let mainConsumed = Swift.min(pendingIndex, mainCommittedPendingTokenCount)
+        let mainLookahead = mainCommittedPendingTokenCount - mainConsumed
+        if mainLookahead > 0 {
+            mainCacheStorage.trim(mainLookahead)
+        }
+
+        let draftConsumed = Swift.min(pendingIndex, draftCommittedPendingTokenCount)
+        let draftLookahead = draftCommittedPendingTokenCount - draftConsumed
+        if draftLookahead > 0 {
+            draftCacheStorage.trim(draftLookahead)
+        }
+    }
 }
+
+extension SpeculativeTokenIterator: TokenIteratorCacheFinalizing {}
 
 /// Result of a call to a deprecated callback-based generate function.
 public struct GenerateResult {
@@ -1277,6 +1315,11 @@ private func buildStopTokenIds(
         if let id = tokenizer.convertTokenToId(token) {
             stopTokenIds.insert(id)
         }
+    }
+    if modelConfiguration.toolCallFormat == .gptOSS,
+        let harmonyStopTokenIDs = HarmonyFrameParser.stopTokenIDs(tokenizer: tokenizer)
+    {
+        stopTokenIds.formUnion(harmonyStopTokenIDs)
     }
     return stopTokenIds
 }
@@ -2116,8 +2159,15 @@ private func generateLoopTask<
 
                 // Check for end-of-sequence tokens
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
-                    if includeStopToken {
-                        tokenCount += 1
+                    let deliverToHandler =
+                        includeStopToken
+                        || (handler.receivesStopTokens && stopTokenIds.contains(token))
+                    if deliverToHandler {
+                        if includeStopToken {
+                            tokenCount += 1
+                        } else {
+                            iterator.discardGeneratedToken()
+                        }
                         switch handler.onStopToken(token, emit: continuation.yield) {
                         case .more:
                             break
@@ -2156,6 +2206,18 @@ private func generateLoopTask<
                 } else {
                     stopReason = .cancelled
                 }
+            }
+
+            // Speculative iterators verify several candidates at once. A stop
+            // token, consumer termination, or token limit can leave verified
+            // but unreturned candidates in their shared caches. Remove that
+            // lookahead before ChatSession reconciles its token ledger.
+            if var finalizing = iterator as? any TokenIteratorCacheFinalizing {
+                finalizing.finalizeCache()
+                // Write back: the cast copies the iterator, and the trim also
+                // updates state held inline by the iterator (not just the
+                // reference-typed caches) that later reads still observe.
+                iterator = finalizing
             }
 
             handler.onGenerationEnd(emit: continuation.yield)
@@ -2401,13 +2463,18 @@ private enum TokenLoopDisposition {
 private protocol TokenLoopHandler {
     associatedtype Output
 
+    /// Whether semantic parsing needs to observe EOS tokens even though they
+    /// are not included in the public output or generation token count.
+    var receivesStopTokens: Bool { get }
+
     /// Return `.stop` for semantic generation stops, or `.cancelled` for consumer termination.
     mutating func onToken(
         _ token: Int,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
     ) -> TokenLoopDisposition
 
-    /// Called only when includeStopToken == true and a stop token was hit.
+    /// Called when `includeStopToken` is true or ``receivesStopTokens`` is true
+    /// and a stop token was hit.
     mutating func onStopToken(
         _ token: Int,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
@@ -2419,6 +2486,10 @@ private protocol TokenLoopHandler {
     )
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Output
+}
+
+extension TokenLoopHandler {
+    var receivesStopTokens: Bool { false }
 }
 
 struct StopStringFilter {
@@ -2510,68 +2581,156 @@ struct StopStringFilter {
 private struct TextToolTokenLoopHandler: TokenLoopHandler {
     typealias Output = Generation
 
-    var detokenizer: NaiveStreamingDetokenizer
-    var stopStringFilter: StopStringFilter
-    let toolCallProcessor: ToolCallProcessor
+    private enum Mode {
+        case standard(detokenizer: NaiveStreamingDetokenizer, toolCallProcessor: ToolCallProcessor)
+        /// Full Harmony protocol (GPT-OSS): framed channels, not a tool-call syntax.
+        case harmony(HarmonyStreamAdapter)
+    }
+
+    private var mode: Mode
+    private var stopStringFilter: StopStringFilter
 
     init(
         tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
         tools: [[String: any Sendable]]? = nil
     ) {
-        detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         stopStringFilter = StopStringFilter(stopStrings: stopStrings)
-        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
+        // A tokenizer without the complete Harmony control-token set cannot run
+        // the frame parser. Degrade to the standard path — the behavior this
+        // model had before `.gptOSS` existed — rather than trapping, so the
+        // model stays usable, minus Harmony tool-call routing.
+        if format == .gptOSS, let adapter = HarmonyStreamAdapter(tokenizer: tokenizer, tools: tools)
+        {
+            mode = .harmony(adapter)
+        } else {
+            mode = .standard(
+                detokenizer: NaiveStreamingDetokenizer(tokenizer: tokenizer),
+                toolCallProcessor: ToolCallProcessor(format: format, tools: tools)
+            )
+        }
+    }
+
+    var receivesStopTokens: Bool {
+        if case .harmony = mode { return true }
+        return false
     }
 
     mutating func onToken(
         _ token: Int,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> TokenLoopDisposition {
-        detokenizer.append(token: token)
-        if let chunk = detokenizer.next() {
-            let result = stopStringFilter.process(chunk)
-            if let text = result.text {
-                let disposition = processText(text, emit: emit)
-                if case .more = disposition {
-                } else {
-                    return disposition
+        switch mode {
+        case .harmony(var adapter):
+            var disposition = TokenLoopDisposition.more
+            let shouldContinue = adapter.onToken(token) { event in
+                disposition = processHarmonyEvent(event, emit: emit)
+                switch disposition {
+                case .more:
+                    return .enqueued(remaining: Int.max)
+                case .stop, .cancelled:
+                    return .terminated
                 }
             }
-            if result.stopped {
-                return .stop
+            mode = .harmony(adapter)
+            if case .more = disposition {
+                return shouldContinue ? .more : .cancelled
             }
-        }
+            return disposition
 
-        return .more
+        case .standard(var detokenizer, let toolCallProcessor):
+            detokenizer.append(token: token)
+
+            if let chunk = detokenizer.next() {
+                let result = stopStringFilter.process(chunk)
+                if let text = result.text {
+                    let disposition = processText(
+                        text, toolCallProcessor: toolCallProcessor, emit: emit)
+                    if case .more = disposition {
+                    } else {
+                        mode = .standard(
+                            detokenizer: detokenizer, toolCallProcessor: toolCallProcessor)
+                        return disposition
+                    }
+                }
+                if result.stopped {
+                    mode = .standard(
+                        detokenizer: detokenizer, toolCallProcessor: toolCallProcessor)
+                    return .stop
+                }
+            }
+
+            mode = .standard(detokenizer: detokenizer, toolCallProcessor: toolCallProcessor)
+            return .more
+        }
     }
 
     mutating func onStopToken(
         _ token: Int,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> TokenLoopDisposition {
-        .more
+        guard case .harmony(var adapter) = mode else { return .more }
+
+        var disposition = TokenLoopDisposition.more
+        let shouldContinue = adapter.onToken(token) { event in
+            disposition = processHarmonyEvent(event, emit: emit)
+            switch disposition {
+            case .more:
+                return .enqueued(remaining: Int.max)
+            case .stop, .cancelled:
+                return .terminated
+            }
+        }
+        mode = .harmony(adapter)
+        if case .more = disposition {
+            return shouldContinue ? .more : .cancelled
+        }
+        return disposition
     }
 
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
-        if let text = stopStringFilter.finish() {
-            guard case .more = processText(text, emit: emit) else {
-                return
+        switch mode {
+        case .harmony(var adapter):
+            var disposition = TokenLoopDisposition.more
+            adapter.onGenerationEnd { event in
+                disposition = processHarmonyEvent(event, emit: emit)
+                switch disposition {
+                case .more:
+                    return .enqueued(remaining: Int.max)
+                case .stop, .cancelled:
+                    return .terminated
+                }
             }
-        }
+            mode = .harmony(adapter)
+            guard case .more = disposition else { return }
 
-        if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
-            !bufferedText.isEmpty
-        {
-            if case .terminated = emit(.chunk(bufferedText)) {
-                return
+            if let text = stopStringFilter.finish() {
+                _ = emit(.chunk(text))
             }
-        }
 
-        for toolCall in toolCallProcessor.drainToolCalls() {
-            if case .terminated = emit(.toolCall(toolCall)) {
-                break
+        case .standard(_, let toolCallProcessor):
+            if let text = stopStringFilter.finish() {
+                guard
+                    case .more = processText(
+                        text, toolCallProcessor: toolCallProcessor, emit: emit)
+                else {
+                    return
+                }
+            }
+
+            if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
+                !bufferedText.isEmpty
+            {
+                if case .terminated = emit(.chunk(bufferedText)) {
+                    return
+                }
+            }
+
+            for toolCall in toolCallProcessor.drainToolCalls() {
+                if case .terminated = emit(.toolCall(toolCall)) {
+                    break
+                }
             }
         }
     }
@@ -2582,6 +2741,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
 
     private mutating func processText(
         _ text: String,
+        toolCallProcessor: ToolCallProcessor,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> TokenLoopDisposition {
         guard !text.isEmpty else {
@@ -2601,6 +2761,30 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
         }
 
         return .more
+    }
+
+    private mutating func processHarmonyEvent(
+        _ event: Generation,
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> TokenLoopDisposition {
+        switch event {
+        case .chunk(let chunk):
+            let result = stopStringFilter.process(chunk)
+            if let text = result.text, case .terminated = emit(.chunk(text)) {
+                return .cancelled
+            }
+            return result.stopped ? .stop : .more
+
+        case .toolCall, .info:
+            // A non-text event is a hard boundary: a stop string cannot span it.
+            if let text = stopStringFilter.finish(), case .terminated = emit(.chunk(text)) {
+                return .cancelled
+            }
+            if case .terminated = emit(event) {
+                return .cancelled
+            }
+            return .more
+        }
     }
 }
 

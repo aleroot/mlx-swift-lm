@@ -57,6 +57,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
+    /// Number of pending tokens already represented by `mainCache`. The last
+    /// verifier sample is not committed until a later forward pass.
+    private var committedPendingTokenCount = 0
 
     /// Set to `true` when the iterator detects that the target can no
     /// longer emit drafter state (typically due to KV cache quantization
@@ -222,6 +225,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 // to the first speculateRound.
                 pendingTokens.append(token.item(Int.self))
                 pendingTokens.append(newToken.item(Int.self))
+                committedPendingTokenCount = 1
             } else {
                 // Prefill state already carried drafter keys; the single
                 // bonus is the input to the first speculateRound.
@@ -372,6 +376,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let finalToken = mainTokens[accepted ... accepted]
         processor?.didSample(token: finalToken)
         pendingTokens.append(mainTokensList[accepted])
+        committedPendingTokenCount = accepted
 
         proposedCount += numDraft
         acceptedCount += accepted
@@ -495,6 +500,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // Run a new speculation round (may transition to passthrough).
         pendingTokens.removeAll(keepingCapacity: true)
         pendingIndex = 0
+        committedPendingTokenCount = 0
         autoreleasepool { speculateRound() }
 
         if pendingTokens.isEmpty {
@@ -513,7 +519,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         telemetry.recordGeneratedToken()
         return token
     }
+
+    mutating func finalizeCache() {
+        let consumed = Swift.min(pendingIndex, committedPendingTokenCount)
+        let lookahead = committedPendingTokenCount - consumed
+        guard lookahead > 0 else { return }
+
+        // Trim through the storage so the model-wide processed-token timeline
+        // rewinds with the cache; `ChatSession` reconciles its ledger against
+        // that timeline, not against per-entry offsets.
+        let trimmed = mainCacheStorage.trim(lookahead)
+        trimSharedKVState(&mainState, numTokens: trimmed)
+    }
 }
+
+extension MTPSpeculativeTokenIterator: TokenIteratorCacheFinalizing {}
 
 extension MTPSpeculativeTokenIterator: MTPStatsCollecting {
     public var proposedDraftTokens: Int { proposedCount }
