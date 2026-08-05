@@ -117,7 +117,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         let kvCachePlan = try parameters.kvCachePlan()
         let mainCache = try kvCachePlan.validated(
-            mainCache ?? mainModel.newCache(parameters: parameters))
+            mainCache ?? (try mainModel.newCache(parameters: parameters)))
         self.y = input.text
         self.mainModel = mainModel
         self.drafter = drafter
