@@ -1,16 +1,22 @@
 // Copyright © 2026 Apple Inc.
 
-/// Generation-loop adapter that owns a ``HarmonyFrameParser`` and a
+/// Token-stream decoder that owns a ``HarmonyFrameParser`` and a
 /// ``HarmonyOutputRouter``.
 ///
-/// This is the only Harmony type that knows about ``Generation``. The parser
-/// stays pure; the router encodes policy; this type bridges both into the
-/// token loop's emit callback.
-struct HarmonyStreamAdapter {
+/// The parser stays pure; the router encodes policy; this type bridges both
+/// into the model-agnostic token-stream decoder contract.
+struct HarmonyStreamAdapter: TokenStreamDecoder {
     private var parser: HarmonyFrameParser
     private var router: HarmonyOutputRouter
+    private var stopStringFilter: StopStringFilter
+    let additionalStopTokenIDs: Set<Int>
+    let receivesStopTokens = true
 
-    init?(tokenizer: any Tokenizer, tools: [[String: any Sendable]]?) {
+    init?(
+        tokenizer: any Tokenizer,
+        tools: [[String: any Sendable]]?,
+        stopStrings: Set<String>
+    ) {
         guard let parser = HarmonyFrameParser(tokenizer: tokenizer) else {
             return nil
         }
@@ -18,26 +24,27 @@ struct HarmonyStreamAdapter {
         self.router = HarmonyOutputRouter(
             tokenizer: tokenizer,
             allowedToolNames: HarmonyOutputRouter.allowedToolNames(from: tools))
+        self.stopStringFilter = StopStringFilter(stopStrings: stopStrings)
+        self.additionalStopTokenIDs = parser.semanticStopTokenIDs
     }
 
     /// Feeds one token. Returns `false` when the consumer terminated.
-    mutating func onToken(
-        _ token: Int,
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> Bool {
+    mutating func push(_ token: Int, emit: (TokenStreamEvent) -> Bool) -> Bool {
         emitSteps(parser.push(token), emit: emit)
     }
 
-    mutating func onGenerationEnd(
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) {
-        _ = emitSteps(parser.finish(), emit: emit)
-        _ = emitEvents(router.finish(), emit: emit)
+    mutating func finish(emit: (TokenStreamEvent) -> Bool) -> Bool {
+        guard emitSteps(parser.finish(), emit: emit) else { return false }
+        guard emitEvents(router.finish(), emit: emit) else { return false }
+        if let text = stopStringFilter.finish() {
+            return emit(.response(text))
+        }
+        return true
     }
 
     private mutating func emitSteps(
         _ steps: [HarmonyParseStep],
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+        emit: (TokenStreamEvent) -> Bool
     ) -> Bool {
         for step in steps {
             if !emitEvents(router.route(step), emit: emit) {
@@ -47,20 +54,29 @@ struct HarmonyStreamAdapter {
         return true
     }
 
-    private func emitEvents(
+    private mutating func emitEvents(
         _ events: [HarmonyOutputRouter.Event],
-        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+        emit: (TokenStreamEvent) -> Bool
     ) -> Bool {
         for event in events {
-            let generation: Generation
             switch event {
             case .response(let text):
-                generation = .chunk(text)
+                let result = stopStringFilter.process(text)
+                if let response = result.text, !emit(.response(response)) {
+                    return false
+                }
+                if result.stopped {
+                    _ = emit(.stop)
+                    return false
+                }
+
             case .toolCall(let call):
-                generation = .toolCall(call)
-            }
-            if case .terminated = emit(generation) {
-                return false
+                // A non-text event is a hard boundary: a stop string cannot
+                // span across a tool call.
+                if let text = stopStringFilter.finish(), !emit(.response(text)) {
+                    return false
+                }
+                guard emit(.toolCall(call)) else { return false }
             }
         }
         return true

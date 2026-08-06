@@ -217,8 +217,8 @@ struct SpeculativeDecodingTests {
     }
 
     @Test(arguments: [1, 2, 4])
-    func `finalizeCache trims unreturned speculative lookahead`(consumedTokens: Int) throws {
-        // Contract: after `finalizeCache()` the shared caches must represent
+    func `finalizeGeneration trims unreturned speculative lookahead`(consumedTokens: Int) throws {
+        // Contract: after `finalizeGeneration()` the shared caches must represent
         // exactly the tokens returned to the generation loop — no verified
         // but unreturned lookahead. ChatSession relies on this to reconcile
         // its token ledger against the model-wide processed-token timeline,
@@ -247,7 +247,7 @@ struct SpeculativeDecodingTests {
         #expect(mainCache.first?.offset == 4)  // prompt + 3 committed drafts
         #expect(draftCache.first?.offset == 3)  // prompt + 2 fed drafts (trails by one)
 
-        iterator.finalizeCache()
+        iterator.finalizeGeneration()
 
         let expectedMain = 1 + Swift.min(consumed, 3)
         let expectedDraft = 1 + Swift.min(consumed, 2)
@@ -262,7 +262,7 @@ struct SpeculativeDecodingTests {
 }
 
 /// ``StableTransitionLanguageModel`` variant that maintains a real KV cache,
-/// so tests can assert cache-offset accounting (e.g. ``finalizeCache()``
+/// so tests can assert cache-offset accounting (e.g. ``finalizeGeneration()``
 /// trimming verified-but-unreturned lookahead).
 private final class CacheTrackingTransitionModel: Module, LanguageModel,
     KVCacheDimensionProvider

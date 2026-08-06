@@ -520,7 +520,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         return token
     }
 
-    mutating func finalizeCache() {
+}
+
+extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
+    mutating func finalizeGeneration() {
         let consumed = Swift.min(pendingIndex, committedPendingTokenCount)
         let lookahead = committedPendingTokenCount - consumed
         guard lookahead > 0 else { return }
@@ -532,8 +535,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         trimSharedKVState(&mainState, numTokens: trimmed)
     }
 }
-
-extension MTPSpeculativeTokenIterator: TokenIteratorCacheFinalizing {}
 
 extension MTPSpeculativeTokenIterator: MTPStatsCollecting {
     public var proposedDraftTokens: Int { proposedCount }

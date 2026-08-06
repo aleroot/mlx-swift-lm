@@ -76,8 +76,11 @@ package struct HarmonyFrameParser: Sendable {
     /// Harmony's two decode-time stop tokens. Resolve them from the tokenizer
     /// even when a converted checkpoint omitted `generation_config.json`.
     package static func stopTokenIDs(tokenizer: any Tokenizer) -> Set<Int>? {
-        guard let parser = Self(tokenizer: tokenizer) else { return nil }
-        return [parser.controls.call, parser.controls.return]
+        Self(tokenizer: tokenizer)?.semanticStopTokenIDs
+    }
+
+    package var semanticStopTokenIDs: Set<Int> {
+        [controls.call, controls.return]
     }
 
     /// The commit token that separates an assistant function call from its

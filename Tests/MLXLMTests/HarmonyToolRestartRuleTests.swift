@@ -161,7 +161,7 @@ struct HarmonyToolRestartRuleTests {
 
     @Test func `declines a cache offset ahead of the ledger`() {
         // Unreturned speculative lookahead would land the splice at the wrong
-        // position; `finalizeCache()` normally prevents this state.
+        // position; `finalizeGeneration()` normally prevents this state.
         #expect(
             rule.reuse(
                 turn: toolRestart(prompt: [1, 2, Self.callToken, 40]),

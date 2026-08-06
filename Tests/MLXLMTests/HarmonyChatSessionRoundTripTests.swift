@@ -423,6 +423,43 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
             "A lagging draft cache must not be reused for the Harmony continuation")
     }
 
+    func testRawGenerationDoesNotApplyHarmonySemanticStopTokens() async throws {
+        let fragments = ["raw token after call"]
+        let tokenizer = HarmonyTokenizer(fragments: fragments, rendered: RenderLog())
+        let configuration = ModelConfiguration(id: "gpt-oss-test", toolCallFormat: .gptOSS)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: GPTOSSMessageGenerator())
+        let model = TimelineModel(
+            timeline: [
+                Harmony.start,
+                Harmony.call,
+                Harmony.firstText,
+                Harmony.return,
+            ],
+            vocabularySize: tokenizer.vocabularySize)
+        let context = ModelContext(
+            configuration: configuration,
+            model: model,
+            processor: processor,
+            tokenizer: tokenizer)
+
+        var tokens: [Int] = []
+        let stream = try generateTokens(
+            input: LMInput(tokens: MLXArray([Harmony.start])),
+            parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+            context: context,
+            includeStopToken: true)
+        for await output in stream {
+            if let token = output.token {
+                tokens.append(token)
+            }
+        }
+
+        XCTAssertEqual(tokens, [Harmony.call, Harmony.firstText, Harmony.return])
+    }
+
     func testMessageGeneratorUsesStructuredToolMetadataOnly() throws {
         let call = ToolCall(
             function: .init(name: "get_weather", arguments: ["city": "Paris"]),

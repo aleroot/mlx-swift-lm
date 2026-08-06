@@ -145,6 +145,35 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         }
     }
 
+    /// Builds the response-protocol decoder used by streaming text generation.
+    ///
+    /// Ordinary formats share the detokenized tool-call decoder. Protocols
+    /// with token-level framing provide their own implementation here, keeping
+    /// concrete model behavior out of the generic evaluation loop.
+    func makeTokenStreamDecoder(
+        tokenizer: any Tokenizer,
+        tools: [[String: any Sendable]]?,
+        stopStrings: Set<String>
+    ) -> any TokenStreamDecoder {
+        switch self {
+        case .gptOSS:
+            if let decoder = HarmonyStreamAdapter(
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
+            {
+                return decoder
+            }
+            // Preserve the pre-Harmony compatibility path when a tokenizer
+            // lacks the protocol's complete control-token vocabulary.
+            return StandardTokenStreamDecoder(
+                tokenizer: tokenizer, format: self, tools: tools, stopStrings: stopStrings)
+
+        case .json, .lfm2, .xmlFunction, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+            .mistral, .llama3:
+            return StandardTokenStreamDecoder(
+                tokenizer: tokenizer, format: self, tools: tools, stopStrings: stopStrings)
+        }
+    }
+
     /// Cache-reuse rules required by this protocol's on-device token stream.
     ///
     /// Most formats are plain text dialects: what the model generates is what a
