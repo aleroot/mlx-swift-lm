@@ -135,7 +135,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.processor = components.logitProcessor(parameters: parameters)
 
         self.maxTokens = parameters.maxTokens
-        self.blockSize = blockSize
+        self.blockSize = Swift.min(blockSize, drafter.maximumBlockSize ?? blockSize)
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
         try prepare(input: input, prefill: parameters.prefill)
@@ -250,6 +250,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// the longest matching prefix, emit the bonus correction.
     mutating func speculateRound() {
         guard !passthrough else { return }
+        // A prior all-accepted round may keep one recurrent checkpoint until
+        // its pending output is drained so early finalization can rewind it.
+        discardSpeculativePromptCacheCheckpoints(mainCache)
 
         // A speculative round can emit up to `numDraft + 1` tokens: the
         // accepted draft prefix plus the verifier's correction/bonus token.
@@ -361,7 +364,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
         let verifyOnMainCache = canTrimPromptCache(mainCache)
-        let verifyCache = verifyOnMainCache ? mainCache : copyKVCache(mainCache)
+        let nativeHybridRewind =
+            drafter.supportsNativeTargetCacheRewind
+            && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
+        let verifyCache =
+            verifyOnMainCache || nativeHybridRewind
+            ? mainCache : copyKVCache(mainCache)
+        verifyState[mtpCacheCheckpointIndexKey] = nativeHybridRewind ? 1 : nil
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: verifyCache, state: verifyState)
         let mainLogits = mainResult.logits
@@ -438,20 +447,25 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 trimSharedKVState(&mainState, numTokens: trimmed)
             }
         } else {
-            // Hybrid models such as Qwen3.5/Qwen3.6 carry Mamba-style caches
-            // that cannot be rewound after a rejected speculative tail. Verify
-            // on a copied cache. If every draft is accepted, the verified
-            // cache already represents the committed sequence and can be
-            // adopted directly. Otherwise replay only the real prefix into
-            // the canonical cache: bonus token plus the accepted draft
-            // tokens. The finalToken is the next token to feed, so it is
-            // intentionally not replayed here.
             if rejected == 0 {
-                mainCache = verifyCache
+                if !nativeHybridRewind {
+                    mainCache = verifyCache
+                }
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
+            } else if rewindSpeculativePromptCache(
+                mainCache, numTokens: rejected) == rejected
+            {
+                // Qwen MTP-1: attention KV trims one token while every GDN
+                // cache restores the state captured after the committed bonus.
+                // The target's 9B weights are not replayed on rejection.
+                mainCacheStorage.commitProcessedTokens(accepted + 1)
+                trimSharedKVState(&mainState, numTokens: rejected)
             } else {
+                // Compatibility fallback for hybrid targets that do not yet
+                // implement in-forward recurrent checkpoints.
                 var commitState = mainState ?? state
                 commitState[mtpEmitFlagKey] = true
+                commitState[mtpCacheCheckpointIndexKey] = nil
                 let committedTokens = verifyTokens[0 ..< (accepted + 1)]
                 let committed = mainModel(
                     LMInput.Text(tokens: committedTokens)[text: .newAxis],
@@ -483,6 +497,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         passthroughReason = reason
         passthrough = true
+        discardSpeculativePromptCacheCheckpoints(mainCache)
+        mainState?[mtpEmitFlagKey] = false
+        mainState?[mtpCacheCheckpointIndexKey] = nil
+        mainState?[mtpLastHiddenStatesKey] = nil
+        mainState?[mtpSharedKVStatesKey] = nil
+        mainState?[mtpSharedKVOffsetsKey] = nil
+        mainState?[mtpPositionDeltasKey] = nil
     }
 
     /// Stand down to passthrough if the main cache cannot absorb `positions`
@@ -503,6 +524,14 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         positions: Int, reason: String
     ) -> Bool {
         guard !passthrough else { return false }
+        // A Qwen hybrid can rewind its Mamba entries from an in-forward
+        // checkpoint. Other non-trimmable caches still use the compatibility
+        // copy/replay route and must stand down before a sliding cache wraps.
+        let hasNativeRecurrentRewind =
+            drafter.supportsNativeTargetCacheRewind
+            && mainCache.contains { $0 is MambaCache }
+            && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
+        guard !hasNativeRecurrentRewind else { return false }
         let hasHeadroom = mainCache.allSatisfy {
             $0.isTrimmable(after: positions)
         }
@@ -588,6 +617,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     mutating func finalizeGeneration() {
+        // A fully consumed all-accepted round can still retain the recurrent
+        // checkpoint used for early-finalization rollback. Release it even
+        // when no committed lookahead remains.
+        defer { discardSpeculativePromptCacheCheckpoints(mainCache) }
         let consumed = Swift.min(pendingIndex, committedPendingTokenCount)
         let lookahead = committedPendingTokenCount - consumed
         guard lookahead > 0 else { return }
@@ -596,7 +629,9 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
         // rewinds with the cache; `ChatSession` reconciles its ledger against
         // that timeline, not against per-entry offsets.
         let trimmed = mainCacheStorage.trim(lookahead)
-        trimSharedKVState(&mainState, numTokens: trimmed)
+        let rewound =
+            trimmed > 0 ? trimmed : mainCacheStorage.rewindSpeculative(lookahead)
+        trimSharedKVState(&mainState, numTokens: rewound)
     }
 }
 

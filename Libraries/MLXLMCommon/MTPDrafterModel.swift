@@ -26,6 +26,14 @@ import MLXNN
 /// instance. Drafters that need their own per-stream state additionally
 /// conform to ``StatefulMTPDrafterModel``.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Largest total verification block the drafter can produce efficiently.
+    /// `nil` means the caller may choose any block size.
+    var maximumBlockSize: Int? { get }
+
+    /// Whether the paired target captures recurrent state during verification,
+    /// allowing mixed caches to rewind without a defensive pre-round copy.
+    var supportsNativeTargetCacheRewind: Bool { get }
+
     /// K-step drafting from a constant position.
     ///
     /// Returns the proposed tokens as a `[B, blockSize - 1]` MLXArray. The
@@ -64,6 +72,11 @@ public protocol MTPDrafterModel: BaseLanguageModel {
         blockSize: Int,
         sampler: any LogitSampler
     ) -> MLXArray
+}
+
+extension MTPDrafterModel {
+    public var maximumBlockSize: Int? { nil }
+    public var supportsNativeTargetCacheRewind: Bool { false }
 }
 
 /// Per-stream state for MTP drafters that need their own transient storage.
@@ -157,9 +170,10 @@ public final class MTPDrafterContainer: Sendable {
 // as method arguments. Public scope is required because writer and reader
 // live in different modules.
 
-/// Target writes its post-final-norm hidden state here (pre-lm_head,
-/// pre-softcap). ``MTPSpeculativeTokenIterator`` reads it and threads it to
-/// the drafter as `lastHidden`.
+/// Target writes the hidden representation required by its MTP head here.
+/// This is architecture-specific: Qwen uses pre-final-norm hidden state while
+/// Gemma assistants use their post-norm representation. The iterator threads
+/// it to the drafter unchanged as `lastHidden`.
 public let mtpLastHiddenStatesKey =
     LMOutput.Key<MLXArray>("mtp.lastHiddenStates")
 
@@ -187,6 +201,12 @@ public let mtpPositionDeltasKey =
 /// ``mtpLastHiddenStatesKey`` and ``mtpSharedKVStatesKey``. An absent key
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
+
+/// Requests a recurrent-cache checkpoint after this many verification input
+/// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
+/// state after the always-committed bonus token without replaying the model.
+public let mtpCacheCheckpointIndexKey =
+    LMOutput.Key<Int>("mtp.cacheCheckpointIndex")
 
 // MARK: - Iterator stats surface
 

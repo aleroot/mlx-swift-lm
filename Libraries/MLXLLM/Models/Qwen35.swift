@@ -339,15 +339,23 @@ final class Qwen35GatedDeltaNet: Module {
     func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
-        cache: MambaCache? = nil
+        cache: MambaCache? = nil,
+        checkpointAfter: Int? = nil
     ) -> MLXArray {
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
-        let (out, newConvState, newRecState) = forward(
-            inputs, convState: convState, recState: cache?[1], mask: mask)
+        let (out, newConvState, newRecState, checkpoint) = forward(
+            inputs, convState: convState, recState: cache?[1], mask: mask,
+            checkpointAfter: checkpointAfter)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
+            if let checkpoint, let checkpointAfter {
+                cache.saveSpeculativeCheckpoint(
+                    convState: checkpoint.conv,
+                    recurrentState: checkpoint.recurrent,
+                    advancedBy: checkpointAfter)
+            }
             cache.advance(inputs.dim(1))
         }
         return out
@@ -366,8 +374,17 @@ final class Qwen35GatedDeltaNet: Module {
     /// The GDN body with state passed explicitly in and out so it can be
     /// traced.
     func forward(
-        _ x: MLXArray, convState: MLXArray, recState: MLXArray?, mask: MLXArray?
-    ) -> (MLXArray, MLXArray, MLXArray) {
+        _ x: MLXArray,
+        convState: MLXArray,
+        recState: MLXArray?,
+        mask: MLXArray?,
+        checkpointAfter: Int? = nil
+    ) -> (
+        output: MLXArray,
+        convState: MLXArray,
+        recurrentState: MLXArray,
+        checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+    ) {
         let B = x.dim(0)
         let S = x.dim(1)
 
@@ -402,20 +419,61 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newRecState) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: recState,
-            mask: mask
-        )
+        let out: MLXArray
+        let newRecState: MLXArray
+        let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+        if let split = checkpointAfter, split > 0, split < S {
+            let prefixMask = mask.map { $0[0..., ..<split] }
+            let suffixMask = mask.map { $0[0..., split...] }
+            let (prefixOut, prefixState) = gatedDeltaUpdate(
+                q: qNormed[0..., ..<split, 0..., 0...],
+                k: kNormed[0..., ..<split, 0..., 0...],
+                v: v[0..., ..<split, 0..., 0...],
+                a: a[0..., ..<split, 0...],
+                b: b[0..., ..<split, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: recState,
+                mask: prefixMask)
+            let (suffixOut, suffixState) = gatedDeltaUpdate(
+                q: qNormed[0..., split..., 0..., 0...],
+                k: kNormed[0..., split..., 0..., 0...],
+                v: v[0..., split..., 0..., 0...],
+                a: a[0..., split..., 0...],
+                b: b[0..., split..., 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: prefixState,
+                mask: suffixMask)
+            out = concatenated([prefixOut, suffixOut], axis: 1)
+            newRecState = suffixState
+
+            let checkpointConv: MLXArray
+            if convKernelSize > 1 {
+                let convInput = concatenated([convState, qkv], axis: 1)
+                checkpointConv = contiguous(
+                    convInput[
+                        0..., split ..< (split + convKernelSize - 1), 0...])
+            } else {
+                checkpointConv = MLXArray.zeros([B, 0, convDim], dtype: qkv.dtype)
+            }
+            checkpoint = (checkpointConv, prefixState)
+        } else {
+            (out, newRecState) = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: recState,
+                mask: mask)
+            checkpoint = nil
+        }
 
         let gated = norm(out, gate: z)
-        return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState)
+        return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint)
     }
 
     /// The S == 1 depthwise conv as elementwise multiply-adds, so `compile`
@@ -699,7 +757,8 @@ final class Qwen35DecoderLayer: Module {
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
-        positionOffset: Int? = nil
+        positionOffset: Int? = nil,
+        checkpointAfter: Int? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else
@@ -715,7 +774,9 @@ final class Qwen35DecoderLayer: Module {
 
         let r: MLXArray
         if isLinear {
-            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+            r = linearAttn!(
+                inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
+                checkpointAfter: checkpointAfter)
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
@@ -812,7 +873,7 @@ final class Qwen35DecoderLayer: Module {
     func linearLayerBody(x: MLXArray, convState: MLXArray, recState: MLXArray) -> (
         MLXArray, MLXArray, MLXArray
     ) {
-        let (r, newConvState, newRecState) = linearAttn!.forward(
+        let (r, newConvState, newRecState, _) = linearAttn!.forward(
             inputLayerNorm(x), convState: convState, recState: recState, mask: nil)
         let h = x + r
         return (h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState)
@@ -874,7 +935,23 @@ public class Qwen35TextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
-        if inputs.dim(1) == 1, let caches = cache, let step = decodeStep(inputs, caches) {
+        forward(inputs, cache: cache, applyFinalNorm: true)
+    }
+
+    /// Backbone hidden states with optional final normalization.
+    ///
+    /// Qwen's MTP head is trained on the pre-final-norm representation. The
+    /// regular logits path keeps the compiled, normalized decode fast path;
+    /// only MTP state emission asks for the unnormalized representation.
+    func forward(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        applyFinalNorm: Bool,
+        checkpointAfter: Int? = nil
+    ) -> MLXArray {
+        if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+            let step = decodeStep(inputs, caches)
+        {
             return step
         }
 
@@ -894,10 +971,11 @@ public class Qwen35TextModelInner: Module {
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
+                checkpointAfter: checkpointAfter)
         }
 
-        return norm(hiddenStates)
+        return applyFinalNorm ? norm(hiddenStates) : hiddenStates
     }
 
     // MARK: - Whole-step decode schedule
@@ -1083,7 +1161,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
-        let hiddenStates = model(input.tokens, cache: cache)
+        let preNormHidden: MLXArray?
+        let hiddenStates: MLXArray
+        if emitDrafterState {
+            let hidden = model.forward(
+                input.tokens, cache: cache, applyFinalNorm: false,
+                checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+            preNormHidden = hidden
+            hiddenStates = model.norm(hidden)
+        } else {
+            preNormHidden = nil
+            hiddenStates = model(input.tokens, cache: cache)
+        }
 
         let logits: MLXArray
         if let lmHead {
@@ -1097,7 +1186,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         var outState = state ?? LMOutput.State()
-        outState[mtpLastHiddenStatesKey] = hiddenStates
+        outState[mtpLastHiddenStatesKey] = preNormHidden
         outState[mtpSharedKVStatesKey] = qwen35SharedKVState(
             cache: cache, fullAttentionIndex: model.faIdx)
         outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(

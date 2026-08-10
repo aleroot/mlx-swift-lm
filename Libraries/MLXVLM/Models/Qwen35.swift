@@ -514,7 +514,8 @@ enum Qwen35Language {
         func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
-            cache: MambaCache? = nil
+            cache: MambaCache? = nil,
+            checkpointAfter: Int? = nil
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
@@ -557,26 +558,68 @@ enum Qwen35Language {
                 MLXArray(invScale).asType(dtype)
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-            var out: MLXArray
-            (out, state) = gatedDeltaUpdate(
-                q: qNormed,
-                k: kNormed,
-                v: v,
-                a: a,
-                b: b,
-                aLog: aLog,
-                dtBias: dtBias,
-                state: state,
-                mask: mask
-            )
+            let out: MLXArray
+            if let split = checkpointAfter, split > 0, split < S {
+                let prefixMask = mask.map { $0[0..., ..<split] }
+                let suffixMask = mask.map { $0[0..., split...] }
+                let (prefixOut, prefixState) = gatedDeltaUpdate(
+                    q: qNormed[0..., ..<split, 0..., 0...],
+                    k: kNormed[0..., ..<split, 0..., 0...],
+                    v: v[0..., ..<split, 0..., 0...],
+                    a: a[0..., ..<split, 0...],
+                    b: b[0..., ..<split, 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: state,
+                    mask: prefixMask)
+                let (suffixOut, suffixState) = gatedDeltaUpdate(
+                    q: qNormed[0..., split..., 0..., 0...],
+                    k: kNormed[0..., split..., 0..., 0...],
+                    v: v[0..., split..., 0..., 0...],
+                    a: a[0..., split..., 0...],
+                    b: b[0..., split..., 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: prefixState,
+                    mask: suffixMask)
+                out = concatenated([prefixOut, suffixOut], axis: 1)
+                state = suffixState
+
+                if let cache {
+                    let checkpointConv: MLXArray
+                    if convKernelSize > 1 {
+                        checkpointConv = contiguous(
+                            convInput[
+                                0..., split ..< (split + convKernelSize - 1), 0...])
+                    } else {
+                        checkpointConv = MLXArray.zeros(
+                            [B, 0, convDim], dtype: mixedQKV.dtype)
+                    }
+                    cache.saveSpeculativeCheckpoint(
+                        convState: checkpointConv,
+                        recurrentState: prefixState,
+                        advancedBy: split)
+                }
+            } else {
+                (out, state) = gatedDeltaUpdate(
+                    q: qNormed,
+                    k: kNormed,
+                    v: v,
+                    a: a,
+                    b: b,
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: state,
+                    mask: mask)
+            }
 
             if let cache {
                 cache[1] = state
                 cache.advance(S)
             }
 
-            out = norm(out, gate: z)
-            return outProj(out.reshaped(B, S, -1))
+            let gated = norm(out, gate: z)
+            return outProj(gated.reshaped(B, S, -1))
         }
     }
 
@@ -677,11 +720,14 @@ enum Qwen35Language {
             attentionMask: MLXArray?,
             ssmMask: MLXArray?,
             cache: KVCache?,
-            positionIds: MLXArray?
+            positionIds: MLXArray?,
+            checkpointAfter: Int? = nil
         ) -> MLXArray {
             let r: MLXArray
             if isLinear {
-                r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+                r = linearAttn!(
+                    inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
+                    checkpointAfter: checkpointAfter)
             } else {
                 r = selfAttn!(
                     inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
@@ -718,7 +764,9 @@ enum Qwen35Language {
             _ inputs: MLXArray,
             inputsEmbeds: MLXArray? = nil,
             cache: [KVCache?]? = nil,
-            positionIds: MLXArray? = nil
+            positionIds: MLXArray? = nil,
+            applyFinalNorm: Bool = true,
+            checkpointAfter: Int? = nil
         ) -> MLXArray {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
@@ -749,11 +797,12 @@ enum Qwen35Language {
                     attentionMask: faMask,
                     ssmMask: layerSSMMask,
                     cache: cacheArray?[index],
-                    positionIds: positionIds
+                    positionIds: positionIds,
+                    checkpointAfter: checkpointAfter
                 )
             }
 
-            return norm(hiddenStates)
+            return applyFinalNorm ? norm(hiddenStates) : hiddenStates
         }
     }
 
@@ -870,12 +919,16 @@ enum Qwen35Language {
                 }
             }
 
-            let hiddenStates = model(
+            let emitDrafterState = state[mtpEmitFlagKey] ?? false
+            let preNormHidden = model(
                 inputs,
                 inputsEmbeds: inputsEmbeds,
                 cache: cache,
-                positionIds: positionIds
+                positionIds: positionIds,
+                applyFinalNorm: !emitDrafterState,
+                checkpointAfter: state[mtpCacheCheckpointIndexKey]
             )
+            let hiddenStates = emitDrafterState ? model.norm(preNormHidden) : preNormHidden
 
             var out = hiddenStates
             if let lmHead {
@@ -884,8 +937,8 @@ enum Qwen35Language {
                 out = model.embedTokens.asLinear(out)
             }
 
-            if state[mtpEmitFlagKey] ?? false {
-                state[mtpLastHiddenStatesKey] = hiddenStates
+            if emitDrafterState {
+                state[mtpLastHiddenStatesKey] = preNormHidden
                 state[mtpSharedKVStatesKey] = qwen35VLMSharedKVState(
                     cache: cache, fullAttentionIndex: model.faIdx)
                 state[mtpSharedKVOffsetsKey] = qwen35VLMSharedKVOffsets(

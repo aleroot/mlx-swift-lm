@@ -57,6 +57,20 @@ func testQwen35MTPDraftSanitizeKeepsAndShiftsMTPNorms() throws {
 }
 
 @Test
+func testQwen35StandaloneMTPDoesNotDoubleShiftConvertedNorms() throws {
+    let cfg = try JSONDecoder().decode(
+        MLXLLM.Qwen35Configuration.self,
+        from: Data(qwen35StandaloneMTPConfigJSON().utf8))
+    let drafter = MLXLLM.Qwen35MTPDraftModel(cfg, preconvertedNorms: true)
+
+    let weight = MLXArray.zeros([16])
+    let sanitized = drafter.sanitize(weights: ["mtp.norm.weight": weight])
+    let norm = try #require(sanitized["mtp.norm.weight"])
+    eval(norm)
+    #expect(allClose(norm, weight, rtol: 0, atol: 0).item(Bool.self))
+}
+
+@Test
 func testQwen35MTPDraftSanitizeStacksPerExpertMoEWeights() throws {
     let cfg = try JSONDecoder().decode(
         MLXLLM.Qwen35TextConfiguration.self,
@@ -97,128 +111,240 @@ func testQwen35MTPDraftInstantiatesDedicatedEmbeddingWhenConfigured() throws {
     #expect(sanitized["model.embed_tokens.weight"] == nil)
 }
 
-@Test
-func testQwen35MTPPredictorAdvancesOneLayerCachePerSpecStep() throws {
-    let cfg = try JSONDecoder().decode(
-        MLXLLM.Qwen35TextConfiguration.self,
-        from: Data(qwen35TextConfigJSON(mtpLayers: 2).utf8))
-    let predictor = MLXLLM.Qwen35MTPPredictor(cfg)
-    let cache = predictor.newCache()
-    let embeds = MLXArray.zeros([1, 1, 16])
-    let hidden = MLXArray.zeros([1, 1, 16])
+@Suite(.serialized)
+struct Qwen35MTPMetalTests {
+    @Test
+    func testQwen35MTPPredictorAdvancesOneLayerCachePerSpecStep() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 2).utf8))
+        let predictor = MLXLLM.Qwen35MTPPredictor(cfg)
+        let cache = predictor.newCache()
+        let embeds = MLXArray.zeros([1, 1, 16])
+        let hidden = MLXArray.zeros([1, 1, 16])
 
-    let first = predictor(
-        inputsEmbeds: embeds, hiddenStates: hidden, cache: cache[0], stepIndex: 0,
-        positionOffset: 128)
-    eval(first)
-    #expect(cache[0].offset == 1)
-    #expect(cache[1].offset == 0)
+        let first = predictor(
+            inputsEmbeds: embeds, hiddenStates: hidden, cache: cache[0], stepIndex: 0,
+            positionOffset: 128)
+        eval(first)
+        #expect(cache[0].offset == 1)
+        #expect(cache[1].offset == 0)
 
-    let second = predictor(
-        inputsEmbeds: embeds, hiddenStates: first, cache: cache[1], stepIndex: 1,
-        positionOffset: 129)
-    eval(second)
-    #expect(cache[0].offset == 1)
-    #expect(cache[1].offset == 1)
+        let second = predictor(
+            inputsEmbeds: embeds, hiddenStates: first, cache: cache[1], stepIndex: 1,
+            positionOffset: 129)
+        eval(second)
+        #expect(cache[0].offset == 1)
+        #expect(cache[1].offset == 1)
+    }
+
+    @Test
+    func testQwen35VLMMTPPositionIdsApplyMultimodalDelta() throws {
+        let positionIds = MLXVLM.qwen35MTPPositionIds(
+            offset: 10,
+            batchSize: 2,
+            positionDeltas: MLXArray([Int32(3), 5])
+        )
+
+        eval(positionIds)
+        #expect(positionIds.shape == [3, 2, 1])
+        #expect(positionIds[0, 0, 0].item(Int32.self) == 13)
+        #expect(positionIds[1, 0, 0].item(Int32.self) == 13)
+        #expect(positionIds[2, 0, 0].item(Int32.self) == 13)
+        #expect(positionIds[0, 1, 0].item(Int32.self) == 15)
+        #expect(positionIds[1, 1, 0].item(Int32.self) == 15)
+        #expect(positionIds[2, 1, 0].item(Int32.self) == 15)
+    }
+
+    @Test
+    func testQwen35VLMMTPPositionIdsRepeatAndTrimShortBatchDeltas() throws {
+        let positionIds = MLXVLM.qwen35MTPPositionIds(
+            offset: 10,
+            batchSize: 4,
+            positionDeltas: MLXArray([Int32(3), 5])
+        )
+
+        eval(positionIds)
+        #expect(positionIds.shape == [3, 4, 1])
+        #expect(positionIds[0, 0, 0].item(Int32.self) == 13)
+        #expect(positionIds[0, 1, 0].item(Int32.self) == 15)
+        #expect(positionIds[0, 2, 0].item(Int32.self) == 13)
+        #expect(positionIds[0, 3, 0].item(Int32.self) == 15)
+    }
+
+    @Test
+    func testQwen35TextModelEmitDrafterStateBySynthetic() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let model = MLXLLM.Qwen35TextModel(cfg)
+        let cache = model.newCache(parameters: nil as GenerateParameters?)
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+
+        let input = LMInput.Text(tokens: MLXArray([Int32(1), 2, 3, 4]).reshaped([1, 4]))
+        let out = model(input, cache: cache, state: state)
+
+        let hidden = try #require(out.state?[mtpLastHiddenStatesKey])
+        let sharedKV = try #require(out.state?[mtpSharedKVStatesKey])
+        let sharedKVOffsets = try #require(out.state?[mtpSharedKVOffsetsKey])
+        eval(out.logits, hidden)
+        #expect(out.logits.shape == [1, 4, 16])
+        #expect(hidden.shape == [1, 4, 16])
+        #expect(Set(sharedKV.keys) == ["full_attention"])
+        #expect(sharedKVOffsets == ["full_attention": 4])
+        let full = try #require(sharedKV["full_attention"])
+        eval(full.0, full.1)
+        #expect(full.0.shape.count == 4)
+        #expect(full.1.shape.count == 4)
+    }
+
+    @Test
+    func testQwen35TextModelEmitsPreFinalNormHiddenState() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let model = MLXLLM.Qwen35TextModel(cfg)
+        let tokens = MLXArray([Int32(1), 2, 3, 4]).reshaped([1, 4])
+        let expected = model.model.forward(tokens, applyFinalNorm: false)
+        let normalized = model.model.norm(expected)
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+
+        let output = model(LMInput.Text(tokens: tokens), cache: nil, state: state)
+        let emitted = try #require(output.state?[mtpLastHiddenStatesKey])
+        eval(expected, normalized, emitted)
+
+        #expect(allClose(emitted, expected, rtol: 0, atol: 0).item(Bool.self))
+        #expect(!allClose(emitted, normalized, rtol: 0, atol: 0).item(Bool.self))
+    }
+
+    @Test
+    func testQwen35GDNCheckpointMatchesPrefixWithoutReplayingProjections() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let layer = MLXLLM.Qwen35GatedDeltaNet(cfg)
+        let input = MLXRandom.normal([1, 2, 16])
+        let fullCache = MambaCache()
+        let speculativeCache = MambaCache()
+        let prefixCache = MambaCache()
+
+        let full = layer(input, cache: fullCache)
+        let speculative = layer(input, cache: speculativeCache, checkpointAfter: 1)
+        _ = layer(input[0..., ..<1, 0...], cache: prefixCache)
+        eval(full, speculative)
+
+        #expect(allClose(speculative, full, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        #expect(speculativeCache.hasSpeculativeCheckpoint)
+        #expect(speculativeCache.restoreSpeculativeCheckpoint())
+
+        let restored = speculativeCache.state
+        let expected = prefixCache.state
+        #expect(restored.count == expected.count)
+        for (actual, reference) in zip(restored, expected) {
+            eval(actual, reference)
+            #expect(allClose(actual, reference, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        }
+    }
+
+    @Test
+    func testQwen35VLMGDNCheckpointMatchesPrefix() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let layer = MLXVLM.Qwen35Language.GatedDeltaNet(cfg)
+        let input = MLXRandom.normal([1, 2, 16])
+        let fullCache = MambaCache()
+        let speculativeCache = MambaCache()
+        let prefixCache = MambaCache()
+
+        let full = layer(input, cache: fullCache)
+        let speculative = layer(input, cache: speculativeCache, checkpointAfter: 1)
+        _ = layer(input[0..., ..<1, 0...], cache: prefixCache)
+        eval(full, speculative)
+
+        #expect(allClose(speculative, full, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        #expect(speculativeCache.restoreSpeculativeCheckpoint())
+        for (actual, reference) in zip(speculativeCache.state, prefixCache.state) {
+            eval(actual, reference)
+            #expect(allClose(actual, reference, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        }
+    }
+
+    @Test
+    func testQwen35HybridCacheRewindRestoresAttentionAndRecurrentStateAtomically() {
+        let attention = KVCacheSimple()
+        let keys = MLXArray.zeros([1, 1, 3, 2])
+        _ = attention.update(keys: keys, values: keys)
+
+        let recurrent = MambaCache()
+        let checkpointConv = MLXArray.ones([1, 1, 4])
+        let checkpointState = MLXArray.ones([1, 2, 2, 2])
+        recurrent.saveSpeculativeCheckpoint(
+            convState: checkpointConv, recurrentState: checkpointState, advancedBy: 1)
+        recurrent[0] = MLXArray.zeros([1, 1, 4])
+        recurrent[1] = MLXArray.zeros([1, 2, 2, 2])
+
+        let rewound = rewindSpeculativePromptCache([attention, recurrent], numTokens: 1)
+        #expect(rewound == 1)
+        #expect(attention.offset == 2)
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+
+        let restored = recurrent.state
+        #expect(restored.count == 2)
+        eval(restored[0], restored[1])
+        #expect(allClose(restored[0], checkpointConv, rtol: 0, atol: 0).item(Bool.self))
+        #expect(allClose(restored[1], checkpointState, rtol: 0, atol: 0).item(Bool.self))
+    }
 }
 
-@Test
-func testQwen35VLMMTPPositionIdsApplyMultimodalDelta() throws {
-    let positionIds = MLXVLM.qwen35MTPPositionIds(
-        offset: 10,
-        batchSize: 2,
-        positionDeltas: MLXArray([Int32(3), 5])
-    )
+@Suite(.serialized)
+struct Qwen35MTPRegistrationTests {
+    @Test
+    func registrationsCreateTextAndVLMDrafters() async throws {
+        await MLXLLM.Qwen35TextMTPRegistration.register()
 
-    eval(positionIds)
-    #expect(positionIds.shape == [3, 2, 1])
-    #expect(positionIds[0, 0, 0].item(Int32.self) == 13)
-    #expect(positionIds[1, 0, 0].item(Int32.self) == 13)
-    #expect(positionIds[2, 0, 0].item(Int32.self) == 13)
-    #expect(positionIds[0, 1, 0].item(Int32.self) == 15)
-    #expect(positionIds[1, 1, 0].item(Int32.self) == 15)
-    #expect(positionIds[2, 1, 0].item(Int32.self) == 15)
-}
+        let textModel = try await MTPDrafterTypeRegistry.shared.createModel(
+            configuration: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8),
+            modelType: "qwen3_5_text")
+        #expect(textModel is MLXLLM.Qwen35MTPDraftModel)
 
-@Test
-func testQwen35VLMMTPPositionIdsRepeatAndTrimShortBatchDeltas() throws {
-    let positionIds = MLXVLM.qwen35MTPPositionIds(
-        offset: 10,
-        batchSize: 4,
-        positionDeltas: MLXArray([Int32(3), 5])
-    )
+        await MLXVLM.Qwen35VLMMTPRegistration.register()
 
-    eval(positionIds)
-    #expect(positionIds.shape == [3, 4, 1])
-    #expect(positionIds[0, 0, 0].item(Int32.self) == 13)
-    #expect(positionIds[0, 1, 0].item(Int32.self) == 15)
-    #expect(positionIds[0, 2, 0].item(Int32.self) == 13)
-    #expect(positionIds[0, 3, 0].item(Int32.self) == 15)
-}
+        let wrappedTextModel = try await MTPDrafterTypeRegistry.shared.createModel(
+            configuration: Data(qwen35WrappedTextConfigJSON(modelType: "qwen3_5").utf8),
+            modelType: "qwen3_5")
+        #expect(wrappedTextModel is MLXLLM.Qwen35MTPDraftModel)
 
-@Test
-func testQwen35TextModelEmitDrafterStateBySynthetic() throws {
-    let cfg = try JSONDecoder().decode(
-        MLXLLM.Qwen35TextConfiguration.self,
-        from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
-    let model = MLXLLM.Qwen35TextModel(cfg)
-    let cache = model.newCache(parameters: nil as GenerateParameters?)
-    var state = LMOutput.State()
-    state[mtpEmitFlagKey] = true
+        let vlmModel = try await MTPDrafterTypeRegistry.shared.createModel(
+            configuration: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8),
+            modelType: "qwen3_5")
+        #expect(vlmModel is MLXVLM.Qwen35VLMNextNDraftModel)
 
-    let input = LMInput.Text(tokens: MLXArray([Int32(1), 2, 3, 4]).reshaped([1, 4]))
-    let out = model(input, cache: cache, state: state)
+        let standalone = try await MTPDrafterTypeRegistry.shared.createModel(
+            configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),
+            modelType: "qwen3_5_mtp")
+        #expect(standalone is MLXLLM.Qwen35MTPDraftModel)
+        #expect(standalone.maximumBlockSize == 2)
+        #expect(standalone.supportsNativeTargetCacheRewind)
+    }
 
-    let hidden = try #require(out.state?[mtpLastHiddenStatesKey])
-    let sharedKV = try #require(out.state?[mtpSharedKVStatesKey])
-    let sharedKVOffsets = try #require(out.state?[mtpSharedKVOffsetsKey])
-    eval(out.logits, hidden)
-    #expect(out.logits.shape == [1, 4, 16])
-    #expect(hidden.shape == [1, 4, 16])
-    #expect(Set(sharedKV.keys) == ["full_attention"])
-    #expect(sharedKVOffsets == ["full_attention": 4])
-    let full = try #require(sharedKV["full_attention"])
-    eval(full.0, full.1)
-    #expect(full.0.shape.count == 4)
-    #expect(full.1.shape.count == 4)
-}
+    @Test
+    func registrationsAreOrderIndependentForSharedModelTypes() async throws {
+        await MLXVLM.Qwen35VLMMTPRegistration.register()
+        await MLXLLM.Qwen35TextMTPRegistration.register()
 
-@Test
-func testQwen35MTPRegistrationsCreateTextAndVLMDrafters() async throws {
-    await MLXLLM.Qwen35TextMTPRegistration.register()
+        let vlmModel = try await MTPDrafterTypeRegistry.shared.createModel(
+            configuration: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8),
+            modelType: "qwen3_5")
+        #expect(vlmModel is MLXVLM.Qwen35VLMNextNDraftModel)
 
-    let textModel = try await MTPDrafterTypeRegistry.shared.createModel(
-        configuration: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8),
-        modelType: "qwen3_5_text")
-    #expect(textModel is MLXLLM.Qwen35MTPDraftModel)
-
-    await MLXVLM.Qwen35VLMMTPRegistration.register()
-
-    let wrappedTextModel = try await MTPDrafterTypeRegistry.shared.createModel(
-        configuration: Data(qwen35WrappedTextConfigJSON(modelType: "qwen3_5").utf8),
-        modelType: "qwen3_5")
-    #expect(wrappedTextModel is MLXLLM.Qwen35MTPDraftModel)
-
-    let vlmModel = try await MTPDrafterTypeRegistry.shared.createModel(
-        configuration: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8),
-        modelType: "qwen3_5")
-    #expect(vlmModel is MLXVLM.Qwen35VLMNextNDraftModel)
-}
-
-@Test
-func testQwen35MTPRegistrationsAreOrderIndependentForSharedModelTypes() async throws {
-    await MLXVLM.Qwen35VLMMTPRegistration.register()
-    await MLXLLM.Qwen35TextMTPRegistration.register()
-
-    let vlmModel = try await MTPDrafterTypeRegistry.shared.createModel(
-        configuration: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8),
-        modelType: "qwen3_5")
-    #expect(vlmModel is MLXVLM.Qwen35VLMNextNDraftModel)
-
-    let textModel = try await MTPDrafterTypeRegistry.shared.createModel(
-        configuration: Data(qwen35WrappedTextConfigJSON(modelType: "qwen3_5").utf8),
-        modelType: "qwen3_5")
-    #expect(textModel is MLXLLM.Qwen35MTPDraftModel)
+        let textModel = try await MTPDrafterTypeRegistry.shared.createModel(
+            configuration: Data(qwen35WrappedTextConfigJSON(modelType: "qwen3_5").utf8),
+            modelType: "qwen3_5")
+        #expect(textModel is MLXLLM.Qwen35MTPDraftModel)
+    }
 }
 
 private func qwen35TextConfigJSON(
@@ -289,6 +415,18 @@ private func qwen35WrappedTextConfigJSON(modelType: String) -> String {
     {
       "model_type": "\(modelType)",
       "text_config": \(qwen35TextConfigJSON(mtpLayers: 1))
+    }
+    """
+}
+
+private func qwen35StandaloneMTPConfigJSON() -> String {
+    """
+    {
+      "model_type": "qwen3_5_mtp",
+      "block_size": 3,
+      "text_config": \(qwen35TextConfigJSON(mtpLayers: 1)),
+      "tie_word_embeddings": true,
+      "vision_config": {}
     }
     """
 }

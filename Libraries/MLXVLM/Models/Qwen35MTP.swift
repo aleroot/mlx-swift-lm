@@ -76,17 +76,29 @@ final class Qwen35VLMNextNPredictor: Module {
 
 public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
     public let configuration: Qwen35Configuration.TextConfiguration
+    public let maximumBlockSize: Int? = 2
+    public let supportsNativeTargetCacheRewind = true
+    private let preconvertedNorms: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35VLMNextNPredictor
 
-    public init(_ configuration: Qwen35Configuration.TextConfiguration) {
+    public init(
+        _ configuration: Qwen35Configuration.TextConfiguration,
+        preconvertedNorms: Bool = false
+    ) {
         self.configuration = configuration
+        self.preconvertedNorms = preconvertedNorms
         _mtp.wrappedValue = Qwen35VLMNextNPredictor(configuration)
         super.init()
     }
 
-    public convenience init(_ configuration: Qwen35Configuration) {
-        self.init(configuration.textConfiguration)
+    public convenience init(
+        _ configuration: Qwen35Configuration,
+        preconvertedNorms: Bool = false
+    ) {
+        self.init(
+            configuration.textConfiguration,
+            preconvertedNorms: preconvertedNorms)
     }
 
     public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
@@ -160,7 +172,8 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         qwenMTPSanitizeWeights(
             weights: weights,
             mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
-            numExperts: configuration.numExperts
+            numExperts: configuration.numExperts,
+            shiftNormWeights: !preconvertedNorms
         )
     }
 }

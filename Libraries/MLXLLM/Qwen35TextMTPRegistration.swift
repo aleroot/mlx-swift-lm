@@ -18,6 +18,15 @@ public enum Qwen35TextMTPRegistration {
             }
         )
         await MTPDrafterTypeRegistry.shared.registerModelType(
+            "qwen3_5_mtp",
+            matches: qwen35TextMTPConfiguration,
+            creator: { data in
+                let config = try JSONDecoder.json5().decode(
+                    Qwen35Configuration.self, from: data)
+                return Qwen35MTPDraftModel(config, preconvertedNorms: true)
+            }
+        )
+        await MTPDrafterTypeRegistry.shared.registerModelType(
             "qwen3_5",
             matches: qwen35TextMTPConfiguration,
             creator: { data in
@@ -39,19 +48,8 @@ public enum Qwen35TextMTPRegistration {
 }
 
 private func qwen35TextMTPConfiguration(_ data: Data) -> Bool {
-    guard let shape = try? JSONDecoder.json5().decode(Qwen35MTPConfigurationShape.self, from: data)
-    else {
-        return true
-    }
-    return shape.visionConfig == nil
-}
-
-private struct Qwen35MTPConfigurationShape: Decodable {
-    var visionConfig: VisionConfig?
-
-    enum CodingKeys: String, CodingKey {
-        case visionConfig = "vision_config"
-    }
-
-    struct VisionConfig: Decodable {}
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let vision = root["vision_config"] as? [String: Any]
+    else { return true }
+    return vision.isEmpty
 }

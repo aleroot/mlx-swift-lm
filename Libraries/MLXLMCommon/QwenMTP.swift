@@ -7,7 +7,8 @@ import MLXNN
 package func qwenMTPSanitizeWeights(
     weights: [String: MLXArray],
     mtpNumHiddenLayers: Int,
-    numExperts: Int
+    numExperts: Int,
+    shiftNormWeights: Bool
 ) -> [String: MLXArray] {
     var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
 
@@ -52,7 +53,9 @@ package func qwenMTPSanitizeWeights(
 
     for key in Array(sanitized.keys) {
         guard let value = sanitized[key] else { continue }
-        if normKeys.contains(where: { key.hasSuffix($0) }) && value.ndim == 1 {
+        if shiftNormWeights,
+            normKeys.contains(where: { key.hasSuffix($0) }), value.ndim == 1
+        {
             sanitized[key] = value + MLXArray(1, dtype: value.dtype)
         }
     }

@@ -408,6 +408,7 @@ func testDraftBlockAcceptsGemma4UnifiedTarget() throws {
         lastToken: MLXArray([Int32(3)]),
         lastHidden: lastHiddenSlice,
         sharedKV: sharedKV,
+        positionDeltas: nil,
         queryOffset: cache.first?.offset ?? 8,
         blockSize: 3,
         sampler: ArgMaxSampler()
