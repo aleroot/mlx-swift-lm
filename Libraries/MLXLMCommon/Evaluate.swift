@@ -748,6 +748,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.y = input.text
         self.cacheStorage = cacheStorage
 
+        try components.validate(parameters: parameters)
         self.processor = components.logitProcessor(parameters: parameters)
         self.sampler = parameters.sampler()
         self.maxTokens = parameters.maxTokens
@@ -1050,6 +1051,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.draftCacheStorage = draftCacheStorage
 
         self.sampler = parameters.sampler()
+        try components.validate(parameters: parameters)
         self.processor = components.logitProcessor(parameters: parameters)
 
         self.maxTokens = parameters.maxTokens

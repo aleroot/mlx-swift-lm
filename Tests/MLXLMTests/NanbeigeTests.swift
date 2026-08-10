@@ -193,14 +193,13 @@ final class NanbeigeTests: XCTestCase {
         XCTAssertEqual(model.toolCallFormat, .xmlFunction)
     }
 
-    /// <think>/</think>, toggled via `enable_thinking` (template default true).
-    func testDeclaresQwen3StyleReasoningConfig() throws {
+    /// Qwen-compatible thinking tags and tool-call boundary, without claiming
+    /// support for the original Qwen3 family's hard-budget transition.
+    func testDeclaresTaggedReasoningProtocol() throws {
         let model = NanbeigeModel(try makeConfig())
         let config = try XCTUnwrap(model.reasoningConfig)
-        XCTAssertEqual(config.startDelimiter, "<think>")
-        XCTAssertEqual(config.endDelimiter, "</think>")
-        XCTAssertEqual(
-            config.promptStrategy, .templateFlag(key: "enable_thinking", defaultOn: true))
-        XCTAssertTrue(config.isSpecialToken)
+        XCTAssertEqual(config, QwenReasoningProtocol.tagged)
+        XCTAssertEqual(config.implicitEndDelimiters, ["<tool_call>"])
+        XCTAssertNil(config.budgetTransition)
     }
 }

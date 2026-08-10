@@ -1175,10 +1175,10 @@ extension Qwen35Model: LoRAModel {
 // `Qwen35MoEModel` subclasses `Qwen35Model` and inherits both declarations.
 extension Qwen35Model {
     public var toolCallFormat: ToolCallFormat? { .xmlFunction }
-    public var reasoningConfig: ReasoningConfig? { .thinkTagsWithEnableThinking }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }
 
 extension Qwen35TextModel {
     public var toolCallFormat: ToolCallFormat? { .xmlFunction }
-    public var reasoningConfig: ReasoningConfig? { .thinkTagsWithEnableThinking }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }

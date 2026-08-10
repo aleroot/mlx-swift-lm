@@ -358,7 +358,7 @@ extension NanbeigeModel {
     // the chat template also supports JSON.
     public var toolCallFormat: ToolCallFormat? { .xmlFunction }
 
-    // <think>/</think>, toggled via `enable_thinking` (template default true),
-    // same contract as the Qwen3 family.
-    public var reasoningConfig: ReasoningConfig? { .thinkTagsWithEnableThinking }
+    // Nanbeige shares Qwen's thinking tags and tool-call boundary, but not the
+    // original Qwen3 family's documented hard-budget transition.
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }

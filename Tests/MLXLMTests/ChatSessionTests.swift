@@ -771,6 +771,32 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(counter.value, 2)
     }
 
+    /// Parameter-dependent components must fail through the real session API
+    /// before prompt prefill starts.
+    func testChatSessionRunsGenerationComponentValidation() async throws {
+        let inputProcessor = TestInputProcessor()
+        let components = try GenerationComponents().applyingThinkingBudget(
+            ThinkingBudgetConfiguration(
+                maximumTokenCount: 100,
+                transitionOverride: .immediate),
+            reasoning: .alwaysOnThinking,
+            tokenizer: inputProcessor.tokenizer)
+        let session = ChatSession(
+            model(processor: inputProcessor),
+            generateParameters: GenerateParameters(maxTokens: 1),
+            components: components)
+
+        do {
+            _ = try await session.respond(to: "hello")
+            XCTFail("Expected generation-component validation to reject maxTokens")
+        } catch let error as ThinkingBudgetError {
+            guard case .insufficientGenerationTokenLimit = error else {
+                XCTFail("Unexpected thinking-budget error: \(error)")
+                return
+            }
+        }
+    }
+
     /// Passing an empty ``GenerationComponents()`` must be non-breaking: the
     /// session still generates normally, exactly as when no components are
     /// supplied. (The exact processor-equivalence guarantee is proven

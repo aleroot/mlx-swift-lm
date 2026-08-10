@@ -686,5 +686,5 @@ extension Qwen3NextModel: LoRAModel {
 
 extension Qwen3NextModel {
     public var toolCallFormat: ToolCallFormat? { .xmlFunction }
-    public var reasoningConfig: ReasoningConfig? { .thinkTagsWithEnableThinking }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }
