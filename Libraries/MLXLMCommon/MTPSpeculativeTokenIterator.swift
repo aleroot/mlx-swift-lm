@@ -42,10 +42,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     var mainState: LMOutput.State?
     let mainCacheStorage: KVCacheStorage
-    var mainCache: [KVCache] {
-        get { mainCacheStorage.cache }
-        set { mainCacheStorage.replace(with: newValue) }
-    }
+    var mainCache: [KVCache] { mainCacheStorage.cache }
     var kvCachePlan: KVCachePlan { mainCacheStorage.plan }
     var drafterState: MTPDrafterState?
 
@@ -500,35 +497,40 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 let trimmed = mainCacheStorage.trim(rejected)
                 trimSharedKVState(&mainState, numTokens: trimmed)
             }
-        } else {
+        } else if nativeHybridRewind {
             if rejected == 0 {
-                if !nativeHybridRewind {
-                    mainCache = verifyCache
-                }
                 mainCacheStorage.commitProcessedTokens(verifyInput.cacheSequenceLength)
-            } else if rewindSpeculativePromptCache(
-                mainCache, numTokens: rejected) == rejected
-            {
+            } else {
+                let rewound = rewindSpeculativePromptCache(
+                    mainCache, numTokens: rejected)
+                precondition(
+                    rewound == rejected,
+                    "Target advertised native speculative rewind depth \(nativeRewindDepth), but rewound \(rewound) of \(rejected) positions"
+                )
                 // Qwen MTP-1: attention KV trims one token while every GDN
                 // cache restores the state captured after the committed bonus.
                 // The target's 9B weights are not replayed on rejection.
                 mainCacheStorage.commitProcessedTokens(accepted + 1)
                 trimSharedKVState(&mainState, numTokens: rejected)
-            } else {
-                // Compatibility fallback for hybrid targets that do not yet
-                // implement in-forward recurrent checkpoints.
-                var commitState = mainState ?? state
-                commitState[mtpEmitFlagKey] = true
-                commitState[mtpCacheCheckpointIndexKey] = nil
-                let committedTokens = verifyTokens[0 ..< (accepted + 1)]
-                let committed = mainModel(
-                    LMInput.Text(tokens: committedTokens)[text: .newAxis],
-                    cache: mainCache,
-                    state: commitState
-                )
-                mainState = committed.state
-                mainCacheStorage.commitProcessedTokens(accepted + 1)
             }
+        } else {
+            // The verifier ran on a defensive copy. Replay the accepted
+            // prefix into the caller's original cache objects instead of
+            // replacing the iterator's cache array with the copy. `[KVCache]`
+            // has value semantics even though its entries are references, so
+            // adopting `verifyCache` here would make the update invisible to
+            // a caller that intends to reuse the cache after generation.
+            var commitState = mainState ?? state
+            commitState[mtpEmitFlagKey] = true
+            commitState[mtpCacheCheckpointIndexKey] = nil
+            let committedTokens = verifyTokens[0 ..< (accepted + 1)]
+            let committed = mainModel(
+                LMInput.Text(tokens: committedTokens)[text: .newAxis],
+                cache: mainCache,
+                state: commitState
+            )
+            mainState = committed.state
+            mainCacheStorage.commitProcessedTokens(accepted + 1)
         }
 
         // Dynamic cache quantization may convert regular K/V to quantized K/V,
@@ -681,8 +683,7 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
         guard lookahead > 0 else { return }
 
         // Trim through the storage so the model-wide processed-token timeline
-        // rewinds with the cache; `ChatSession` reconciles its ledger against
-        // that timeline, not against per-entry offsets.
+        // rewinds with the cache instead of diverging from per-entry offsets.
         let trimmed = mainCacheStorage.trim(lookahead)
         let rewound =
             trimmed > 0 ? trimmed : mainCacheStorage.rewindSpeculative(lookahead)

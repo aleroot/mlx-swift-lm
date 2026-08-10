@@ -772,10 +772,10 @@ func testMTPUntrimmableCacheVerifiesOnCopyAndCommitsAcceptedPrefix() throws {
 }
 
 @Test
-func testMTPUntrimmableCacheAllAcceptedAdoptsVerifyCacheWithoutReplay() throws {
-    // When every proposed draft is accepted, the copied verify cache already
-    // represents the committed sequence. The iterator should adopt it
-    // directly instead of replaying the same prefix into the canonical cache.
+func testMTPUntrimmableCacheAllAcceptedReplaysIntoCallerCache() throws {
+    // The copied verify cache is iterator-private. Even when every draft is
+    // accepted, commit must replay into the original cache objects so a caller
+    // holding `[KVCache]` observes the authoritative post-generation state.
     let mainLogitTokens: [Int32] = [
         0, 0, 5,  // prefill follow-up picks bonus 5
         5, 5, 5, 9,  // round-1 verify: accept all three drafts, emit bonus 9
@@ -783,13 +783,14 @@ func testMTPUntrimmableCacheAllAcceptedAdoptsVerifyCacheWithoutReplay() throws {
     ]
     let main = MockMainModel(nextLogitTokens: mainLogitTokens)
     let drafter = MockDrafter(draftedTokenValue: 5)
+    let cache = NonTrimmableCountingKVCache()
     let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
 
     var iter = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: main,
         drafter: drafter,
-        mainCache: [NonTrimmableCountingKVCache()],
+        mainCache: [cache],
         parameters: GenerateParameters(maxTokens: 12),
         blockSize: 4
     )
@@ -800,13 +801,16 @@ func testMTPUntrimmableCacheAllAcceptedAdoptsVerifyCacheWithoutReplay() throws {
     #expect(iter.next() == 5)
     #expect(iter.next() == 9)
 
-    #expect(main.callCount == 2)
+    // Prefill, copied verification, then accepted-prefix replay against the
+    // original object. Its offset proves the update is caller-observable.
+    #expect(main.callCount == 3)
+    #expect(cache.offset == 7)
 
-    // Starting the next round proves the verified cache was adopted: the
-    // query offset advances from prompt span 3 to committed span 7.
+    // Starting the next round proves the replayed state remains authoritative:
+    // the query offset advances from prompt span 3 to committed span 7.
     _ = iter.next()
 
-    #expect(main.emittedSharedKVSpans.starts(with: [3, 7, 11]))
+    #expect(main.emittedSharedKVSpans.starts(with: [3, 7, 7, 11]))
     #expect(drafter.draftBlockCallCount == 2)
     #expect(drafter.receivedQueryOffsets == [3, 7])
     #expect(drafter.receivedCacheOffsets == [0, 3])
