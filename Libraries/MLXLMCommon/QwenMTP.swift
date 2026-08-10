@@ -74,8 +74,8 @@ package func draftMTPTokenBlock(
     sampler: any LogitSampler,
     cache: [KVCache],
     forward: (
-        _ inputsEmbeds: MLXArray, _ hiddenStates: MLXArray, _ cache: KVCache?,
-        _ stepIndex: Int, _ positionOffset: Int
+        _ inputsEmbeds: MLXArray, _ hiddenStates: MLXArray, _ cache: [KVCache],
+        _ positionOffset: Int
     ) -> MLXArray
 ) -> MLXArray {
     precondition(blockSize >= 2, "blockSize must be >= 2")
@@ -90,8 +90,7 @@ package func draftMTPTokenBlock(
         let mtpHidden = forward(
             inputEmbedding(tok),
             hidden,
-            cache[stepIndex % cache.count],
-            stepIndex,
+            cache,
             queryOffset + stepIndex
         )
         hidden = mtpHidden
@@ -109,4 +108,29 @@ package func draftMTPTokenBlock(
     }
 
     return concatenated(tokens, axis: 1)
+}
+
+package func normalizedMTPTokenBatch(_ tokens: MLXArray) -> MLXArray {
+    switch tokens.ndim {
+    case 1:
+        return tokens[.newAxis, 0...]
+    default:
+        return tokens
+    }
+}
+
+package func normalizedMTPColumn(_ tokens: MLXArray) -> MLXArray {
+    let tokens = normalizedMTPTokenBatch(tokens)
+    return tokens.dim(-1) == 1 ? tokens : tokens[0..., (-1)...]
+}
+
+package func sampleMTPSeed(
+    hidden: MLXArray,
+    targetEmbedTokens: Embedding,
+    lmHead: Linear?,
+    sampler: any LogitSampler
+) -> MLXArray {
+    let logits = lmHead.map { $0(hidden) } ?? targetEmbedTokens.asLinear(hidden)
+    let sampled = sampler.sample(logits: logits[0..., -1, 0...])
+    return normalizedMTPColumn(sampled)
 }

@@ -17,6 +17,7 @@ private let preservedStateKey = LMOutput.Key<Int>("tests.mtp.preservedState")
 private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var draftBlockCallCount = 0
     var draftedTokenValue: Int32
+    let requiresGreedySampling: Bool
     /// Per-call record of what the iterator handed `draftBlock`: the
     /// sequence-axis span of each sharedKV entry, and the query offset.
     /// Lets tests assert the state the drafter conditions on, not just the
@@ -26,8 +27,9 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var receivedPositionDeltaValues: [Int?] = []
     private(set) var receivedCacheOffsets: [Int?] = []
 
-    init(draftedTokenValue: Int32 = 7) {
+    init(draftedTokenValue: Int32 = 7, requiresGreedySampling: Bool = false) {
         self.draftedTokenValue = draftedTokenValue
+        self.requiresGreedySampling = requiresGreedySampling
         super.init()
     }
 
@@ -462,7 +464,7 @@ func testMTPIteratorEmptySharedKVFallsBackToPassthrough() throws {
     #expect(iter.next() == 12)
     #expect(iter.next() == nil)
     #expect(drafter.draftBlockCallCount == 0)
-    #expect(iter.passthroughReason == "main model did not emit drafter state")
+    #expect(iter.passthroughReason == "main model did not emit shared target K/V")
 }
 
 // MARK: - Pending buffer drain order
@@ -535,39 +537,32 @@ func testMTPIteratorUsesSingleStepWhenOnlyOneTokenRemains() throws {
 
 // MARK: - LogitProcessor emit-only invariant
 
-/// Records `didSample(token:)` calls so a test can verify which tokens the
-/// processor actually observed. Pure value semantics — Swift struct value
-/// copies (e.g., `var verifyProcessorCopy = processor` in `speculateRound`)
-/// produce a separate `recordedTokens` backing via array copy-on-write.
-private struct EmissionLog: LogitProcessor {
+/// Reference-backed processor proving verifier logic does not rely on an
+/// existential assignment being a deep copy.
+private final class EmissionLog: LogitProcessor {
     var recordedTokens: [Int] = []
 
-    mutating func prompt(_ prompt: MLXArray) {}
+    func prompt(_ prompt: MLXArray) {}
 
     func process(logits: MLXArray) -> MLXArray { logits }
 
-    mutating func didSample(token: MLXArray) {
+    func didSample(token: MLXArray) {
         recordedTokens.append(token.item(Int.self))
     }
 }
 
-/// Locks in the value-semantics invariant of `speculateRound`'s verify
-/// loop: `var verifyProcessorCopy = processor` makes a Swift struct copy,
-/// so `verifyProcessorCopy.didSample(...)` calls mutate the local copy
-/// and do NOT propagate back to `self.processor`. The canonical processor
-/// state at `self.processor` is updated only by the accept loop, which
-/// runs over the actually-emitted tokens (accepted drafts + correction).
+/// The canonical processor advances only for emitted tokens. In particular,
+/// a class conformer must not observe verifier rows after the first mismatch.
 ///
 /// Test scenario: bs=4 (numDraft=3), drafter proposes [5, 5, 5], main
 /// verifies and samples [5, 9, 1, 2] — only position 0 matches the draft.
 /// accepted=1, correction=9, emitted=[bonus=5, draft=5, correction=9].
-/// Verify loop's `didSample` fires four times (on the copy) for [5, 9, 1, 2].
-/// Self.processor's `didSample` should fire exactly twice (for emitted [5, 9])
-/// — NOT four times. The probe processor is installed AFTER init so the
+/// The processor's `didSample` should fire exactly twice (for emitted [5, 9])
+/// — never for [1, 2]. The probe processor is installed AFTER init so the
 /// prepare-time bonus is not recorded; the test asserts on speculation-
 /// round emissions only.
 @Test
-func testMTPVerifyLoopDidSampleStaysScopedToLocalCopy() throws {
+func testMTPVerifyLoopMutatesClassProcessorForEmittedTokensOnly() throws {
     let mainLogitTokens: [Int32] = [
         0, 0, 5,  // prefill follow-up picks bonus 5 (positions 0/1 unused, < vocab=20)
         5, 9, 1, 2,  // verify positions: only position 0 matches draft
@@ -590,7 +585,8 @@ func testMTPVerifyLoopDidSampleStaysScopedToLocalCopy() throws {
     // happens inside init's call to prepare()) hits the parameters-derived
     // processor (nil here, since no penalties were configured) rather than
     // the EmissionLog. The probe records speculation-round emissions only.
-    iter._setProcessorForTesting(EmissionLog())
+    let emissionLog = EmissionLog()
+    iter._setProcessorForTesting(emissionLog)
 
     // Manual drain — exactly 3 calls to cover prepare bonus + 1 accepted
     // draft + correction. Stopping here avoids triggering a second round
@@ -605,18 +601,28 @@ func testMTPVerifyLoopDidSampleStaysScopedToLocalCopy() throws {
     #expect(iter.proposedCount == 3, "numDraft=3 verify samples expected")
     #expect(iter.acceptedCount == 1, "only draft[0] matched")
 
-    let log = iter._processorForTesting as? EmissionLog
-    #expect(log != nil, "probe processor lost between install and drain")
-
-    // self.processor's didSample fired exactly twice — for the accepted
-    // draft and the correction — NOT for the three other verify-position
-    // samples (9, 1, 2) which happened on the local copy. If a regression
-    // ever removes the local-copy idiom, log.recordedTokens would gain
-    // entries [9, 1, 2] from the rejected verify positions.
+    #expect(iter._processorForTesting as? EmissionLog === emissionLog)
     #expect(
-        log?.recordedTokens == [5, 9],
-        "self.processor.recordedTokens=\(log?.recordedTokens ?? []) — expected [5, 9] (1 accepted draft + 1 correction). Verify-loop didSample is leaking from the copy into the canonical processor."
+        emissionLog.recordedTokens == [5, 9],
+        "recordedTokens=\(emissionLog.recordedTokens) — expected one accepted draft and one correction only"
     )
+}
+
+@Test
+func testQwenStyleMTPRequiresGreedySampling() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 6])
+    let drafter = MockDrafter(draftedTokenValue: 5, requiresGreedySampling: true)
+    let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+    var iter = try MTPSpeculativeTokenIterator(
+        input: input, mainModel: main, drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 2, temperature: 0.6), blockSize: 2)
+
+    #expect(iter.next() == 5)
+    #expect(iter.next() == 6)
+    #expect(drafter.draftBlockCallCount == 0)
+    #expect(
+        iter.passthroughReason
+            == "Qwen MTP currently requires temperature == 0; generating without speculation")
 }
 
 // MARK: - sharedKV span across partial acceptance

@@ -940,9 +940,9 @@ public class Qwen35TextModelInner: Module {
 
     /// Backbone hidden states with optional final normalization.
     ///
-    /// Qwen's MTP head is trained on the pre-final-norm representation. The
-    /// regular logits path keeps the compiled, normalized decode fast path;
-    /// only MTP state emission asks for the unnormalized representation.
+    /// MTP state emission needs access to both the residual and the final
+    /// normalized representation. The paired Qwen MTP head consumes the same
+    /// post-final-norm hidden representation used by the target LM head.
     func forward(
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
@@ -1161,16 +1161,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
-        let preNormHidden: MLXArray?
         let hiddenStates: MLXArray
         if emitDrafterState {
             let hidden = model.forward(
                 input.tokens, cache: cache, applyFinalNorm: false,
                 checkpointAfter: state?[mtpCacheCheckpointIndexKey])
-            preNormHidden = hidden
             hiddenStates = model.norm(hidden)
         } else {
-            preNormHidden = nil
             hiddenStates = model(input.tokens, cache: cache)
         }
 
@@ -1186,7 +1183,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         var outState = state ?? LMOutput.State()
-        outState[mtpLastHiddenStatesKey] = preNormHidden
+        outState[mtpLastHiddenStatesKey] = hiddenStates
         outState[mtpSharedKVStatesKey] = qwen35SharedKVState(
             cache: cache, fullAttentionIndex: model.faIdx)
         outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(
@@ -1272,6 +1269,10 @@ extension Qwen35TextModel: LoRAModel {
     }
 }
 
+extension Qwen35TextModel: SpeculativeCacheRewindModel {
+    public var maximumNativeTargetCacheRewind: Int { 1 }
+}
+
 // MARK: - Top-level Model
 
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -1326,6 +1327,10 @@ extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
     }
+}
+
+extension Qwen35Model: SpeculativeCacheRewindModel {
+    public var maximumNativeTargetCacheRewind: Int { 1 }
 }
 
 // MARK: - Chat conventions

@@ -6,7 +6,7 @@ import MLXLMCommon
 /// Registers Qwen3.5/Qwen3.6 VLM MTP drafter model types.
 ///
 /// Callers should invoke this once before loading a Qwen VLM drafter through
-/// ``MTPDrafterModelFactory``. The `"qwen3_5"` names overlap with the text
+/// `MTPDrafterModelFactory`. The `"qwen3_5"` names overlap with the text
 /// registration; config-shape predicates keep both registrations usable in
 /// the same process.
 public enum Qwen35VLMMTPRegistration {

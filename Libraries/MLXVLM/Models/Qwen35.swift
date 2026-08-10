@@ -938,7 +938,7 @@ enum Qwen35Language {
             }
 
             if emitDrafterState {
-                state[mtpLastHiddenStatesKey] = preNormHidden
+                state[mtpLastHiddenStatesKey] = hiddenStates
                 state[mtpSharedKVStatesKey] = qwen35VLMSharedKVState(
                     cache: cache, fullAttentionIndex: model.faIdx)
                 state[mtpSharedKVOffsetsKey] = qwen35VLMSharedKVOffsets(
@@ -1386,6 +1386,10 @@ public class Qwen35: Module, VLMModel {
 
         return visionModel.sanitize(weights: sanitized)
     }
+}
+
+extension Qwen35: SpeculativeCacheRewindModel {
+    public var maximumNativeTargetCacheRewind: Int { 1 }
 }
 
 extension Array where Element == THW {

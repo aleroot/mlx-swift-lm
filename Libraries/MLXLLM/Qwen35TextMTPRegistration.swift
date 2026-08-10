@@ -6,7 +6,7 @@ import MLXLMCommon
 /// Registers Qwen3.5/Qwen3.6 text MTP drafter model types.
 ///
 /// Callers should invoke this once before loading a Qwen text drafter through
-/// ``MTPDrafterModelFactory``.
+/// `MTPDrafterModelFactory`.
 public enum Qwen35TextMTPRegistration {
     public static func register() async {
         await MTPDrafterTypeRegistry.shared.registerModelType(

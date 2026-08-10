@@ -114,7 +114,7 @@ func testQwen35MTPDraftInstantiatesDedicatedEmbeddingWhenConfigured() throws {
 @Suite(.serialized)
 struct Qwen35MTPMetalTests {
     @Test
-    func testQwen35MTPPredictorAdvancesOneLayerCachePerSpecStep() throws {
+    func testQwen35MTPPredictorAdvancesEveryLayerCachePerToken() throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 2).utf8))
@@ -124,18 +124,18 @@ struct Qwen35MTPMetalTests {
         let hidden = MLXArray.zeros([1, 1, 16])
 
         let first = predictor(
-            inputsEmbeds: embeds, hiddenStates: hidden, cache: cache[0], stepIndex: 0,
+            inputsEmbeds: embeds, hiddenStates: hidden, cache: cache,
             positionOffset: 128)
         eval(first)
         #expect(cache[0].offset == 1)
-        #expect(cache[1].offset == 0)
+        #expect(cache[1].offset == 1)
 
         let second = predictor(
-            inputsEmbeds: embeds, hiddenStates: first, cache: cache[1], stepIndex: 1,
+            inputsEmbeds: embeds, hiddenStates: first, cache: cache,
             positionOffset: 129)
         eval(second)
-        #expect(cache[0].offset == 1)
-        #expect(cache[1].offset == 1)
+        #expect(cache[0].offset == 2)
+        #expect(cache[1].offset == 2)
     }
 
     @Test
@@ -200,7 +200,7 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
-    func testQwen35TextModelEmitsPreFinalNormHiddenState() throws {
+    func testQwen35TextModelEmitsPostFinalNormHiddenState() throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
@@ -215,8 +215,82 @@ struct Qwen35MTPMetalTests {
         let emitted = try #require(output.state?[mtpLastHiddenStatesKey])
         eval(expected, normalized, emitted)
 
-        #expect(allClose(emitted, expected, rtol: 0, atol: 0).item(Bool.self))
-        #expect(!allClose(emitted, normalized, rtol: 0, atol: 0).item(Bool.self))
+        #expect(allClose(emitted, normalized, rtol: 0, atol: 0).item(Bool.self))
+        #expect(!allClose(emitted, expected, rtol: 0, atol: 0).item(Bool.self))
+    }
+
+    @Test
+    func testQwen35VLMEmitsPostFinalNormHiddenState() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let model = MLXVLM.Qwen35(cfg)
+        let tokens = MLXArray([Int32(1), 2, 3, 4]).reshaped([1, 4])
+        let base = MLXArray(0 ..< 4).asType(.int32).reshaped([1, 1, 4])
+        let positionIds = broadcast(base, to: [3, 1, 4])
+        let expected = model.languageModel.model(
+            tokens, positionIds: positionIds, applyFinalNorm: false)
+        let normalized = model.languageModel.model.norm(expected)
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+
+        let output = model.languageModel(
+            tokens, cache: nil, state: state, positionIds: positionIds)
+        let emitted = try #require(output.state?[mtpLastHiddenStatesKey])
+        eval(expected, normalized, emitted)
+
+        #expect(allClose(emitted, normalized, rtol: 0, atol: 0).item(Bool.self))
+        #expect(!allClose(emitted, expected, rtol: 0, atol: 0).item(Bool.self))
+    }
+
+    @Test
+    func testQwen35DrafterCacheTracksVerifiedSequenceAcrossAcceptRejectPatterns() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let prompt = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+
+        var targetState = LMOutput.State()
+        targetState[mtpEmitFlagKey] = true
+        let targetOutput = target(LMInput.Text(tokens: prompt), cache: nil, state: targetState)
+        let promptHidden = try #require(targetOutput.state?[mtpLastHiddenStatesKey])
+
+        for pattern in [[0, 0], [0, 1], [1, 0], [1, 1]] {
+            var state = drafter.makeState(parameters: nil)
+            var bonus = MLXArray([Int32(4)])
+            drafter.prepareDrafterState(
+                target: target, promptTokens: prompt, targetHidden: promptHidden,
+                firstBonus: bonus, positionDeltas: nil, state: &state, sampler: sampler)
+            eval(state.seedToken!, state.seedHidden!)
+            #expect(state.cache.allSatisfy { $0.offset == 3 })
+            #expect(state.nextPosition == 3)
+
+            var expectedPosition = 3
+            for accepted in pattern {
+                let proposal = drafter.draftBlock(
+                    target: target, lastToken: bonus,
+                    lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
+                    positionDeltas: nil, queryOffset: expectedPosition, blockSize: 2,
+                    state: &state, sampler: sampler)
+                eval(proposal)
+                #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
+
+                let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+                let finalToken = MLXArray([Int32(8 + accepted)])
+                drafter.commitDrafterState(
+                    target: target, targetHidden: verifyHidden, draftTokens: proposal,
+                    acceptedCount: accepted, finalToken: finalToken, positionDeltas: nil,
+                    state: &state, sampler: sampler)
+                eval(state.seedToken!, state.seedHidden!)
+                expectedPosition += accepted + 1
+                #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
+                #expect(state.nextPosition == expectedPosition)
+                bonus = finalToken
+            }
+        }
     }
 
     @Test
@@ -327,7 +401,9 @@ struct Qwen35MTPRegistrationTests {
             modelType: "qwen3_5_mtp")
         #expect(standalone is MLXLLM.Qwen35MTPDraftModel)
         #expect(standalone.maximumBlockSize == 2)
-        #expect(standalone.supportsNativeTargetCacheRewind)
+        #expect(standalone.requiresPromptPrefill)
+        #expect(!standalone.requiresSharedTargetKV)
+        #expect(standalone.requiresGreedySampling)
     }
 
     @Test

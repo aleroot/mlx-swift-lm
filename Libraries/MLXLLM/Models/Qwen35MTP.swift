@@ -43,23 +43,23 @@ final class Qwen35MTPPredictor: Module {
     func callAsFunction(
         inputsEmbeds: MLXArray,
         hiddenStates previousHidden: MLXArray,
-        cache: KVCache?,
-        stepIndex: Int,
+        cache: [KVCache],
         positionOffset: Int
     ) -> MLXArray {
         var hiddenStates = concatenated(
             [preFCNormEmbedding(inputsEmbeds), preFCNormHidden(previousHidden)], axis: -1)
         hiddenStates = fc(hiddenStates)
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cache)
-        let layer = layers[stepIndex % layers.count]
-
-        hiddenStates = layer(
-            hiddenStates,
-            attentionMask: faMask,
-            ssmMask: nil,
-            cache: cache,
-            positionOffset: positionOffset)
+        precondition(cache.count == layers.count, "Qwen MTP cache/layer count mismatch")
+        for (layer, layerCache) in zip(layers, cache) {
+            let faMask = createAttentionMask(h: hiddenStates, cache: layerCache)
+            hiddenStates = layer(
+                hiddenStates,
+                attentionMask: faMask,
+                ssmMask: nil,
+                cache: layerCache,
+                positionOffset: positionOffset)
+        }
 
         return norm(hiddenStates)
     }
@@ -68,7 +68,9 @@ final class Qwen35MTPPredictor: Module {
 public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
     public let configuration: Qwen35TextConfiguration
     public let maximumBlockSize: Int? = 2
-    public let supportsNativeTargetCacheRewind = true
+    public let requiresSharedTargetKV = false
+    public let requiresPromptPrefill = true
+    public let requiresGreedySampling = true
     private let preconvertedNorms: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
@@ -92,6 +94,37 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
 
     public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: mtp.newCache())
+    }
+
+    public func prepareDrafterState(
+        target: any LanguageModel,
+        promptTokens: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) {
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let prompt = normalizedMTPTokenBatch(promptTokens)
+        let bonus = normalizedMTPColumn(firstBonus)
+        guard prompt.dim(-1) > 0 else { return }
+
+        let shifted = concatenated([prompt[0..., 1...], bonus], axis: 1)
+        let hidden = targetHidden[0..., ..<shifted.dim(1), 0...]
+        state.nextPosition = 0
+        let mtpHidden = mtp(
+            inputsEmbeds: inputEmbedding(shifted),
+            hiddenStates: hidden,
+            cache: state.cache,
+            positionOffset: 0)
+        state.nextPosition = shifted.dim(1)
+        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedToken = sampleMTPSeed(
+            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead, sampler: sampler)
+        state.proposalAppended = 0
     }
 
     public func draftBlock(
@@ -130,7 +163,16 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
     ) -> MLXArray {
         let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
-        return draftMTPTokenBlock(
+
+        if let seed = state.seedToken {
+            state.seedToken = nil
+            state.seedHidden = nil
+            state.proposalAppended = 0
+            return seed
+        }
+
+        state.proposalAppended = blockSize - 1
+        let proposed = draftMTPTokenBlock(
             targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead,
             inputEmbedding: inputEmbedding,
@@ -140,14 +182,58 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             blockSize: blockSize,
             sampler: sampler,
             cache: state.cache
-        ) { inputsEmbeds, hiddenStates, cache, stepIndex, positionOffset in
+        ) { inputsEmbeds, hiddenStates, cache, positionOffset in
             mtp(
                 inputsEmbeds: inputsEmbeds,
                 hiddenStates: hiddenStates,
                 cache: cache,
-                stepIndex: stepIndex,
                 positionOffset: positionOffset)
         }
+        state.nextPosition += state.proposalAppended
+        return proposed
+    }
+
+    public func commitDrafterState(
+        target: any LanguageModel,
+        targetHidden: MLXArray,
+        draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) {
+        let keepAppended = Swift.min(acceptedCount, state.proposalAppended)
+        let trim = state.proposalAppended - keepAppended
+        if trim > 0 {
+            trimPromptCache(state.cache, numTokens: trim)
+            state.nextPosition -= trim
+        }
+
+        var tokens = [MLXArray]()
+        var hiddens = [MLXArray]()
+        for index in keepAppended ..< acceptedCount {
+            tokens.append(draftTokens[0..., index ..< (index + 1)])
+            hiddens.append(targetHidden[0..., index ..< (index + 1), 0...])
+        }
+        tokens.append(normalizedMTPColumn(finalToken))
+        hiddens.append(targetHidden[0..., acceptedCount ..< (acceptedCount + 1), 0...])
+
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let committedTokens = concatenated(tokens, axis: 1)
+        let committedHidden = concatenated(hiddens, axis: 1)
+        let mtpHidden = mtp(
+            inputsEmbeds: inputEmbedding(committedTokens),
+            hiddenStates: committedHidden,
+            cache: state.cache,
+            positionOffset: state.nextPosition)
+        state.nextPosition += committedTokens.dim(1)
+        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedToken = sampleMTPSeed(
+            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead, sampler: sampler)
+        state.proposalAppended = 0
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

@@ -30,9 +30,19 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// `nil` means the caller may choose any block size.
     var maximumBlockSize: Int? { get }
 
-    /// Whether the paired target captures recurrent state during verification,
-    /// allowing mixed caches to rewind without a defensive pre-round copy.
-    var supportsNativeTargetCacheRewind: Bool { get }
+    /// Whether this drafter consumes target-emitted shared K/V. Qwen owns a
+    /// private full-attention cache and therefore only needs target hidden
+    /// states; Gemma-style assistants consume the shared target K/V directly.
+    var requiresSharedTargetKV: Bool { get }
+
+    /// Whether the drafter must be prefilled over the shifted prompt before
+    /// its first proposal. Qwen's private decoder cache requires this.
+    var requiresPromptPrefill: Bool { get }
+
+    /// Whether this drafter is currently supported only for greedy decoding.
+    /// This keeps stochastic generation on the ordinary target path until a
+    /// probability-ratio acceptance sampler is available.
+    var requiresGreedySampling: Bool { get }
 
     /// K-step drafting from a constant position.
     ///
@@ -76,7 +86,18 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 
 extension MTPDrafterModel {
     public var maximumBlockSize: Int? { nil }
-    public var supportsNativeTargetCacheRewind: Bool { false }
+    public var requiresSharedTargetKV: Bool { true }
+    public var requiresPromptPrefill: Bool { false }
+    public var requiresGreedySampling: Bool { false }
+}
+
+/// Target-side capability for rewinding an in-place speculative verify pass.
+///
+/// Rollback belongs to the target/cache implementation, not to the drafter.
+/// The depth is explicit so a future multi-token drafter cannot accidentally
+/// select an in-place path whose recurrent checkpoint is too shallow.
+public protocol SpeculativeCacheRewindModel {
+    var maximumNativeTargetCacheRewind: Int { get }
 }
 
 /// Per-stream state for MTP drafters that need their own transient storage.
@@ -87,8 +108,29 @@ extension MTPDrafterModel {
 public struct MTPDrafterState {
     public var cache: [KVCache]
 
-    public init(cache: [KVCache]) {
+    /// Absolute next position in a drafter-owned autoregressive cache.
+    public var nextPosition: Int
+
+    /// A proposal already computed while committing the previous verified
+    /// round. Qwen uses this to avoid advancing its cache twice.
+    public var seedToken: MLXArray?
+    public var seedHidden: MLXArray?
+
+    /// Number of tentative cache entries appended by the current proposal.
+    public var proposalAppended: Int
+
+    public init(
+        cache: [KVCache],
+        nextPosition: Int = 0,
+        seedToken: MLXArray? = nil,
+        seedHidden: MLXArray? = nil,
+        proposalAppended: Int = 0
+    ) {
         self.cache = cache
+        self.nextPosition = nextPosition
+        self.seedToken = seedToken
+        self.seedHidden = seedHidden
+        self.proposalAppended = proposalAppended
     }
 }
 
@@ -103,6 +145,17 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
     /// Create per-stream state owned and trimmed by the iterator.
     func makeState(parameters: GenerateParameters?) -> MTPDrafterState
 
+    /// Prefill drafter-owned state from the target's prompt hidden states.
+    func prepareDrafterState(
+        target: any LanguageModel,
+        promptTokens: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    )
+
     /// Stateful variant of ``MTPDrafterModel/draftBlock(target:lastToken:lastHidden:sharedKV:positionDeltas:queryOffset:blockSize:sampler:)``.
     func draftBlock(
         target: any LanguageModel,
@@ -115,6 +168,47 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
         state: inout MTPDrafterState,
         sampler: any LogitSampler
     ) -> MLXArray
+
+    /// Reconcile tentative proposal writes with the sequence accepted by the
+    /// target, then seed the next proposal if the architecture supports it.
+    func commitDrafterState(
+        target: any LanguageModel,
+        targetHidden: MLXArray,
+        draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken: MLXArray,
+        positionDeltas: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    )
+}
+
+extension StatefulMTPDrafterModel {
+    public func prepareDrafterState(
+        target _: any LanguageModel,
+        promptTokens _: MLXArray,
+        targetHidden _: MLXArray,
+        firstBonus _: MLXArray,
+        positionDeltas _: MLXArray?,
+        state _: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) {}
+
+    public func commitDrafterState(
+        target _: any LanguageModel,
+        targetHidden _: MLXArray,
+        draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken _: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) {
+        let rejected = draftTokens.dim(-1) - acceptedCount
+        if rejected > 0 {
+            trimPromptCache(state.cache, numTokens: rejected)
+        }
+    }
 }
 
 /// Lightweight context for an MTP drafter — simpler than `ModelContext`
@@ -171,9 +265,10 @@ public final class MTPDrafterContainer: Sendable {
 // live in different modules.
 
 /// Target writes the hidden representation required by its MTP head here.
-/// This is architecture-specific: Qwen uses pre-final-norm hidden state while
-/// Gemma assistants use their post-norm representation. The iterator threads
-/// it to the drafter unchanged as `lastHidden`.
+/// This is architecture-specific, but must match the representation used to
+/// train the paired MTP head. Qwen and Gemma assistants both publish their
+/// post-final-norm representation. The iterator threads it to the drafter
+/// unchanged as `lastHidden`.
 public let mtpLastHiddenStatesKey =
     LMOutput.Key<MLXArray>("mtp.lastHiddenStates")
 
