@@ -954,13 +954,8 @@ public final class ChatSession {
                         }
                         let structuredToolCallCount = templateMessages.reduce(into: 0) {
                             count, message in
-                            // GPT-OSS renders at most one call from each
-                            // assistant message. Other protocols ignore this
-                            // model-specific boundary count.
-                            if message.role == .assistant,
-                                message.tool?.calls?.isEmpty == false
-                            {
-                                count += 1
+                            if message.role == .assistant {
+                                count += message.tool?.calls?.count ?? 0
                             }
                         }
 

@@ -170,6 +170,8 @@ final class StopStringTests: XCTestCase {
 
         let continued = decoder.push(1) { event in
             switch event {
+            case .reasoning:
+                return true
             case .response:
                 return true
             case .toolCall(let toolCall):

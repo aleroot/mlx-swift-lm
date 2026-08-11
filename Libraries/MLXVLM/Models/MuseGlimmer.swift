@@ -1055,6 +1055,12 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
 
     public var vocabularySize: Int { config.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
+    public var toolCallFormat: ToolCallFormat? { .atem }
+    public var reasoningConfig: ReasoningConfig? {
+        ReasoningConfig(
+            startDelimiter: "to=self<|message|>", endDelimiter: "<|eom|>",
+            promptStrategy: .none, isSpecialToken: true)
+    }
 
     public init(_ config: MuseGlimmerConfiguration) {
         self.config = config
@@ -1368,6 +1374,11 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
+        // The released processor has no video patchification path. Reject it
+        // explicitly so a rendered `<|video|>` placeholder cannot reach the
+        // model without corresponding features.
+        guard input.videos.isEmpty else { throw VLMError.singleMediaTypeAllowed }
+
         let messages = Qwen2VLMessageGenerator().generate(from: input)
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools, additionalContext: input.additionalContext)

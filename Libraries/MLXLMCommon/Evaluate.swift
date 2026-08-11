@@ -2141,6 +2141,35 @@ public func generateTokensTask(
     )
 }
 
+/// Package-only raw generation for framed response protocols.
+///
+/// The decoder remains owned by the caller; this function only applies its
+/// semantic stop-token policy to the generic generation loop.
+package func generateProtocolTokensTask(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    state: LMOutput.State? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    decoder: (any TokenStreamDecoder)?,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
+    let iterator = try TokenIterator(
+        input: input, model: context.model, cache: cache, state: state,
+        parameters: parameters, components: components)
+    return generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: RawTokenLoopHandler(
+            additionalStopTokenIDs: decoder?.additionalStopTokenIDs ?? [],
+            receivesStopTokens: decoder?.receivesStopTokens ?? false)
+    )
+}
+
 /// Low-level raw token generation using a `TokenIterator`, returning an
 /// `AsyncStream<TokenGeneration>` and a `Task`.
 ///
@@ -2688,6 +2717,12 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> TokenLoopDisposition {
         switch event {
+        case .reasoning:
+            // The public Generation stream intentionally exposes only response
+            // text and tool calls. Protocol-aware clients consume reasoning via
+            // the package-level TokenStreamDecoder contract.
+            return .more
+
         case .response(let response):
             if case .terminated = emit(.chunk(response)) {
                 return .cancelled
@@ -2708,6 +2743,14 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
 
 private struct RawTokenLoopHandler: TokenLoopHandler {
     typealias Output = TokenGeneration
+
+    let additionalStopTokenIDs: Set<Int>
+    let receivesStopTokens: Bool
+
+    init(additionalStopTokenIDs: Set<Int> = [], receivesStopTokens: Bool = false) {
+        self.additionalStopTokenIDs = additionalStopTokenIDs
+        self.receivesStopTokens = receivesStopTokens
+    }
 
     mutating func onToken(
         _ token: Int,

@@ -275,7 +275,13 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let museGlimmer30B4bit = ModelConfiguration(
         id: "mlx-community/Muse-Glimmer-30B-4bit",
         defaultPrompt: "Describe the image in English",
-        extraEOSTokens: ["<|eot|>", "<|end_of_text|>"]
+        extraEOSTokens: ["<|eot|>", "<|end_of_text|>"],
+        toolCallFormat: .atem,
+        reasoningConfig: ReasoningConfig(
+            startDelimiter: "to=self<|message|>",
+            endDelimiter: "<|eom|>",
+            promptStrategy: .none,
+            isSpecialToken: true)
     )
 
     static public func all() -> [ModelConfiguration] {

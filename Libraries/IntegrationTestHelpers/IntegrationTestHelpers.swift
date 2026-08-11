@@ -105,6 +105,74 @@ public enum HarmonyProtocolTests {
     }
 }
 
+// MARK: - Muse Glimmer tokenizer contract
+
+public enum MuseGlimmerProtocolTests {
+    /// Exercises Meta's production Onyx control vocabulary and ATEM chat
+    /// template without loading the 30B checkpoint.
+    public static func realTokenizerContract(tokenizer: any Tokenizer) throws {
+        let expectedControlTokenIDs = [
+            "<|begin_of_text|>": 200_000,
+            "<|end_of_text|>": 200_001,
+            "<|eom|>": 200_007,
+            "<|eot|>": 200_008,
+            "<|start|>": 200_022,
+            "<|message|>": 200_023,
+        ]
+        for (token, expectedID) in expectedControlTokenIDs {
+            try check(
+                tokenizer.convertTokenToId(token) == expectedID,
+                "Muse Glimmer tokenizer resolved \(token) to "
+                    + "\(String(describing: tokenizer.convertTokenToId(token))); expected \(expectedID)"
+            )
+            try check(
+                tokenizer.encode(text: token, addSpecialTokens: false) == [expectedID],
+                "Muse Glimmer tokenizer did not encode \(token) atomically")
+        }
+
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "weather.get",
+                    "description": "Get weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "city": ["type": "string"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["city"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+        let call = ToolCall(
+            function: .init(name: "weather.get", arguments: ["city": "Paris"]),
+            id: "call_fixture")
+        let messages = DefaultMessageGenerator().generate(messages: [
+            .user("Weather in Paris?"),
+            .assistant("", toolCalls: [call]),
+            .tool(#"{"forecast":"sunny"}"#, id: "call_fixture"),
+        ])
+        let rendered = try tokenizer.applyChatTemplate(
+            messages: messages, tools: tools, additionalContext: nil)
+        let text = tokenizer.decode(tokenIds: rendered, skipSpecialTokens: false)
+        try check(
+            text.contains(#"<atem:invoke name="weather.get">"#),
+            "Muse Glimmer template omitted the structured ATEM call")
+        try check(
+            text.contains(#"<tool_output name="weather.get">"#),
+            "Muse Glimmer template did not correlate the tool result by call id")
+        try check(
+            text.hasSuffix("<|start|>assistant"),
+            "Muse Glimmer template omitted the assistant continuation prompt")
+        try check(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: tools, stopStrings: []) != nil,
+            "ATEM protocol adapter rejected the production Muse Glimmer tokenizer")
+    }
+}
+
 // MARK: - Network Retry
 
 /// Transient network failures worth retrying on a flaky CI network — chiefly

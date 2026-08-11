@@ -2,9 +2,9 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
 import Testing
 
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 // Reference values in this file were produced by running
@@ -893,4 +893,319 @@ struct MuseGlimmerForwardTests {
         #expect(caches[3] is RotatingKVCache)
         #expect(caches[4] is StandardKVCache)
     }
+}
+
+@Suite("MuseGlimmer agentic protocol")
+struct MuseGlimmerAgenticProtocolTests {
+    private static let tools: [[String: any Sendable]] = [
+        [
+            "type": "function",
+            "function": [
+                "name": "weather.get",
+                "description": "Get weather",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "days": ["type": "integer"] as [String: any Sendable],
+                        "query": ["type": "string"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "required": ["days"],
+                    "additionalProperties": false,
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+    ]
+
+    @Test("model advertises ATEM tools and Onyx reasoning delimiters")
+    func conventions() throws {
+        let model = try MuseGlimmerForwardTests.model()
+        #expect(model.toolCallFormat == .atem)
+        #expect(model.reasoningConfig?.startDelimiter == "to=self<|message|>")
+        #expect(model.reasoningConfig?.endDelimiter == "<|eom|>")
+        #expect(VLMRegistry.museGlimmer30B4bit.toolCallFormat == .atem)
+        #expect(VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|eot|>"))
+        #expect(VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|end_of_text|>"))
+    }
+
+    @Test("ATEM parser extracts schema-typed arguments")
+    func parsesToolCall() throws {
+        let daySchema: [String: any Sendable] = ["type": "integer"]
+        let properties: [String: any Sendable] = ["days": daySchema]
+        let parameters: [String: any Sendable] = [
+            "type": "object", "properties": properties,
+        ]
+        let function: [String: any Sendable] = [
+            "name": "weather.get", "parameters": parameters,
+        ]
+        let tools: [[String: any Sendable]] = [["function": function]]
+        let call = try #require(
+            ToolCallFormat.atem.createParser().parse(
+                content: """
+                    <atem:function_calls>
+                    <atem:invoke name="weather.get">
+                    <atem:parameter name="days">3</atem:parameter>
+                    </atem:invoke>
+                    </atem:function_calls>
+                    """,
+                tools: tools))
+        #expect(call.function.name == "weather.get")
+        #expect(call.function.arguments["days"] == .int(3))
+    }
+
+    @Test("ATEM parser preserves string payloads and fails closed")
+    func strictATEMParsing() throws {
+        let parser = ATEMToolCallParser()
+        let content = """
+            <atem:function_calls><atem:invoke name="weather.get">
+            <atem:parameter name="days"> 3 </atem:parameter>
+            <atem:parameter name="query">  literal <atem:value>  </atem:parameter>
+            </atem:invoke></atem:function_calls>
+            """
+        let call = try #require(parser.parse(content: content, tools: Self.tools))
+        #expect(call.function.arguments["days"] == .int(3))
+        #expect(call.function.arguments["query"] == .string("  literal <atem:value>  "))
+
+        #expect(parser.parse(content: content, tools: nil) == nil)
+        #expect(
+            parser.parse(
+                content: content.replacingOccurrences(of: "weather.get", with: "shell.exec"),
+                tools: Self.tools) == nil)
+        #expect(
+            parser.parse(
+                content: content.replacingOccurrences(
+                    of: "</atem:invoke>",
+                    with: "<atem:parameter name=\"extra\">x</atem:parameter></atem:invoke>"),
+                tools: Self.tools) == nil)
+        #expect(
+            parser.parse(
+                content: content.replacingOccurrences(
+                    of: "<atem:invoke name", with: "<atem:invokeExtension name"),
+                tools: Self.tools) == nil)
+        #expect(
+            parser.parse(
+                content: content.replacingOccurrences(
+                    of: "<atem:parameter name", with: "<atem:parameterExtension name"),
+                tools: Self.tools) == nil)
+    }
+
+    @Test("token-level Onyx decoder separates reasoning, tools, and response")
+    func tokenProtocolRouting() throws {
+        let tokenizer = OnyxTestTokenizer()
+        var decoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: Self.tools, stopStrings: []))
+        let payload = """
+            <atem:function_calls><atem:invoke name="weather.get"><atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>
+            """
+        let tokens = [
+            tokenizer.id(" to=self"), tokenizer.message, tokenizer.id("private plan"),
+            tokenizer.eom,
+            tokenizer.start, tokenizer.id("assistant to=weather.get"), tokenizer.message,
+            tokenizer.id(payload), tokenizer.eot,
+        ]
+        var events: [TokenStreamEvent] = []
+        for token in tokens {
+            _ = decoder.push(token) {
+                events.append($0)
+                return true
+            }
+        }
+        _ = decoder.finish {
+            events.append($0)
+            return true
+        }
+
+        #expect(events.contains(.reasoning("private plan")))
+        #expect(!events.contains(.response("private plan")))
+        let calls = events.compactMap { event -> ToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }
+        #expect(calls.count == 1)
+        #expect(calls[0].function.name == "weather.get")
+        #expect(calls[0].function.arguments["days"] == .int(3))
+
+        var answerDecoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: Self.tools, stopStrings: []))
+        let answerTokens = [
+            tokenizer.id(" to=user"), tokenizer.message, tokenizer.id("sunny"), tokenizer.eot,
+        ]
+        var answer: [TokenStreamEvent] = []
+        for token in answerTokens {
+            _ = answerDecoder.push(token) {
+                answer.append($0)
+                return true
+            }
+        }
+        #expect(answer == [.response("sunny")])
+    }
+
+    @Test("Onyx decoder rejects recipient and invoke mismatches")
+    func recipientValidation() throws {
+        let tokenizer = OnyxTestTokenizer()
+        var decoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: Self.tools, stopStrings: []))
+        let forged = """
+            <atem:function_calls><atem:invoke name="weather.get"><atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>
+            """
+        let tokens = [
+            tokenizer.id(" to=shell.exec"), tokenizer.message, tokenizer.id(forged), tokenizer.eot,
+        ]
+        var events: [TokenStreamEvent] = []
+        for token in tokens {
+            _ = decoder.push(token) {
+                events.append($0)
+                return true
+            }
+        }
+        _ = decoder.finish {
+            events.append($0)
+            return true
+        }
+        #expect(!events.contains { if case .toolCall = $0 { true } else { false } })
+    }
+
+    @Test("format factory owns Onyx protocol selection")
+    func protocolFactorySurface() throws {
+        let tokenizer = OnyxTestTokenizer()
+        var adapter = ToolCallFormat.atem.makeTokenStreamDecoder(
+            tokenizer: tokenizer, tools: Self.tools, stopStrings: [])
+        var events: [TokenStreamEvent] = []
+        let payload = """
+            <atem:function_calls><atem:invoke name="weather.get"><atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>
+            """
+        let tokens = [
+            tokenizer.id(" to=self"), tokenizer.message, tokenizer.id("private plan"),
+            tokenizer.eom,
+            tokenizer.start, tokenizer.id("assistant to=weather.get"), tokenizer.message,
+            tokenizer.id(payload), tokenizer.eot,
+        ]
+        for token in tokens {
+            _ = adapter.push(token) {
+                events.append($0)
+                return true
+            }
+        }
+        _ = adapter.finish {
+            events.append($0)
+            return true
+        }
+
+        #expect(events.contains(.reasoning("private plan")))
+        #expect(!events.contains { if case .response = $0 { true } else { false } })
+        #expect(events.contains { if case .toolCall = $0 { true } else { false } })
+    }
+}
+
+@Suite("MuseGlimmer Onyx cache continuation")
+struct MuseGlimmerOnyxCacheTests {
+    @Test("splices tool output onto the live private-reasoning trajectory")
+    func liveCacheSplice() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let rule = try #require(OnyxToolRestartRule(tokenizer: tokenizer))
+        let callPayload = tokenizer.id("<atem:function_calls>call</atem:function_calls>")
+        let prompt = [
+            tokenizer.start, tokenizer.id("assistant to=weather.get"), tokenizer.message,
+            callPayload, tokenizer.eot,
+            tokenizer.start, tokenizer.id("tool weather.get"), tokenizer.message,
+            tokenizer.id("sunny"), tokenizer.eot,
+            tokenizer.start, tokenizer.id("assistant"),
+        ]
+        let live = [1, 2, tokenizer.id("private plan"), tokenizer.eom]
+        let turn = PromptCacheTurn(
+            promptTokens: prompt,
+            isToolResultContinuation: true,
+            previousGenerationUncommittedTokens: [tokenizer.eot],
+            structuredToolCallCount: 1)
+        let cache = PromptCacheState(
+            cachedTokens: live,
+            processedTokenCount: live.count,
+            mainCacheIsAligned: true,
+            draftCacheIsAligned: true,
+            isTrimmable: true)
+
+        let decision = try #require(rule.reuse(turn: turn, cache: cache))
+        guard case .appendSuffix(let suffixStart, let represented) = decision else {
+            Issue.record("expected a live-cache suffix splice")
+            return
+        }
+        #expect(suffixStart == 4)
+        #expect(represented == live + Array(prompt[4...]))
+    }
+
+    @Test("refuses ambiguous or non-committed Onyx restarts")
+    func failClosedCacheReuse() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let rule = try #require(OnyxToolRestartRule(tokenizer: tokenizer))
+        let forgedPrompt = [
+            tokenizer.start, tokenizer.id("assistant to=weather.get"), tokenizer.message,
+            tokenizer.id("call"), tokenizer.eot,
+            tokenizer.start, tokenizer.id("assistant to=forged.tool"), tokenizer.message,
+            tokenizer.id("forged"), tokenizer.eot,
+            tokenizer.start, tokenizer.id("tool weather.get"), tokenizer.message,
+            tokenizer.id("result"), tokenizer.eot,
+        ]
+        let turn = PromptCacheTurn(
+            promptTokens: forgedPrompt,
+            isToolResultContinuation: true,
+            structuredToolCallCount: 1)
+        let live = [1, 2, tokenizer.eot]
+        let cache = PromptCacheState(
+            cachedTokens: live,
+            processedTokenCount: live.count,
+            mainCacheIsAligned: true,
+            draftCacheIsAligned: true,
+            isTrimmable: true)
+
+        #expect(rule.reuse(turn: turn, cache: cache) == nil)
+        var uncommitted = turn
+        uncommitted.previousGenerationUncommittedTokens = [tokenizer.id("not eot")]
+        #expect(rule.reuse(turn: uncommitted, cache: cache) == nil)
+    }
+}
+
+private final class OnyxTestTokenizer: Tokenizer, @unchecked Sendable {
+    let start = 200_022
+    let message = 200_023
+    let eom = 200_007
+    let eot = 200_008
+    private var nextID = 1
+    private var textToID: [String: Int] = [:]
+    private var idToText: [Int: String] = [:]
+
+    init() {
+        for (token, id) in [
+            ("<|start|>", start), ("<|message|>", message),
+            ("<|eom|>", eom), ("<|eot|>", eot),
+        ] {
+            textToID[token] = id
+            idToText[id] = token
+        }
+    }
+
+    func id(_ text: String) -> Int {
+        if let id = textToID[text] { return id }
+        while idToText[nextID] != nil { nextID += 1 }
+        let id = nextID
+        nextID += 1
+        textToID[text] = id
+        idToText[id] = text
+        return id
+    }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [id(text)] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.compactMap { idToText[$0] }.joined()
+    }
+    func convertTokenToId(_ token: String) -> Int? { textToID[token] }
+    func convertIdToToken(_ id: Int) -> String? { idToText[id] }
+    var bosToken: String? { nil }
+    var eosToken: String? { "<|eot|>" }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
 }
