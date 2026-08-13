@@ -154,8 +154,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             && mainCache.contains { $0 is MambaCache }
             && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
         if !usesNativeHybridRewind {
-            guard let probe = self.mainCacheStorage.beginRound(
-                maximumPositions: effectiveBlockSize)
+            guard
+                let probe = self.mainCacheStorage.beginRound(
+                    maximumPositions: effectiveBlockSize)
             else {
                 throw KVCacheError(
                     message: "MTP speculative decoding requires a stageable main KV cache.")
@@ -406,7 +407,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             nativeRewindDepth >= numDraft
             && mainCache.contains { $0 is MambaCache }
             && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
-        let round = nativeHybridRewind
+        let round =
+            nativeHybridRewind
             ? nil : mainCacheStorage.beginRound(maximumPositions: numDraft + 1)
         guard nativeHybridRewind || round != nil else {
             switchToPassthrough(
