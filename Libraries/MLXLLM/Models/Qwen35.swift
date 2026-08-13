@@ -1188,15 +1188,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             cache: cache, fullAttentionIndex: model.faIdx)
         outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(
             cache: cache, fullAttentionIndex: model.faIdx)
+        outState[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
         return LMOutput(logits: logits, state: outState)
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        return model.layers.map { layer in
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
             }
-            return KVCacheSimple()
+            // Full-attention layers honor maxKVSize; GDN / linear layers keep
+            // a fixed recurrent state that cannot be token-windowed.
+            return try makeAttentionKVCache(parameters: parameters)
         }
     }
 
@@ -1298,8 +1301,8 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         languageModel(input, cache: cache, state: state)
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

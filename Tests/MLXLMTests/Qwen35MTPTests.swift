@@ -178,7 +178,7 @@ struct Qwen35MTPMetalTests {
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
         let model = MLXLLM.Qwen35TextModel(cfg)
-        let cache = model.newCache(parameters: nil as GenerateParameters?)
+        let cache = try model.newCache(parameters: nil as GenerateParameters?)
         var state = LMOutput.State()
         state[mtpEmitFlagKey] = true
 
