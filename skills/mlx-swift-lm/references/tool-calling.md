@@ -30,7 +30,8 @@ mlx-swift-lm supports function calling / tool use with multiple model-specific f
 |--------|--------|----------------|
 | `.json` | Llama, Qwen, most models | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
 | `.lfm2` | LFM2 | `<\|tool_call_start\|>{"name":"f",...}<\|tool_call_end\|>` |
-| `.xmlFunction` | Nemotron, Qwen3 Coder, Qwen3.5 | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
+| `.xmlFunction` | Nemotron, Qwen3 Coder, Qwen3 Next | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
+| `.qwen35` | Qwen 3.5 | Same `<tool_call>` frame as `.xmlFunction`, but also accepts a framed Qwen/Hermes JSON payload (`<tool_call>{"name":"f","arguments":{...}}</tool_call>`) that Qwen 3.5 sporadically emits instead of XML. Bare (unframed) JSON is not recovered. |
 | `.glm4` | GLM4 | `func<arg_key>k</arg_key><arg_value>v</arg_value>` |
 | `.gemma` | Gemma | `call:name{key:value}` |
 | `.kimiK2` | Kimi K2 | `functions.name:0<\|tool_call_argument_begin\|>{...}` |

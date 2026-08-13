@@ -34,20 +34,7 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         guard let toolCall else { return nil }
 
         // If tool schemas are provided, only accept calls to declared tools.
-        if let tools, !tools.isEmpty {
-            var isDeclaredTool = false
-            for tool in tools {
-                let functionSpec = tool["function"] as? [String: any Sendable]
-                if functionSpec?["name"] as? String == toolCall.function.name {
-                    isDeclaredTool = true
-                    break
-                }
-            }
-
-            guard isDeclaredTool else {
-                return nil
-            }
-        }
+        guard isDeclaredTool(toolCall.function.name, tools: tools) else { return nil }
 
         return toolCall
     }
