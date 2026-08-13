@@ -185,17 +185,31 @@ let processor = ToolCallProcessor(
 )
 ```
 
-## Format Auto-Detection
+## Format Resolution
 
-Formats are auto-detected from model type:
+When a model is loaded, the factories resolve the format in this order and stop
+at the first answer:
+
+1. an explicit value on the `ModelConfiguration` (registry entry or caller),
+2. a `ChatConventionsResolving` registered with `ChatConventionsRegistry`
+   (keyed on repo id / model type, for conventions the model cannot know),
+3. the model's own `ChatConventionsProviding` declaration, e.g.
+   `public var toolCallFormat: ToolCallFormat? { .gemma4 }`,
+4. the checkpoint's tokenizer files — a `tool_parser_type` entry if present,
+   otherwise inference from the chat template.
+
+Nothing resolved means the default `.json` parser is used.
+
+Step 4 covers checkpoints whose architecture declares no format, since the chat
+template is what teaches the model to emit a given dialect:
 
 ```swift
-// Auto-detected based on model_type in config.json
-ToolCallFormat.infer(from: "lfm2")     // -> .lfm2
-ToolCallFormat.infer(from: "glm4")     // -> .glm4
-ToolCallFormat.infer(from: "gemma")    // -> .gemma
-ToolCallFormat.infer(from: "llama")    // -> nil (use default .json)
+ToolCallFormat.inferred(fromChatTemplate: template)  // -> .mistral, .glm4, ...
+ToolCallFormat(toolParserType: "qwen3_coder")        // -> .xmlFunction
 ```
+
+Protocols with token-level framing (`.gptOSS`, `.atem`) are deliberately not
+inferred from templates — they are selected by the models that own them.
 
 ### Explicit Format in Configuration
 

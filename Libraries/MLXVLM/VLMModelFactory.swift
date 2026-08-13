@@ -406,13 +406,16 @@ public final class VLMModelFactory: GenericModelFactory {
 
         // Chat conventions. Precedence: an explicit value on the configuration
         // (registry entry or caller) wins; then a registered resolver, which sees
-        // the repo id the model cannot; then the model's own declaration.
+        // the repo id the model cannot; then the model's own declaration; and
+        // finally the checkpoint's own tokenizer files, which describe the
+        // dialect even for an architecture that declares nothing.
         let modelId = configuration.name
         if mutableConfiguration.toolCallFormat == nil {
             mutableConfiguration.toolCallFormat =
                 conventionsRegistry.toolCallFormat(
                     modelId: modelId, modelType: baseConfig.modelType)
                 ?? model.toolCallFormat
+                ?? ToolCallFormat.resolved(forTokenizerDirectory: configuration.tokenizerDirectory)
         }
         if mutableConfiguration.reasoningConfig == nil {
             mutableConfiguration.reasoningConfig =
