@@ -830,6 +830,84 @@ struct ToolTests {
         #expect(toolCalls2[1].function.arguments["timezone"] == .string("UTC"))
     }
 
+    @Test("Pythonic argument values may contain the closing delimiters")
+    func testPythonicParserDelimitersInsideValue() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+
+        // `)]` closes the call for a scanner that is not quote aware, which
+        // truncated the value and left the stray quote behind.
+        let quoted = "<|tool_call_start|>[notify(note='a)]b')]<|tool_call_end|>"
+        let quotedCall = try #require(parser.parse(content: quoted, tools: nil))
+        #expect(quotedCall.function.name == "notify")
+        #expect(quotedCall.function.arguments["note"] == .string("a)]b"))
+
+        let object = #"<|tool_call_start|>[notify(filters={"x": "a)]b"})]<|tool_call_end|>"#
+        let objectCall = try #require(parser.parse(content: object, tools: nil))
+        #expect(objectCall.function.arguments["filters"] == .object(["x": .string("a)]b")]))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Array Value With Inner Commas")
+    func testPythonicParserArrayValue() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content =
+            #"<|tool_call_start|>[search_many(queries=["swift", "mlx"], limit=2)]<|tool_call_end|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search_many")
+        #expect(
+            toolCall.function.arguments["queries"] == .array([.string("swift"), .string("mlx")]))
+        // Bare scalars are typed from the tool schema; without one they stay literal.
+        #expect(toolCall.function.arguments["limit"] == .string("2"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Object Value Is Not Unwrapped Alongside Another")
+    func testPythonicParserWrapperGuardWithSecondArgument() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        // A wrapper name is only a wrapper when it is the *sole* argument.
+        let content =
+            #"<|tool_call_start|>[get_weather(properties={"location": "Paris"}, units='c')]<|tool_call_end|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(
+            toolCall.function.arguments["properties"] == .object(["location": .string("Paris")]))
+        #expect(toolCall.function.arguments["units"] == .string("c"))
+        #expect(toolCall.function.arguments["location"] == nil)
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Wrapper Object via parseEOS")
+    func testPythonicParserWrapperObjectViaEOS() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content =
+            #"<|tool_call_start|>[get_weather(properties={"location": "Paris"}), current_time(properties={"timezone": "UTC"})]<|tool_call_end|>"#
+
+        let toolCalls = parser.parseEOS(content, tools: nil)
+
+        #expect(toolCalls.count == 2)
+        #expect(toolCalls.first?.function.name == "get_weather")
+        #expect(toolCalls.first?.function.arguments["location"] == .string("Paris"))
+        #expect(toolCalls.last?.function.name == "current_time")
+        #expect(toolCalls.last?.function.arguments["timezone"] == .string("UTC"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Unbalanced Bracket Is Not A Call")
+    func testPythonicParserUnbalancedBracket() {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+
+        // A truncated list is incomplete output, not a call that is ready to run.
+        #expect(
+            parser.parse(
+                content: "<|tool_call_start|>[notify(note='hi')<|tool_call_end|>", tools: nil)
+                == nil)
+    }
+
     @Test("Test Pythonic Tool Call Parser - Type Conversion")
     func testPythonicParserTypeConversion() throws {
         let parser = PythonicToolCallParser(
@@ -1185,6 +1263,73 @@ struct ToolTests {
         #expect(toolCall.function.arguments["mailbox"] == .string("INBOX"))
         #expect(toolCall.function.arguments["id"] == .int(158_348))
         #expect(toolCall.function.arguments["id"] != .string("158348"))
+    }
+
+    @Test("Gemma keeps a nested object value whole")
+    func testGemmaNestedObjectValue() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:search{filters:{"city":"Paris","limit":1}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search")
+        // The comma inside the object must not split the value, and the tail of
+        // a split value must not become an argument of its own.
+        #expect(toolCall.function.arguments.count == 1)
+        #expect(
+            toolCall.function.arguments["filters"]
+                == .object(["city": .string("Paris"), "limit": .int(1)]))
+    }
+
+    @Test("Gemma keeps an array value whole")
+    func testGemmaArrayValue() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:notify{ids:[1,2,3],urgent:true}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments.count == 2)
+        // The array survives its inner commas, and `1` stays an integer rather
+        // than being rewritten as a boolean on the way into `JSONValue`.
+        #expect(toolCall.function.arguments["ids"] == .array([.int(1), .int(2), .int(3)]))
+        // Bare scalars are typed from the tool schema; without one they stay literal.
+        #expect(toolCall.function.arguments["urgent"] == .string("true"))
+    }
+
+    @Test("Gemma escaped values may contain protocol punctuation")
+    func testGemmaEscapedValuePunctuation() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content =
+            #"<|tool_call>call:notify{note:<|"|>a, b} and {c<|"|>,seen:false}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(toolCall.function.arguments["note"] == .string("a, b} and {c"))
+        #expect(toolCall.function.arguments["seen"] == .string("false"))
+    }
+
+    @Test("Test Gemma 4 Format via ToolCallProcessor")
+    func testGemma4FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .gemma4)
+        let content = #"<|tool_call>call:get_weather{city:<|"|>Tokyo<|"|>}<tool_call|>"#
+
+        // Delivered one character at a time: the streaming path has to reassemble
+        // the asymmetric Gemma 4 tags before the parser ever sees them.
+        var visible = ""
+        for character in content {
+            if let text = processor.processChunk(String(character)) { visible += text }
+        }
+        processor.processEOS()
+
+        #expect(visible.isEmpty)
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["city"] == .string("Tokyo"))
     }
 
     @Test("Test Gemma Format via ToolCallProcessor")

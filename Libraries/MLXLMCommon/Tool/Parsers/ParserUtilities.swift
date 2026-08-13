@@ -132,6 +132,20 @@ func extractTypesFromSchema(_ schema: [String: any Sendable]?) -> [String] {
     return types.isEmpty ? ["string"] : Array(types)
 }
 
+// MARK: - Slicing
+
+extension Substring {
+    /// The slice without leading or trailing whitespace, avoiding the copy that
+    /// `trimmingCharacters(in:)` makes when the caller only needs a view.
+    func trimmingWhitespace() -> Substring {
+        var slice = drop(while: \.isWhitespace)
+        while let last = slice.last, last.isWhitespace {
+            slice = slice.dropLast()
+        }
+        return slice
+    }
+}
+
 // MARK: - Type Conversion
 
 /// Whether a generated function name belongs to the caller-provided tool set.

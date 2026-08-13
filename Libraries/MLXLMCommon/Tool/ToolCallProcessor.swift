@@ -506,33 +506,12 @@ public class ToolCallProcessor {
         return drainOrderedOutputs()
     }
 
+    /// End of the bracketed call list beginning at `start`, ignoring brackets
+    /// that appear inside quoted argument values.
     private func balancedBracketEnd(in text: String, from start: String.Index) -> String.Index? {
-        var depth = 0
-        var stringQuote: Character?
-        var escaped = false
-
-        for index in text.indices[start...] {
-            let character = text[index]
-            if let quote = stringQuote {
-                if escaped {
-                    escaped = false
-                } else if character == "\\" {
-                    escaped = true
-                } else if character == quote {
-                    stringQuote = nil
-                }
-                continue
-            }
-            switch character {
-            case "\"", "'": stringQuote = character
-            case "[": depth += 1
-            case "]":
-                depth -= 1
-                if depth == 0 { return index }
-            default: break
-            }
-        }
-        return nil
+        let tail = text[start...]
+        guard let open = Self.listScanner.firstTopLevelIndex(of: "[", in: tail) else { return nil }
+        return Self.listScanner.endOfGroup(in: tail, openedAt: open)
     }
 
     private func recordEOSResidualOutputs(_ text: String) {
@@ -551,6 +530,8 @@ public class ToolCallProcessor {
             detail: RejectedToolCall.Reason.malformedSyntax.diagnosticDetail)
         recordEOSResidualOutputs(String(text[range.upperBound...]))
     }
+
+    private static let listScanner = StructuredTextScanner(quotes: ["'", "\""])
 
     /// Process chunk for tagged formats.
     private func processTaggedChunk(_ chunk: String) -> String? {
