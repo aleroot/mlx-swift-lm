@@ -41,6 +41,31 @@ public protocol LogitProcessor {
 
     /// Called to provide the sampled token
     mutating func didSample(token: MLXArray)
+
+    /// Returns an independent copy of this processor.
+    ///
+    /// Value types (structs) obtain an independent copy via standard value semantics
+    /// by default. Reference types (classes) must explicitly implement this method to
+    /// produce a distinct instance; classes that do not provide an implementation trap.
+    func copy() -> Self
+}
+
+extension LogitProcessor {
+    public func copy() -> Self {
+        self
+    }
+}
+
+extension LogitProcessor where Self: AnyObject {
+    public func copy() -> Self {
+        fatalError(
+            """
+            \(Self.self) is a reference type conforming to LogitProcessor but does not implement copy(). \
+            Reference-type processors must explicitly implement copy() to support isolated state scoping \
+            in speculative decoding and verification passes.
+            """
+        )
+    }
 }
 
 /// Parameters for text generation, see ``TokenIterator``.
@@ -607,6 +632,10 @@ public struct ChainedLogitProcessor: LogitProcessor {
         self.processors = processors
     }
 
+    public func copy() -> Self {
+        Self(processors: processors.map { $0.copy() })
+    }
+
     mutating public func prompt(_ prompt: MLXArray) {
         for index in processors.indices {
             processors[index].prompt(prompt)
@@ -1155,7 +1184,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         // Draft generation: autoregressive loop with draft model
-        var draftProcessor = processor  // Copy to discard later
+        var draftProcessor = processor?.copy()  // Copy to discard later
         var draftTokens = [MLXArray]()
         var draftState: LMOutput.State?
         for _ in 0 ..< numDraft {
@@ -1182,7 +1211,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         state = mainResult.state
 
         let mainTokens: MLXArray
-        if var verifyProcessor = processor {
+        if var verifyProcessor = processor?.copy() {
             // Process each position sequentially so that the processor sees tokens sampled at earlier positions
             var sampled = [MLXArray]()
             for i in 0 ..< (numDraft + 1) {
