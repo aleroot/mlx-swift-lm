@@ -873,6 +873,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.tieWordEmbeddings)
+
         // MoE expert weight remapping ported from MLXVLM/Models/Gemma4.swift. yooz-engine.
         // HuggingFace stores expert weights as fused gate_up_proj; SwitchGLU expects
         // separate gate_proj and up_proj, each shaped [numExperts, hiddenDims, inputDims].

@@ -1338,9 +1338,9 @@ public class Qwen35: Module, VLMModel {
 
         var weights = weights.filter { !$0.key.contains("mtp.") }
 
-        if config.textConfiguration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        weights = filterLMHeadWeights(
+            from: weights,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
 
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count)

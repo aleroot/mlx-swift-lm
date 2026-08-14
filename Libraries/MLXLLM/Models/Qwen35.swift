@@ -1212,9 +1212,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         var weights = weights.filter { !$0.key.contains("mtp.") }
 
-        if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
+        weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         let normKeys = [
             ".input_layernorm.weight",
