@@ -862,7 +862,9 @@ public struct Qwen25VLProcessor: UserInputProcessor {
                 var resizedSize: CGSize = .zero
 
                 let imageSequence = try await MediaProcessing.asProcessedSequence(
-                    video, targetFPS: { _ in Double(2) }
+                    video,
+                    processing: input.processing.video,
+                    targetFPS: { _ in Double(2) }
                 ) { frame in
                     // first apply the user requested resizing, etc. if any
                     let resizedImage = MediaProcessing.apply(
