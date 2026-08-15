@@ -859,8 +859,74 @@ struct ToolTests {
         #expect(toolCall.function.name == "search_many")
         #expect(
             toolCall.function.arguments["queries"] == .array([.string("swift"), .string("mlx")]))
-        // Bare scalars are typed from the tool schema; without one they stay literal.
-        #expect(toolCall.function.arguments["limit"] == .string("2"))
+        #expect(toolCall.function.arguments["limit"] == .int(2))
+    }
+
+    @Test("Pythonic collections accept Python literal syntax")
+    func testPythonicParserPythonLiteralCollections() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content = #"""
+            <|tool_call_start|>[configure(settings={'location': 'Tokyo', 'enabled': True, 'fallback': None, 'thresholds': [0, 1.5]})]<|tool_call_end|>
+            """#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(
+            toolCall.function.arguments["settings"]
+                == .object([
+                    "location": .string("Tokyo"),
+                    "enabled": .bool(true),
+                    "fallback": .null,
+                    "thresholds": .array([.int(0), .double(1.5)]),
+                ]))
+    }
+
+    @Test("Pythonic scalars are inferred without a schema")
+    func testPythonicParserUnschematizedScalars() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content = #"""
+            <|tool_call_start|>[configure(count=5, ratio=1.5, enabled=True, disabled=False, fallback=None, mode=fast)]<|tool_call_end|>
+            """#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments["count"] == .int(5))
+        #expect(toolCall.function.arguments["ratio"] == .double(1.5))
+        #expect(toolCall.function.arguments["enabled"] == .bool(true))
+        #expect(toolCall.function.arguments["disabled"] == .bool(false))
+        #expect(toolCall.function.arguments["fallback"] == .null)
+        #expect(toolCall.function.arguments["mode"] == .string("fast"))
+    }
+
+    @Test("Pythonic scalar inference does not override a declared string schema")
+    func testPythonicParserDeclaredStringsRemainStrings() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let stringProperties: [String: any Sendable] = [
+            "count": ["type": "string"] as [String: any Sendable],
+            "enabled": ["type": "string"] as [String: any Sendable],
+            "fallback": ["type": "string"] as [String: any Sendable],
+        ]
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "configure",
+                    "parameters": ["properties": stringProperties]
+                        as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = #"""
+            <|tool_call_start|>[configure(count=5, enabled=True, fallback=None)]<|tool_call_end|>
+            """#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments["count"] == .string("5"))
+        #expect(toolCall.function.arguments["enabled"] == .string("True"))
+        #expect(toolCall.function.arguments["fallback"] == .string("None"))
     }
 
     @Test("Test Pythonic Tool Call Parser - Object Value Is Not Unwrapped Alongside Another")
@@ -1440,7 +1506,7 @@ struct ToolTests {
         let toolCall4 = try #require(parser.parse(content: content4, tools: nil))
         #expect(toolCall4.function.name == "calculate")
         #expect(toolCall4.function.arguments["expression"] == .string("2 + 2"))
-        #expect(toolCall4.function.arguments["precision"] == .string("4"))
+        #expect(toolCall4.function.arguments["precision"] == .int(4))
 
         // Multiple JSON list format via parseEOS
         let content5 = """

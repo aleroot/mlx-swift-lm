@@ -100,9 +100,9 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
 
     /// Parse Pythonic keyword arguments: arg1='value1', arg2="value2", arg3=123
     ///
-    /// Values may themselves be JSON objects/arrays (e.g.
-    /// `properties={"location": "Tokyo", "unit": "c"}`); splitting is bracket-,
-    /// brace-, and quote-aware so commas inside a value do not truncate it.
+    /// Values may be JSON or Python literals, including single-quoted collections
+    /// and the `True`, `False`, and `None` spellings. Splitting is bracket-, brace-,
+    /// and quote-aware so commas inside a value do not truncate it.
     private func parseArguments(
         _ argsString: String,
         funcName: String,
@@ -114,37 +114,41 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             guard let eq = Self.scanner.firstTopLevelIndex(of: "=", in: pair) else { continue }
             let key = String(pair[..<eq]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
-            var value = String(pair[pair.index(after: eq)...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-
-            // Object / array value: parse as JSON so nested commas are preserved.
-            if value.hasPrefix("{") || value.hasPrefix("[") {
-                if let json = tryParseJSON(value) {
-                    arguments[key] = json
-                    continue
-                }
-            }
-
-            // Quoted string: strip surrounding quotes and unescape, then apply
-            // schema-based typing (e.g. a quoted '25' for an integer parameter).
-            if (value.hasPrefix("'") && value.hasSuffix("'"))
-                || (value.hasPrefix("\"") && value.hasSuffix("\""))
-            {
-                value = String(value.dropFirst().dropLast())
-                value = value.replacingOccurrences(of: "\\'", with: "'")
-                value = value.replacingOccurrences(of: "\\\"", with: "\"")
-                value = value.replacingOccurrences(of: "\\\\", with: "\\")
-                arguments[key] = convertParameterValue(
-                    value, paramName: key, funcName: funcName, tools: tools)
-                continue
-            }
-
-            // Unquoted scalar: convert based on schema type if available.
-            arguments[key] = convertParameterValue(
-                value, paramName: key, funcName: funcName, tools: tools)
+            let value = pair[pair.index(after: eq)...].trimmingWhitespace()
+            arguments[key] = parseArgumentValue(
+                value, key: key, funcName: funcName, tools: tools)
         }
 
         return unwrapArgumentWrapper(arguments, funcName: funcName, tools: tools)
+    }
+
+    /// Converts one argument without letting inferred scalar types override a
+    /// declared schema. Collections retain the parser's historical eager
+    /// decoding behavior, now with Python-literal syntax as a fallback.
+    private func parseArgumentValue(
+        _ value: Substring,
+        key: String,
+        funcName: String,
+        tools: [[String: any Sendable]]?
+    ) -> any Sendable {
+        let literal = String(value)
+
+        if value.first == "{" || value.first == "[" {
+            return tryParseJSON(literal) ?? tryParsePythonLiteral(literal) ?? literal
+        }
+
+        if value.first == "'" || value.first == "\"" {
+            let string = (tryParsePythonLiteral(literal) as? String) ?? literal
+            return convertParameterValue(
+                string, paramName: key, funcName: funcName, tools: tools)
+        }
+
+        if getParameterType(funcName: funcName, paramName: key, tools: tools) != nil {
+            return convertParameterValue(
+                literal, paramName: key, funcName: funcName, tools: tools)
+        }
+
+        return tryParsePythonLiteral(literal) ?? literal
     }
 
     /// Some models wrap all arguments in a single object under a schema key —
