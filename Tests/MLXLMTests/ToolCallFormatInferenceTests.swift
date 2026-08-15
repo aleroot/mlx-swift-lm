@@ -91,8 +91,8 @@ struct ToolCallFormatInferenceTests {
         #expect(ToolCallFormat.resolved(forTokenizerDirectory: directory) == .mistral)
     }
 
-    @Test("A named template list resolves through its default entry")
-    func readsNamedTemplateList() throws {
+    @Test("A named template list prefers tool_use for format inference")
+    func namedTemplateListPrefersToolUse() throws {
         let directory = try TokenizerFixture.make([
             "tokenizer_config.json": #"""
             {"chat_template": [
@@ -103,7 +103,114 @@ struct ToolCallFormatInferenceTests {
         ])
         defer { TokenizerFixture.remove(directory) }
 
+        #expect(ToolCallFormat.resolved(forTokenizerDirectory: directory) == .glm4)
+    }
+
+    @Test("Hermes tool_use refines the heuristic Llama 3 declaration to framed JSON")
+    func hermesTemplateListRefinesLlama3Format() throws {
+        let directory = try TokenizerFixture.make([
+            "tokenizer_config.json": #"""
+            {"chat_template": [
+                {"name": "default", "template": "{{ bos_token }}{{ messages }}"},
+                {"name": "tool_use", "template": "For each function call return a json object within <tool_call></tool_call>: <tool_call>{\"name\": {{ tool_call.name }}, \"arguments\": {}}</tool_call>"}
+            ]}
+            """#
+        ])
+        defer { TokenizerFixture.remove(directory) }
+
+        let format = ToolCallFormat.resolved(
+            forTokenizerDirectory: directory, modelFormat: .llama3)
+        #expect(format == .json)
+
+        let processor = ToolCallProcessor(format: try #require(format))
+        #expect(processor.processChunk("<tool_call>\n") == nil)
+        #expect(
+            processor.processChunk(
+                #"{"name":"get_weather","arguments":{"location":"Paris"}}"#) == nil)
+        #expect(processor.processChunk("\n</tool_call>") == nil)
+        #expect(processor.toolCalls.count == 1)
+        let call = try #require(processor.toolCalls.first)
+        #expect(call.function.name == "get_weather")
+        #expect(call.function.arguments == ["location": .string("Paris")])
+        #expect(call.id != nil)
+    }
+
+    @Test("A compatible model superset is preserved over template inference")
+    func compatibleModelFormatIsPreserved() throws {
+        let xmlDirectory = try TokenizerFixture.make([
+            "tokenizer_config.json": #"{"chat_template":"<tool_call>\n<function={{ name }}>"}"#
+        ])
+        defer { TokenizerFixture.remove(xmlDirectory) }
+
+        let jsonDirectory = try TokenizerFixture.make([
+            "tokenizer_config.json":
+                #"{"chat_template":"<tool_call>{{ tool_call.name }}</tool_call>"}"#
+        ])
+        defer { TokenizerFixture.remove(jsonDirectory) }
+
+        #expect(
+            ToolCallFormat.resolved(
+                forTokenizerDirectory: xmlDirectory, modelFormat: .qwen35) == .qwen35)
+        #expect(
+            ToolCallFormat.resolved(
+                forTokenizerDirectory: jsonDirectory, modelFormat: .qwen35) == .qwen35)
+    }
+
+    @Test("A model declaration is used when the selected template has no known dialect")
+    func modelFormatIsFallbackForUnknownTemplate() throws {
+        let directory = try TokenizerFixture.make([
+            "tokenizer_config.json": #"{"chat_template":"{{ messages }}"}"#
+        ])
+        defer { TokenizerFixture.remove(directory) }
+
+        #expect(
+            ToolCallFormat.resolved(
+                forTokenizerDirectory: directory, modelFormat: .llama3) == .llama3)
+    }
+
+    @Test("A complete response protocol is not replaced by payload inference")
+    func protocolFormatIsAuthoritative() throws {
+        let directory = try TokenizerFixture.make([
+            "tokenizer_config.json":
+                #"{"chat_template":"<tool_call>{{ tool_call.name }}</tool_call>"}"#
+        ])
+        defer { TokenizerFixture.remove(directory) }
+
+        #expect(
+            ToolCallFormat.resolved(
+                forTokenizerDirectory: directory, modelFormat: .gptOSS) == .gptOSS)
+        #expect(
+            ToolCallFormat.resolved(
+                forTokenizerDirectory: directory, modelFormat: .atem) == .atem)
+    }
+
+    @Test("A named template list falls back to default without tool_use")
+    func namedTemplateListFallsBackToDefault() throws {
+        let directory = try TokenizerFixture.make([
+            "tokenizer_config.json": #"""
+            {"chat_template": [
+                {"name": "other", "template": "<arg_key>x</arg_key>"},
+                {"name": "default", "template": "<|tool_list_start|>"}
+            ]}
+            """#
+        ])
+        defer { TokenizerFixture.remove(directory) }
+
         #expect(ToolCallFormat.resolved(forTokenizerDirectory: directory) == .lfm2)
+    }
+
+    @Test("An unselected named template is not used for inference")
+    func namedTemplateListWithoutAutomaticChoiceResolvesToNothing() throws {
+        let directory = try TokenizerFixture.make([
+            "tokenizer_config.json": #"""
+            {"chat_template": [
+                {"name": "other", "template": "<arg_key>x</arg_key>"}
+            ]}
+            """#
+        ])
+        defer { TokenizerFixture.remove(directory) }
+
+        #expect(ToolCallFormat.resolved(forTokenizerDirectory: directory) == nil)
     }
 
     @Test("A sidecar chat template file is used when the config has none")
@@ -126,7 +233,9 @@ struct ToolCallFormatInferenceTests {
         ])
         defer { TokenizerFixture.remove(directory) }
 
-        #expect(ToolCallFormat.resolved(forTokenizerDirectory: directory) == .xmlFunction)
+        #expect(
+            ToolCallFormat.resolved(
+                forTokenizerDirectory: directory, modelFormat: .llama3) == .xmlFunction)
     }
 
     @Test("A checkpoint with nothing to go on resolves to nothing")

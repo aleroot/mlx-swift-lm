@@ -81,18 +81,50 @@ extension ToolCallFormat {
 
 extension ToolCallFormat {
 
-    /// The dialect a checkpoint declares or implies, read from its tokenizer files.
+    /// Resolves a model declaration against the dialect selected by its checkpoint.
     ///
     /// An explicit `tool_parser_type` wins, matching mlx-lm, because it is the
-    /// checkpoint author correcting what the template alone would imply.
-    package static func resolved(forTokenizerDirectory directory: URL) -> ToolCallFormat? {
+    /// checkpoint author correcting what the template alone would imply. Otherwise,
+    /// the selected tool template refines a model declaration that cannot parse the
+    /// dialect it prompts. This matters for architecture heuristics such as Llama 3:
+    /// Hermes checkpoints use that architecture while prompting framed JSON instead
+    /// of Llama's inline JSON.
+    ///
+    /// A model-declared superset remains selected. For example, Qwen 3.5 prompts XML
+    /// but its parser deliberately accepts both XML and framed Hermes JSON.
+    package static func resolved(
+        forTokenizerDirectory directory: URL,
+        modelFormat: ToolCallFormat? = nil
+    ) -> ToolCallFormat? {
         let configuration = TokenizerToolCallConfiguration(directory: directory)
 
         if let declared = configuration.toolParserType.flatMap(ToolCallFormat.init(toolParserType:))
         {
             return declared
         }
-        return configuration.chatTemplate.flatMap(ToolCallFormat.inferred(fromChatTemplate:))
+
+        guard
+            let templateFormat = configuration.chatTemplate.flatMap(
+                ToolCallFormat.inferred(fromChatTemplate:))
+        else { return modelFormat }
+        guard let modelFormat else { return templateFormat }
+
+        return modelFormat.accepts(templateFormat: templateFormat) ? modelFormat : templateFormat
+    }
+
+    /// Whether a model-selected parser is a superset of the dialect prompted by
+    /// the selected chat template.
+    private func accepts(templateFormat: ToolCallFormat) -> Bool {
+        switch self {
+        case .qwen35:
+            return templateFormat == .xmlFunction || templateFormat == .json
+        case .gptOSS, .atem:
+            // These select complete token-stream protocols, not interchangeable
+            // payload parsers. Incidental textual markers must not reroute them.
+            return true
+        default:
+            return self == templateFormat
+        }
     }
 }
 
@@ -131,8 +163,9 @@ struct TokenizerToolCallConfiguration {
         }
     }
 
-    /// A template is either the template itself or a list of named templates,
-    /// in which case the one named `default` is the one applied to a chat.
+    /// A template is either the template itself or a list of named templates.
+    /// Format inference models a tool-enabled request, so it follows
+    /// swift-transformers by preferring `tool_use` and falling back to `default`.
     enum ChatTemplate: Decodable {
         case single(String)
         case named([Named])
@@ -156,7 +189,8 @@ struct TokenizerToolCallConfiguration {
             case .single(let template):
                 return template
             case .named(let templates):
-                return (templates.first { $0.name == "default" } ?? templates.first)?.template
+                return templates.first { $0.name == "tool_use" }?.template
+                    ?? templates.first { $0.name == "default" }?.template
             }
         }
     }

@@ -187,21 +187,23 @@ let processor = ToolCallProcessor(
 
 ## Format Resolution
 
-When a model is loaded, the factories resolve the format in this order and stop
-at the first answer:
+When a model is loaded, the factories resolve the format in this order:
 
 1. an explicit value on the `ModelConfiguration` (registry entry or caller),
 2. a `ChatConventionsResolving` registered with `ChatConventionsRegistry`
    (keyed on repo id / model type, for conventions the model cannot know),
-3. the model's own `ChatConventionsProviding` declaration, e.g.
-   `public var toolCallFormat: ToolCallFormat? { .gemma4 }`,
-4. the checkpoint's tokenizer files — a `tool_parser_type` entry if present,
-   otherwise inference from the chat template.
+3. an explicit `tool_parser_type` in the checkpoint's tokenizer files,
+4. the selected tool template reconciled with the model's own
+   `ChatConventionsProviding` declaration.
 
 Nothing resolved means the default `.json` parser is used.
 
-Step 4 covers checkpoints whose architecture declares no format, since the chat
-template is what teaches the model to emit a given dialect:
+At step 4, the model declaration remains selected when it can parse the template's
+dialect. Otherwise, the template refines it because the template is what teaches
+the model what to emit. This lets Qwen 3.5 keep its dual-dialect parser while a
+Hermes checkpoint can refine the Llama 3 architecture heuristic from inline JSON
+to framed JSON. If the template has no recognizable tool syntax, the model
+declaration remains the fallback.
 
 ```swift
 ToolCallFormat.inferred(fromChatTemplate: template)  // -> .mistral, .glm4, ...
