@@ -26,6 +26,10 @@ public struct RejectedToolCall: Hashable, Codable, Sendable {
 
         /// The function arguments could not be represented as a tool input.
         case invalidArguments = "invalid_arguments"
+
+        /// The candidate exceeded the bounded parser budget and was discarded
+        /// without execution.
+        case resourceLimitExceeded = "resource_limit_exceeded"
     }
 
     /// The default maximum number of UTF-8 bytes retained in ``rawTextPreview``.
@@ -126,6 +130,8 @@ extension RejectedToolCall.Reason {
             "The function was not present in the supplied tool definitions."
         case .invalidArguments:
             "The function arguments were not a JSON object."
+        case .resourceLimitExceeded:
+            "The tool-call payload exceeded the parser's safety limit."
         }
     }
 }

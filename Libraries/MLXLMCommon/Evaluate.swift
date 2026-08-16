@@ -179,6 +179,11 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Governs bounded recovery when a model emits a declared tool call in a
+    /// dialect other than the selected ``ToolCallFormat``. Conservative is the
+    /// production default; set disabled when only the native format may run.
+    public var toolCallRecoveryPolicy: ToolCallRecoveryPolicy
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -198,7 +203,8 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefill: PrefillParameters = .init(),
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        toolCallRecoveryPolicy: ToolCallRecoveryPolicy = .conservative
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -219,6 +225,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefill = prefill
         self.seed = seed
+        self.toolCallRecoveryPolicy = toolCallRecoveryPolicy
     }
 
     @available(
@@ -1759,7 +1766,8 @@ public func generate(
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
-        tools: tools)
+        tools: tools,
+        recoveryPolicy: parameters.toolCallRecoveryPolicy)
     return stream
 }
 
@@ -1813,6 +1821,7 @@ public func generate(
 ///   - numDraftTokens: Number of tokens the draft model proposes per round (default: 2).
 ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+///   - tools: Optional tool schemas used to parse arguments and authorize function names.
 /// - Returns: An `AsyncStream` that emits text, accepted or rejected tool calls, and completion
 ///   information as `Generation` values.
 /// - Throws: An error if the iterator initialization fails.
@@ -1826,7 +1835,8 @@ public func generate(
     draftCache: [KVCache]? = nil,
     numDraftTokens: Int = 2,
     components: GenerationComponents = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try SpeculativeTokenIterator(
         input: input,
@@ -1848,7 +1858,9 @@ public func generate(
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             stopStrings: context.configuration.effectiveStopStrings,
-            format: context.configuration.toolCallFormat ?? .json
+            format: context.configuration.toolCallFormat ?? .json,
+            tools: tools,
+            recoveryPolicy: parameters.toolCallRecoveryPolicy
         )
     )
     return stream
@@ -1895,7 +1907,8 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
     tokenizer: Tokenizer,
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
-    tools: [[String: any Sendable]]? = nil
+    tools: [[String: any Sendable]]? = nil,
+    recoveryPolicy: ToolCallRecoveryPolicy = .conservative
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1907,7 +1920,8 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
             tokenizer: tokenizer,
             stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
-            tools: tools
+            tools: tools,
+            recoveryPolicy: recoveryPolicy
         )
     )
 }
@@ -1920,7 +1934,8 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
     tokenizer: Tokenizer,
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
-    tools: [[String: any Sendable]]? = nil
+    tools: [[String: any Sendable]]? = nil,
+    recoveryPolicy: ToolCallRecoveryPolicy = .conservative
 ) -> (AsyncStream<Generation>, Task<[Int], Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1933,7 +1948,8 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
             tokenizer: tokenizer,
             stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
-            tools: tools
+            tools: tools,
+            recoveryPolicy: recoveryPolicy
         )
     )
 }
@@ -2068,6 +2084,7 @@ public func generateTokens(
 ///     `draft_block_size`. Default 4 matches mlx-vlm's example configs.
 ///   - components: optional behavioral components, e.g. a custom ``LogitProcessor``
 ///   - wiredMemoryTicket: optional wired memory ticket.
+///   - tools: Optional tool schemas used to parse arguments and authorize function names.
 /// - Returns: an `AsyncStream<Generation>` yielding chunks and tool calls.
 /// - Throws: an error if the iterator initialization fails.
 public func generate(
@@ -2078,7 +2095,8 @@ public func generate(
     mtpDrafter: any MTPDrafterModel,
     blockSize: Int = 4,
     components: GenerationComponents = .init(),
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
@@ -2098,7 +2116,9 @@ public func generate(
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             stopStrings: context.configuration.effectiveStopStrings,
-            format: context.configuration.toolCallFormat ?? .json
+            format: context.configuration.toolCallFormat ?? .json,
+            tools: tools,
+            recoveryPolicy: parameters.toolCallRecoveryPolicy
         )
     )
     return stream
@@ -2538,6 +2558,10 @@ public struct GenerateCompletionInfo: Sendable {
     /// Number of tool-call-shaped outputs rejected during this generation.
     public let rejectedToolCallCount: Int
 
+    /// Number of accepted calls produced by bounded cross-dialect recovery.
+    /// Native-format calls are intentionally excluded.
+    public let recoveredToolCallCount: Int
+
     /// The rendered prompt length: the reused cache prefix plus the prefilled tokens.
     public var totalPromptTokenCount: Int {
         cachedPromptTokenCount + promptTokenCount
@@ -2570,7 +2594,8 @@ public struct GenerateCompletionInfo: Sendable {
         acceptedDraftTokens: Int? = nil,
         passthroughReason: String? = nil,
         speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? = nil,
-        rejectedToolCallCount: Int = 0
+        rejectedToolCallCount: Int = 0,
+        recoveredToolCallCount: Int = 0
     ) {
         self.promptTokenCount = promptTokenCount
         self.cachedPromptTokenCount = cachedPromptTokenCount
@@ -2583,6 +2608,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.passthroughReason = passthroughReason
         self.speculativeDecodingTelemetry = speculativeDecodingTelemetry
         self.rejectedToolCallCount = rejectedToolCallCount
+        self.recoveredToolCallCount = recoveredToolCallCount
     }
 
     public func summary() -> String {
@@ -2598,7 +2624,7 @@ public struct GenerateCompletionInfo: Sendable {
         return lines.joined(separator: "\n")
     }
 
-    fileprivate func withRejectedToolCallCount(_ count: Int) -> Self {
+    fileprivate func withToolCallCounts(rejected: Int, recovered: Int) -> Self {
         Self(
             promptTokenCount: promptTokenCount,
             cachedPromptTokenCount: cachedPromptTokenCount,
@@ -2610,7 +2636,8 @@ public struct GenerateCompletionInfo: Sendable {
             acceptedDraftTokens: acceptedDraftTokens,
             passthroughReason: passthroughReason,
             speculativeDecodingTelemetry: speculativeDecodingTelemetry,
-            rejectedToolCallCount: count)
+            rejectedToolCallCount: rejected,
+            recoveredToolCallCount: recovered)
     }
 }
 
@@ -2786,10 +2813,12 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
 
     init(
         tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
-        tools: [[String: any Sendable]]? = nil
+        tools: [[String: any Sendable]]? = nil,
+        recoveryPolicy: ToolCallRecoveryPolicy = .conservative
     ) {
         self.decoder = format.makeTokenStreamDecoder(
-            tokenizer: tokenizer, tools: tools, stopStrings: stopStrings)
+            tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+            recoveryPolicy: recoveryPolicy)
     }
 
     var additionalStopTokenIDs: Set<Int> { decoder.additionalStopTokenIDs }
@@ -2823,7 +2852,10 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
     }
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
-        .info(info.withRejectedToolCallCount(decoder.rejectedToolCallCount))
+        .info(
+            info.withToolCallCounts(
+                rejected: decoder.rejectedToolCallCount,
+                recovered: decoder.recoveredToolCallCount))
     }
 
     private mutating func process(
