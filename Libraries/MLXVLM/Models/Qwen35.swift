@@ -51,6 +51,9 @@ public struct Qwen35Configuration: Codable, Sendable {
         public var headDim: Int?
         public var ropeParameters: [String: StringOrNumber]?
         public var fullAttentionInterval: Int = 4
+        public var layerTypes: [String]?
+        var resolvedLayerTypes: [String] = []
+        var fullAttentionLayerIndex: Int? = nil
         public var mtpNumHiddenLayers: Int = 0
         public var mtpUseDedicatedEmbeddings: Bool = false
 
@@ -84,6 +87,7 @@ public struct Qwen35Configuration: Codable, Sendable {
             case headDim = "head_dim"
             case ropeParameters = "rope_parameters"
             case fullAttentionInterval = "full_attention_interval"
+            case layerTypes = "layer_types"
             case mtpNumHiddenLayers = "mtp_num_hidden_layers"
             case mtpUseDedicatedEmbeddings = "mtp_use_dedicated_embeddings"
             case numExperts = "num_experts"
@@ -127,6 +131,14 @@ public struct Qwen35Configuration: Codable, Sendable {
             self.headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
             self.fullAttentionInterval =
                 try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+            self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
+            let layerSchedule = try HybridAttentionSchedule(
+                hiddenLayerCount: hiddenLayers,
+                fullAttentionInterval: fullAttentionInterval,
+                explicitLayerTypes: layerTypes
+            )
+            self.resolvedLayerTypes = layerSchedule.layerTypes
+            self.fullAttentionLayerIndex = layerSchedule.firstFullAttentionIndex
             self.mtpNumHiddenLayers =
                 try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
             self.mtpUseDedicatedEmbeddings =
@@ -901,7 +913,8 @@ public enum Qwen35Language {
             self.allowsCompiledDecode = !forceFullAttention
             self.isLinear =
                 forceFullAttention
-                ? false : (layerIdx + 1) % args.fullAttentionInterval != 0
+                ? false
+                : args.resolvedLayerTypes[layerIdx] == HybridAttentionSchedule.linearAttention
 
             if isLinear {
                 _linearAttn.wrappedValue = GatedDeltaNet(args)
@@ -1092,7 +1105,7 @@ public enum Qwen35Language {
             _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
             self.ssmIdx = 0
-            self.faIdx = args.fullAttentionInterval - 1
+            self.faIdx = args.fullAttentionLayerIndex ?? (args.fullAttentionInterval - 1)
 
             let segments = CompiledDecodeSegment.schedule(
                 linearLayers: layers.map(\.isLinear))
@@ -1109,7 +1122,6 @@ public enum Qwen35Language {
                 body: { model, index, arguments in
                     model.segmentBody(at: index, arguments)
                 })
-
             super.init()
         }
 
