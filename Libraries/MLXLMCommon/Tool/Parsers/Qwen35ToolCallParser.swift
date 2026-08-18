@@ -42,24 +42,8 @@ public struct Qwen35ToolCallParser: ToolCallParser, Sendable {
     /// Returns the body used only to select a parser. The concrete parser remains
     /// responsible for validating the entire payload.
     private func payloadBody(in content: String) -> String? {
-        var payload = content.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if let startTag, payload.hasPrefix(startTag) {
-            payload.removeFirst(startTag.count)
-            payload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if let endTag {
-            if payload.hasSuffix(endTag) {
-                payload.removeLast(endTag.count)
-                payload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
-            } else if payload.contains(endTag) {
-                // The streaming processor normally separates trailing content.
-                // Direct parser callers must not have it silently discarded.
-                return nil
-            }
-        }
-
-        return payload
+        QwenXMLPayloadScanner.framedPayload(
+            in: content, startTag: startTag, endTag: endTag)
     }
 
     /// Validate and extract a canonical XML payload with the shared structural
@@ -71,19 +55,6 @@ public struct Qwen35ToolCallParser: ToolCallParser, Sendable {
         _ payload: String,
         tools: [[String: any Sendable]]?
     ) -> ToolCall? {
-        guard case .complete(let parsed) = QwenXMLPayloadScanner.scan(payload[...]),
-            payload[parsed.end...].allSatisfy(\.isWhitespace)
-        else { return nil }
-
-        var arguments: [String: any Sendable] = [:]
-        for parameter in parsed.parameters {
-            var value = String(parameter.value)
-            // Trim a single leading/trailing newline (matching XMLFunctionParser).
-            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
-            if value.hasSuffix("\n") { value = String(value.dropLast()) }
-            arguments[parameter.name] = convertParameterValue(
-                value, paramName: parameter.name, funcName: parsed.name, tools: tools)
-        }
-        return ToolCall(function: .init(name: parsed.name, arguments: arguments))
+        QwenXMLPayloadScanner.parseCanonical(payload[...], tools: tools)
     }
 }

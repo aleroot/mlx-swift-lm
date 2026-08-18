@@ -5,11 +5,11 @@ import Foundation
 /// Shared structural scanner for the Qwen XML function dialect:
 /// `<function=name><parameter=key>value</parameter>...</function>`.
 ///
-/// `Qwen35ToolCallParser` validates native payloads with this scanner and the
-/// cross-dialect recovery scanner uses the same implementation for candidate
-/// extents and argument extraction. There is exactly one definition of a
-/// canonical payload, so a malformed or ambiguous payload cannot be promoted
-/// through a looser secondary path:
+/// `XMLFunctionParser` and `Qwen35ToolCallParser` validate native payloads with
+/// this scanner, and the cross-dialect recovery scanner uses the same
+/// implementation for candidate extents and argument extraction. There is
+/// exactly one definition of a canonical payload, so a malformed or ambiguous
+/// payload cannot be promoted through a looser secondary path:
 ///
 /// - the function close is the structural close, not the first textual
 ///   `</function>` (a parameter value may contain that literal),
@@ -131,6 +131,59 @@ enum QwenXMLPayloadScanner {
         return payload[parsed.end...].allSatisfy(\.isWhitespace)
     }
 
+    /// Parse a payload that must be canonical *in full* into a `ToolCall`.
+    ///
+    /// This is the only supported way to turn the Qwen XML dialect into an
+    /// executable call. Validation and value extraction share one grammar, so a
+    /// structurally degraded payload can never be downgraded into a call with
+    /// silently missing arguments.
+    ///
+    /// - Parameter allowMissingFunctionClose: see ``scan(_:allowMissingFunctionClose:)``.
+    ///   Only documented end-of-stream repair may set this.
+    static func parseCanonical(
+        _ payload: Substring,
+        tools: [[String: any Sendable]]?,
+        allowMissingFunctionClose: Bool = false
+    ) -> ToolCall? {
+        guard
+            case .complete(let parsed) = scan(
+                payload, allowMissingFunctionClose: allowMissingFunctionClose),
+            payload[parsed.end...].allSatisfy(\.isWhitespace)
+        else { return nil }
+        return parsed.toolCall(tools: tools)
+    }
+
+    /// Strip the optional framing tags from `content`, returning the payload a
+    /// parser must then validate in full.
+    ///
+    /// Returns `nil` when `endTag` appears anywhere other than the very end: the
+    /// streaming processor separates trailing content before parsing, so a
+    /// direct caller must never have it silently discarded. A close marker
+    /// *inside* a parameter value is unaffected, because the trailing marker is
+    /// removed as a suffix before that check can apply.
+    static func framedPayload(
+        in content: String,
+        startTag: String?,
+        endTag: String?
+    ) -> String? {
+        var payload = content.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let startTag, payload.hasPrefix(startTag) {
+            payload.removeFirst(startTag.count)
+            payload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let endTag {
+            if payload.hasSuffix(endTag) {
+                payload.removeLast(endTag.count)
+                payload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if payload.contains(endTag) {
+                return nil
+            }
+        }
+
+        return payload
+    }
+
     private enum LiteralMatch {
         case matched(after: String.Index)
         case needMore
@@ -153,6 +206,28 @@ enum QwenXMLPayloadScanner {
             textIndex = text.index(after: textIndex)
         }
         return .matched(after: textIndex)
+    }
+}
+
+extension QwenXMLPayloadScanner.Payload {
+
+    /// The single definition of how a canonical payload becomes call arguments.
+    ///
+    /// Every caller — the native ``XMLFunctionParser`` and ``Qwen35ToolCallParser``
+    /// paths as well as cross-dialect recovery — funnels through this method, so
+    /// argument extraction cannot drift between them.
+    func toolCall(tools: [[String: any Sendable]]?) -> ToolCall {
+        var arguments: [String: any Sendable] = [:]
+        for parameter in parameters {
+            var value = String(parameter.value)
+            // Trim a single leading/trailing newline (matching the Qwen3 Coder
+            // reference implementation, which formats values on their own line).
+            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
+            if value.hasSuffix("\n") { value = String(value.dropLast()) }
+            arguments[parameter.name] = convertParameterValue(
+                value, paramName: parameter.name, funcName: name, tools: tools)
+        }
+        return ToolCall(function: .init(name: name, arguments: arguments))
     }
 }
 

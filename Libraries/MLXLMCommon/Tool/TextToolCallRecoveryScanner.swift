@@ -1263,22 +1263,10 @@ struct TextToolCallRecoveryScanner: Sendable {
         _ raw: String,
         allowMissingFunctionClose: Bool
     ) -> ToolCall? {
-        guard
-            case .complete(let payload) = QwenXMLPayloadScanner.scan(
-                raw[...], allowMissingFunctionClose: allowMissingFunctionClose),
-            raw[payload.end...].allSatisfy(\.isWhitespace)
-        else { return nil }
-
-        var arguments: [String: any Sendable] = [:]
-        for parameter in payload.parameters {
-            var value = String(parameter.value)
-            // Trim a single leading/trailing newline (matching XMLFunctionParser).
-            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
-            if value.hasSuffix("\n") { value = String(value.dropLast()) }
-            arguments[parameter.name] = convertParameterValue(
-                value, paramName: parameter.name, funcName: payload.name, tools: tools)
-        }
-        return ToolCall(function: .init(name: payload.name, arguments: arguments))
+        QwenXMLPayloadScanner.parseCanonical(
+            raw[...],
+            tools: tools,
+            allowMissingFunctionClose: allowMissingFunctionClose)
     }
 
     /// A recovered call must satisfy the declared schema's required arguments
