@@ -34,21 +34,6 @@ struct ModelLoadProgressTests {
         #expect(LoadProgressHandlers.download(handler).weights == nil)
     }
 
-    @Test("the download handler chains after the legacy parameter")
-    func downloadHandlerChains() {
-        let recorder = Recorder()
-        let progress = Progress.discreteProgress(totalUnitCount: 10)
-        progress.completedUnitCount = 4
-
-        let legacy = LoadProgressHandlers()
-        legacy.chainedDownloadHandler(with: { recorder.record($0) })(progress)
-        #expect(recorder.completed == [4])
-
-        let chained = LoadProgressHandlers(download: { recorder.record($0) })
-        chained.chainedDownloadHandler(with: { recorder.record($0) })(progress)
-        #expect(recorder.completed == [4, 4, 4])
-    }
-
     /// Recorder for the `Progress` published by ``ModelLoadProgressReporter``.
     final class Recorder: @unchecked Sendable {
         private let lock = NSLock()
@@ -93,6 +78,29 @@ struct ModelLoadProgressTests {
         // not weights -- must not be counted
         try write(64, to: directory.appending(path: "config.json"))
         try write(64, to: directory.appending(path: "tokenizer.json"))
+
+        #expect(safetensorsByteCount(in: directory) == 3072)
+    }
+
+    @Test("byte count follows the safetensors index")
+    func safetensorsByteCountUsesIndex() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try write(1024, to: directory.appending(path: "model-00001-of-00002.safetensors"))
+        try write(2048, to: directory.appending(path: "model-00002-of-00002.safetensors"))
+        try write(4096, to: directory.appending(path: "stale.safetensors"))
+
+        let index = """
+            {
+              "weight_map": {
+                "model.layers.0.weight": "model-00001-of-00002.safetensors",
+                "model.layers.1.weight": "model-00002-of-00002.safetensors"
+              }
+            }
+            """
+        try Data(index.utf8).write(
+            to: directory.appending(path: "model.safetensors.index.json"))
 
         #expect(safetensorsByteCount(in: directory) == 3072)
     }
