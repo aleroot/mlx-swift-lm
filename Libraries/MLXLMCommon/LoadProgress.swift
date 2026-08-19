@@ -42,8 +42,8 @@ import MLX
 /// }
 /// ```
 ///
-/// - Note: the existing `progressHandler` parameter of the loading entry points keeps
-///   reporting the download and is unchanged; when both are given, both are called.
+/// - Note: the former `progressHandler` loading overloads are deprecated. Use
+///   ``download`` for download progress.
 public struct LoadProgressHandlers: Sendable {
 
     /// Progress of downloading the model from a provider.
@@ -76,17 +76,6 @@ public struct LoadProgressHandlers: Sendable {
         .init(download: handler)
     }
 
-    /// The download callbacks of `self` chained after `progressHandler`, for entry
-    /// points that take both the legacy `progressHandler` parameter and `self`.
-    func chainedDownloadHandler(
-        with progressHandler: @escaping @Sendable (Progress) -> Void
-    ) -> @Sendable (Progress) -> Void {
-        guard let download else { return progressHandler }
-        return { progress in
-            progressHandler(progress)
-            download(progress)
-        }
-    }
 }
 
 extension GenericModelFactory {
@@ -127,20 +116,13 @@ extension GenericModelFactory {
 /// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)`` does, so the
 /// result is the number of bytes that loading the model will read.
 func safetensorsByteCount(in modelDirectory: URL) -> Int64 {
-    guard
-        let enumerator = FileManager.default.enumerator(
-            at: modelDirectory, includingPropertiesForKeys: [.fileSizeKey])
-    else {
-        return 0
-    }
+    guard FileManager.default.fileExists(atPath: modelDirectory.path) else { return 0 }
 
-    var total: Int64 = 0
-    for case let url as URL in enumerator {
-        guard url.pathExtension == "safetensors" else { continue }
+    let urls = (try? safetensorWeightURLs(in: modelDirectory)) ?? []
+    return urls.reduce(into: 0) { total, url in
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         total += Int64(size)
     }
-    return total
 }
 
 /// Aggregates the per file byte progress reported by MLX while the weights of a model are
