@@ -267,11 +267,14 @@ public class ToolCallProcessor {
         let buffered = toolCallBuffer
         let terminalState = state
         var parsedCalls = parser.parseEOS(buffered, tools: tools)
+        let usedRecovery = parsedCalls.isEmpty
         if parsedCalls.isEmpty {
             parsedCalls = recoveryScanner?.recoverEOSPayloads(buffered) ?? []
-            collectRecoveryEvents()
         }
-        appendToolCalls(parsedCalls, rawText: buffered)
+        let acceptedCalls = appendToolCalls(parsedCalls, rawText: buffered)
+        if usedRecovery {
+            collectRecoveryEvents(acceptedCandidates: acceptedCalls)
+        }
 
         let didReject: Bool
         if parsedCalls.isEmpty,
@@ -324,6 +327,7 @@ public class ToolCallProcessor {
         -> String?
     {
         var visible: String?
+        var acceptedCandidates: [Bool] = []
         for output in outputs {
             switch output {
             case .text(let text):
@@ -336,7 +340,7 @@ public class ToolCallProcessor {
                 recordResponse(text)
                 visible = combine(visible, text)
             case .toolCall(let call, let rawText):
-                appendToolCall(call, rawText: rawText)
+                acceptedCandidates.append(appendToolCall(call, rawText: rawText))
             case .rejected(let rawText, let reason, let toolName):
                 appendRejectedToolCall(
                     reason: reason,
@@ -345,15 +349,21 @@ public class ToolCallProcessor {
                     detail: reason.diagnosticDetail)
             }
         }
-        collectRecoveryEvents()
+        collectRecoveryEvents(acceptedCandidates: acceptedCandidates)
         return visible
     }
 
-    /// Moves provenance recorded by the recovery scanner into the public log.
-    private func collectRecoveryEvents() {
+    /// Moves provenance for executable promotions into the public log.
+    /// Candidates rejected by the common authorization/schema boundary are
+    /// rejection telemetry, not successful recoveries.
+    private func collectRecoveryEvents(acceptedCandidates: [Bool]) {
         guard let drained = recoveryScanner?.drainEvents(), !drained.isEmpty else { return }
-        recoveredToolCallCount += drained.count
-        recoveryEvents.append(contentsOf: drained)
+        assert(drained.count == acceptedCandidates.count)
+        let acceptedEvents = zip(drained, acceptedCandidates).compactMap { event, accepted in
+            accepted ? event : nil
+        }
+        recoveredToolCallCount += acceptedEvents.count
+        recoveryEvents.append(contentsOf: acceptedEvents)
     }
 
     private func finishRecoveryStream() -> String? {
@@ -570,8 +580,8 @@ public class ToolCallProcessor {
             if let call = parser.parse(content: callText, tools: tools)
                 ?? recoveryScanner?.recoverCompletePayload(callText)
             {
-                collectRecoveryEvents()
-                appendToolCall(call, rawText: callText)
+                let accepted = appendToolCall(call, rawText: callText)
+                collectRecoveryEvents(acceptedCandidates: [accepted])
             } else {
                 let reason = classifyCompletePayload(callText)
                 appendRejectedToolCall(
@@ -802,8 +812,8 @@ public class ToolCallProcessor {
                     if !leadingTokenWasRecorded {
                         recordResponse(leadingToken ?? "")
                     }
-                    collectRecoveryEvents()
-                    appendToolCall(toolCall, rawText: bufferedToolCall)
+                    let accepted = appendToolCall(toolCall, rawText: bufferedToolCall)
+                    collectRecoveryEvents(acceptedCandidates: [accepted])
                     state = .normal
                     toolCallBuffer = ""
 
@@ -966,13 +976,12 @@ public class ToolCallProcessor {
         return merged.isEmpty ? nil : merged
     }
 
-    private func appendToolCalls(_ calls: [ToolCall], rawText: String) {
-        for call in calls {
-            appendToolCall(call, rawText: rawText)
-        }
+    private func appendToolCalls(_ calls: [ToolCall], rawText: String) -> [Bool] {
+        calls.map { appendToolCall($0, rawText: rawText) }
     }
 
-    private func appendToolCall(_ call: ToolCall, rawText: String) {
+    @discardableResult
+    private func appendToolCall(_ call: ToolCall, rawText: String) -> Bool {
         guard allowedToolNames?.contains(call.function.name) ?? true else {
             appendRejectedToolCall(
                 reason: .undeclaredTool,
@@ -980,37 +989,27 @@ public class ToolCallProcessor {
                 toolName: call.function.name,
                 callID: call.id,
                 detail: RejectedToolCall.Reason.undeclaredTool.diagnosticDetail)
-            return
+            return false
         }
 
-        guard satisfiesDeclaredRequiredArguments(call) else {
+        if case .invalid(let violations) = ToolSchemaValidator.validate(
+            arguments: call.function.arguments,
+            forToolNamed: call.function.name,
+            in: tools)
+        {
             appendRejectedToolCall(
                 reason: .invalidArguments,
                 rawText: rawText,
                 toolName: call.function.name,
                 callID: call.id,
-                detail: "The tool-call payload omitted one or more required arguments.")
-            return
+                detail: ToolSchemaValidator.describe(violations))
+            return false
         }
 
         let normalized = normalizedToolCall(call)
         toolCalls.append(normalized)
         if orderedOutputEnabled {
             orderedOutputQueue.append(.toolCall(normalized))
-        }
-    }
-
-    private func satisfiesDeclaredRequiredArguments(_ call: ToolCall) -> Bool {
-        guard let tools else { return true }
-        for tool in tools {
-            guard let function = tool["function"] as? [String: any Sendable],
-                function["name"] as? String == call.function.name
-            else { continue }
-            guard let parameters = function["parameters"] as? [String: any Sendable],
-                let required = parameters["required"] as? [any Sendable]
-            else { return true }
-            return required.compactMap { $0 as? String }
-                .allSatisfy { call.function.arguments[$0] != nil }
         }
         return true
     }

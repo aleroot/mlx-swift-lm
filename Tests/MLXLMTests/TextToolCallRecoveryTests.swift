@@ -330,11 +330,16 @@ struct TextToolCallRecoveryTests {
         _ = processor.processChunk("<function=weather></function>")
         #expect(processor.toolCalls.isEmpty)
         #expect(processor.rejectedToolCalls.count == 1)
+        #expect(processor.rejectedToolCalls.first?.reason == .invalidArguments)
+        #expect(processor.rejectedToolCalls.first?.detail == "arguments.city is required")
+        #expect(processor.recoveredToolCallCount == 0)
+        #expect(processor.recoveryEvents.isEmpty)
 
         let native = ToolCallProcessor(format: .json, tools: tools)
         _ = native.processChunk(
             #"<tool_call>{"name":"weather","arguments":{}}</tool_call>"#)
         #expect(native.toolCalls.isEmpty)
         #expect(native.rejectedToolCalls.first?.reason == .invalidArguments)
+        #expect(native.rejectedToolCalls.first?.detail == "arguments.city is required")
     }
 }

@@ -24,7 +24,8 @@ public struct RejectedToolCall: Hashable, Codable, Sendable {
         /// The call named a function that was not present in the supplied tools.
         case undeclaredTool = "undeclared_tool"
 
-        /// The function arguments could not be represented as a tool input.
+        /// The function arguments could not be represented as a tool input or
+        /// definitively violated the tool's declared schema.
         case invalidArguments = "invalid_arguments"
 
         /// The candidate exceeded the bounded parser budget and was discarded
