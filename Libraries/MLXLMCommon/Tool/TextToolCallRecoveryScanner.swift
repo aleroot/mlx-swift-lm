@@ -1240,16 +1240,13 @@ struct TextToolCallRecoveryScanner: Sendable {
             call = parseMistralStyle(raw)
         }
 
-        guard let call, allowedToolNames.contains(call.function.name),
-            satisfiesDeclaredRequiredArguments(call)
-        else { return nil }
+        guard let call, allowedToolNames.contains(call.function.name) else { return nil }
         return call
     }
 
     private func recoverDeclaredArgs(_ raw: String, name: String) -> ToolCall? {
         guard raw.hasPrefix(name + "[ARGS]"),
-            let call = parseMistralStyle(raw, expectedName: name),
-            satisfiesDeclaredRequiredArguments(call)
+            let call = parseMistralStyle(raw, expectedName: name)
         else { return nil }
         return call
     }
@@ -1267,23 +1264,6 @@ struct TextToolCallRecoveryScanner: Sendable {
             raw[...],
             tools: tools,
             allowMissingFunctionClose: allowMissingFunctionClose)
-    }
-
-    /// A recovered call must satisfy the declared schema's required arguments
-    /// before promotion; an empty-arguments promotion for a tool that declares
-    /// required parameters is never valid recovery.
-    private func satisfiesDeclaredRequiredArguments(_ call: ToolCall) -> Bool {
-        for tool in tools {
-            guard let function = tool["function"] as? [String: any Sendable],
-                function["name"] as? String == call.function.name
-            else { continue }
-            guard let parameters = function["parameters"] as? [String: any Sendable],
-                let required = parameters["required"] as? [any Sendable]
-            else { return true }
-            let requiredNames = required.compactMap { $0 as? String }
-            return requiredNames.allSatisfy { call.function.arguments[$0] != nil }
-        }
-        return true
     }
 
     private func rejection(
