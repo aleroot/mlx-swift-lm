@@ -240,6 +240,9 @@ public enum LoRATrain {
         try model.update(
             parameters: ModuleParameters.unflattened(weights),
             verify: .noUnusedKeys)
+        // `loadArrays` is lazy. Realize the installed weights before the caller
+        // trains, evaluates, or otherwise reads them.
+        eval(model)
     }
 
     public enum Progress: CustomStringConvertible, Sendable {
