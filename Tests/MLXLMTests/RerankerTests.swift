@@ -517,6 +517,36 @@ struct RerankerTests {
         #expect(output.shape == [1, 3, 128])
     }
 
+    @Test func jinaSanitizeAcceptsBothPackagingsOfTheProjector() throws {
+        let configuration = try decodeQwenConfiguration()
+        let model = JinaRerankerModel(configuration)
+        let linear1 = MLXArray.zeros([512, 1024])
+        let linear2 = MLXArray.zeros([512, 512])
+
+        // jinaai/jina-reranker-v3: nn.Sequential(Linear, ReLU, Linear) in `model.safetensors`,
+        // so the layers are numbered by position
+        let fromSource = model.sanitize(weights: [
+            "model.embed_tokens.weight": MLXArray.zeros([151_936, 1024]),
+            "projector.0.weight": linear1,
+            "projector.2.weight": linear2,
+        ])
+
+        // jinaai/jina-reranker-v3-mlx: the same layers renamed, in `projector.safetensors`,
+        // without the `projector` prefix
+        let fromMLX = model.sanitize(weights: [
+            "model.embed_tokens.weight": MLXArray.zeros([151_936, 1024]),
+            "linear1.weight": linear1,
+            "linear2.weight": linear2,
+        ])
+
+        for weights in [fromSource, fromMLX] {
+            #expect(weights["projector.linear1.weight"]?.shape == [512, 1024])
+            #expect(weights["projector.linear2.weight"]?.shape == [512, 512])
+            #expect(weights["model.embed_tokens.weight"] != nil)
+            #expect(weights.count == 3, "sanitize must not leave the original spelling behind")
+        }
+    }
+
     @Test func jinaDeclaresTheProjectorSidecarNoConventionSelects() throws {
         let configuration = try decodeQwenConfiguration()
         let model = JinaRerankerModel(configuration)

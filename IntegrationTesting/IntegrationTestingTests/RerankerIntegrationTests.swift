@@ -27,4 +27,11 @@ struct RerankerModelIntegrationTests {
         try await RerankerIntegrationTests.jinaV3(
             downloader: downloader, tokenizerLoader: tokenizerLoader)
     }
+
+    /// The upstream checkpoint the MLX repo was converted from, which packages the same model
+    /// with no index and the projector inside `model.safetensors`.
+    @Test func jinaV3SourceCheckpointRelevanceScores() async throws {
+        try await RerankerIntegrationTests.jinaV3SourceCheckpoint(
+            downloader: downloader, tokenizerLoader: tokenizerLoader)
+    }
 }
