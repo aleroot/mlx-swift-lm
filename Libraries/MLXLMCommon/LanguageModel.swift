@@ -15,6 +15,18 @@ public protocol BaseLanguageModel: Module {
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+
+    /// Weight files the model needs that `model.safetensors.index.json` may not name.
+    ///
+    /// A checkpoint can ship weights in a sidecar file that its index omits, e.g.
+    /// `jinaai/jina-reranker-v3-mlx` keeps the reranking head in `projector.safetensors` while
+    /// the index only maps the transformer shards.  Loading honors the index when it is present,
+    /// so those weights would never be read.  A model that owns such a sidecar lists it here.
+    ///
+    /// The names are relative to the model directory and are loaded after the indexed files, so
+    /// the index still wins for any tensor both provide.  Files that are not present are
+    /// ignored.  The default implementation returns an empty array.
+    var additionalWeightFiles: [String] { get }
 }
 
 /// Optional metadata a model wants written into converted safetensors.
@@ -35,6 +47,8 @@ extension BaseLanguageModel {
     {
         sanitize(weights: weights)
     }
+
+    public var additionalWeightFiles: [String] { [] }
 }
 
 /// Removes checkpoint tensors owned by an `lm_head` module when the model uses its token

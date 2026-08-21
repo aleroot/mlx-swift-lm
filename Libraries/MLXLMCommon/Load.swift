@@ -12,24 +12,71 @@ private struct SafetensorsIndex: Decodable {
     }
 }
 
-package func safetensorWeightURLs(in modelDirectory: URL) throws -> [URL] {
+/// The `safetensors` files in `modelDirectory` that hold the model's weights.
+///
+/// When `model.safetensors.index.json` is present it is authoritative: only the files it names
+/// are loaded.  That keeps sidecar checkpoints that belong to a different module -- for example
+/// `mtp.safetensors` or `optiq_vision.safetensors` -- out of the main model.  Two cases relax
+/// that rule:
+///
+/// - The index names files the repository does not ship.  Some quantized uploads carry the
+///   index over from the unquantized source repo without regenerating it, so it names shards
+///   that do not exist.  Loading only those files would load nothing, so every `safetensors`
+///   file that is actually present is used instead.
+/// - `additionalFiles` names sidecars the model requires but the index omits, for example the
+///   Jina reranker's `projector.safetensors`.  Missing entries are ignored.
+///
+/// - Parameters:
+///   - modelDirectory: directory holding the weight files
+///   - additionalFiles: file names, relative to `modelDirectory`, to load in addition to the
+///     files named by the index.  See ``BaseLanguageModel/additionalWeightFiles``.
+package func safetensorWeightURLs(
+    in modelDirectory: URL, additionalFiles: [String] = []
+) throws -> [URL] {
     let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
-    if FileManager.default.fileExists(atPath: indexURL.path) {
-        let data = try Data(contentsOf: indexURL)
-        let index = try JSONDecoder().decode(SafetensorsIndex.self, from: data)
-        return Set(index.weightMap.values)
-            .sorted()
-            .map { modelDirectory.appendingPathComponent($0) }
+    guard FileManager.default.fileExists(atPath: indexURL.path) else {
+        return allSafetensorWeightURLs(in: modelDirectory)
     }
 
+    let data = try Data(contentsOf: indexURL)
+    let index = try JSONDecoder().decode(SafetensorsIndex.self, from: data)
+    let indexed = Set(index.weightMap.values)
+        .sorted()
+        .map { modelDirectory.appendingPathComponent($0) }
+
+    // an index that names files the repo does not ship is stale -- load what is there
+    guard !indexed.isEmpty,
+        indexed.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) })
+    else {
+        return allSafetensorWeightURLs(in: modelDirectory)
+    }
+
+    var seen = Set(indexed.map(\.standardizedFileURL.path))
+    var urls = indexed
+    for name in additionalFiles {
+        let url = modelDirectory.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: url.path),
+            seen.insert(url.standardizedFileURL.path).inserted
+        else {
+            continue
+        }
+        urls.append(url)
+    }
+    return urls
+}
+
+private func allSafetensorWeightURLs(in modelDirectory: URL) -> [URL] {
     let enumerator = FileManager.default.enumerator(
         at: modelDirectory, includingPropertiesForKeys: nil)!
-    return enumerator.compactMap { item -> URL? in
-        guard let url = item as? URL, url.pathExtension == "safetensors" else {
-            return nil
+    return
+        enumerator
+        .compactMap { item -> URL? in
+            guard let url = item as? URL, url.pathExtension == "safetensors" else {
+                return nil
+            }
+            return url
         }
-        return url
-    }
+        .sorted { $0.path < $1.path }
 }
 
 /// Load model weights.
@@ -47,7 +94,9 @@ public func loadWeights(
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
-    for url in try safetensorWeightURLs(in: modelDirectory) {
+    for url in try safetensorWeightURLs(
+        in: modelDirectory, additionalFiles: model.additionalWeightFiles)
+    {
         let (w, m) = try loadArraysAndMetadata(url: url)
         for (key, value) in w {
             weights[key] = value

@@ -101,6 +101,10 @@ public final class JinaRerankerModel: Module, LanguageModel, KVCacheDimensionPro
         return scores.asArray(Float.self).map(Double.init)
     }
 
+    /// The checkpoint keeps the projector in `projector.safetensors`, which
+    /// `model.safetensors.index.json` does not name, so it has to be requested explicitly.
+    public var additionalWeightFiles: [String] { ["projector.safetensors"] }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights.reduce(into: [:]) { result, item in
             switch item.key {
