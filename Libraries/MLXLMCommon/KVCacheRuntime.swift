@@ -234,8 +234,7 @@ extension KVCacheLeaf {
                     : .differentStrategy)
         case .varianceNormalized:
             let matches = requested == .varianceNormalized
-            return .init(
-                path: path,
+            return status(
                 state: matches ? .active : .skipped,
                 resolvedStrategy: .varianceNormalized,
                 reason: matches ? nil : .differentStrategy)

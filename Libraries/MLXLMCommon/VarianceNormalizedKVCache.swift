@@ -93,8 +93,12 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     static let tailStateCount = 2
 
     private var tiles: [VarianceNormalizedKVTile] = []
+    private var tileStorage: VarianceNormalizedKVTile?
+    private var stackedTiles: VarianceNormalizedKVTile?
     private var tailKeys: MLXArray?
     private var tailValues: MLXArray?
+    private var keyDType: DType?
+    private var valueDType: DType?
     private var restoredTileCount: Int?
     private var restoredTailLength: Int?
 
@@ -254,7 +258,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         let fusedValueScales = valueScales * valueRowScales
         let fusedValueBiases = valueBiases * valueRowScales
 
-        tiles.append(
+        appendCompressedTile(
             VarianceNormalizedKVTile(
                 keyWeight: keyWeight,
                 keyScales: fusedKeyScales,
@@ -265,6 +269,166 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
                 valueBiases: fusedValueBiases,
                 valueColumnScales: valueColumnScales
             ))
+    }
+
+    private func makeTileStorage(
+        like tile: VarianceNormalizedKVTile, capacity: Int
+    ) -> VarianceNormalizedKVTile {
+        func buffer(like array: MLXArray) -> MLXArray {
+            var shape = array.shape
+            shape.insert(capacity, at: 2)
+            return MLXArray.zeros(shape, dtype: array.dtype)
+        }
+
+        return VarianceNormalizedKVTile(
+            keyWeight: buffer(like: tile.keyWeight),
+            keyScales: buffer(like: tile.keyScales),
+            keyBiases: buffer(like: tile.keyBiases),
+            keyColumnScales: buffer(like: tile.keyColumnScales),
+            valueWeight: buffer(like: tile.valueWeight),
+            valueScales: buffer(like: tile.valueScales),
+            valueBiases: buffer(like: tile.valueBiases),
+            valueColumnScales: buffer(like: tile.valueColumnScales)
+        )
+    }
+
+    private func store(
+        _ tile: VarianceNormalizedKVTile, at index: Int,
+        in storage: inout VarianceNormalizedKVTile
+    ) {
+        storage.keyWeight[0..., 0..., index, 0..., 0...] = tile.keyWeight
+        storage.keyScales[0..., 0..., index, 0..., 0...] = tile.keyScales
+        storage.keyBiases[0..., 0..., index, 0..., 0...] = tile.keyBiases
+        storage.keyColumnScales[0..., 0..., index, 0..., 0...] = tile.keyColumnScales
+        storage.valueWeight[0..., 0..., index, 0..., 0...] = tile.valueWeight
+        storage.valueScales[0..., 0..., index, 0..., 0...] = tile.valueScales
+        storage.valueBiases[0..., 0..., index, 0..., 0...] = tile.valueBiases
+        storage.valueColumnScales[0..., 0..., index, 0..., 0...] = tile.valueColumnScales
+    }
+
+    private func evaluate(_ tile: VarianceNormalizedKVTile) {
+        eval([
+            tile.keyWeight, tile.keyScales, tile.keyBiases, tile.keyColumnScales,
+            tile.valueWeight, tile.valueScales, tile.valueBiases, tile.valueColumnScales,
+        ])
+    }
+
+    private func activeView(
+        of storage: VarianceNormalizedKVTile, count: Int
+    ) -> VarianceNormalizedKVTile {
+        VarianceNormalizedKVTile(
+            keyWeight: storage.keyWeight[0..., 0..., ..<count, 0..., 0...],
+            keyScales: storage.keyScales[0..., 0..., ..<count, 0..., 0...],
+            keyBiases: storage.keyBiases[0..., 0..., ..<count, 0..., 0...],
+            keyColumnScales: storage.keyColumnScales[0..., 0..., ..<count, 0..., 0...],
+            valueWeight: storage.valueWeight[0..., 0..., ..<count, 0..., 0...],
+            valueScales: storage.valueScales[0..., 0..., ..<count, 0..., 0...],
+            valueBiases: storage.valueBiases[0..., 0..., ..<count, 0..., 0...],
+            valueColumnScales: storage.valueColumnScales[0..., 0..., ..<count, 0..., 0...]
+        )
+    }
+
+    private func install(_ storage: VarianceNormalizedKVTile, count: Int) {
+        tileStorage = storage
+        let active = activeView(of: storage, count: count)
+        stackedTiles = active
+        tiles = (0 ..< count).map { index in
+            VarianceNormalizedKVTile(
+                keyWeight: active.keyWeight[0..., 0..., index, 0..., 0...],
+                keyScales: active.keyScales[0..., 0..., index, 0..., 0...],
+                keyBiases: active.keyBiases[0..., 0..., index, 0..., 0...],
+                keyColumnScales: active.keyColumnScales[0..., 0..., index, 0..., 0...],
+                valueWeight: active.valueWeight[0..., 0..., index, 0..., 0...],
+                valueScales: active.valueScales[0..., 0..., index, 0..., 0...],
+                valueBiases: active.valueBiases[0..., 0..., index, 0..., 0...],
+                valueColumnScales: active.valueColumnScales[0..., 0..., index, 0..., 0...]
+            )
+        }
+    }
+
+    /// Keep one evaluated batch-shaped view of completed tiles. Capacity doubles as needed, so
+    /// appending tiles has amortized linear copy cost while attention avoids per-token stacking.
+    private func appendCompressedTile(_ tile: VarianceNormalizedKVTile) {
+        let previousCount = tiles.count
+        let newCount = previousCount + 1
+        guard newCount > 1 else {
+            tiles.append(tile)
+            return
+        }
+
+        var storage: VarianceNormalizedKVTile
+        if let existing = tileStorage, existing.keyWeight.dim(2) >= newCount {
+            storage = existing
+        } else {
+            var capacity = 2
+            while capacity < newCount {
+                capacity *= 2
+            }
+            storage = makeTileStorage(like: tile, capacity: capacity)
+            if let stackedTiles {
+                storage.keyWeight[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.keyWeight
+                storage.keyScales[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.keyScales
+                storage.keyBiases[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.keyBiases
+                storage.keyColumnScales[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.keyColumnScales
+                storage.valueWeight[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.valueWeight
+                storage.valueScales[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.valueScales
+                storage.valueBiases[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.valueBiases
+                storage.valueColumnScales[0..., 0..., ..<previousCount, 0..., 0...] =
+                    stackedTiles.valueColumnScales
+            } else {
+                store(tiles[0], at: 0, in: &storage)
+            }
+        }
+        store(tile, at: previousCount, in: &storage)
+        evaluate(storage)
+        install(storage, count: newCount)
+    }
+
+    private func rebuildStackedTiles() {
+        guard !tiles.isEmpty else {
+            tileStorage = nil
+            stackedTiles = nil
+            return
+        }
+        guard tiles.count > 1 else {
+            if tileStorage != nil {
+                let tile = tiles[0]
+                let detached = VarianceNormalizedKVTile(
+                    keyWeight: contiguous(tile.keyWeight),
+                    keyScales: contiguous(tile.keyScales),
+                    keyBiases: contiguous(tile.keyBiases),
+                    keyColumnScales: contiguous(tile.keyColumnScales),
+                    valueWeight: contiguous(tile.valueWeight),
+                    valueScales: contiguous(tile.valueScales),
+                    valueBiases: contiguous(tile.valueBiases),
+                    valueColumnScales: contiguous(tile.valueColumnScales)
+                )
+                evaluate(detached)
+                tiles = [detached]
+            }
+            tileStorage = nil
+            stackedTiles = nil
+            return
+        }
+
+        let restoredTiles = tiles
+        var capacity = 2
+        while capacity < restoredTiles.count {
+            capacity *= 2
+        }
+        var storage = makeTileStorage(like: restoredTiles[0], capacity: capacity)
+        for (index, tile) in restoredTiles.enumerated() {
+            store(tile, at: index, in: &storage)
+        }
+        evaluate(storage)
+        install(storage, count: restoredTiles.count)
     }
 
     private func reconstructedRotated(
@@ -283,7 +447,10 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
             groupSize: valueGroupSize, bits: valueBits, mode: .affine)
         let rotatedValues = scaledValues * tile.valueColumnScales
 
-        return (rotatedKeys.asType(.float16), rotatedValues.asType(.float16))
+        return (
+            rotatedKeys.asType(keyDType ?? .float32),
+            rotatedValues.asType(valueDType ?? .float32)
+        )
     }
 
     private func reconstructed(_ tile: VarianceNormalizedKVTile) -> (MLXArray, MLXArray) {
@@ -418,10 +585,13 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         )
         let kvHeadCount = tiles[0].keyWeight.dim(1)
         let repeats = queryHeadCount / kvHeadCount
-        let keyWeights = MLX.stacked(tiles.map(\.keyWeight), axis: 2)
-        let keyScales = MLX.stacked(tiles.map(\.keyScales), axis: 2)
-        let keyBiases = MLX.stacked(tiles.map(\.keyBiases), axis: 2)
-        let keyColumnScales = MLX.stacked(tiles.map(\.keyColumnScales), axis: 2)
+        guard let stackedTiles else {
+            preconditionFailure("Stacked tile scores require at least two completed tiles")
+        }
+        let keyWeights = stackedTiles.keyWeight
+        let keyScales = stackedTiles.keyScales
+        let keyBiases = stackedTiles.keyBiases
+        let keyColumnScales = stackedTiles.keyColumnScales
 
         if repeats > 1 {
             let groupedQueries = rotatedQueries.reshaped([
@@ -473,10 +643,13 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         let repeats = queryHeadCount / kvHeadCount
         let valueHeadDim = tiles[0].valueColumnScales.dim(-1)
         let groupSize = validatedValueGroupSize(valueHeadDim)
-        let valueWeights = MLX.stacked(tiles.map(\.valueWeight), axis: 2)
-        let valueScales = MLX.stacked(tiles.map(\.valueScales), axis: 2)
-        let valueBiases = MLX.stacked(tiles.map(\.valueBiases), axis: 2)
-        let valueColumnScales = MLX.stacked(tiles.map(\.valueColumnScales), axis: 2)
+        guard let stackedTiles else {
+            preconditionFailure("Stacked tile values require at least two completed tiles")
+        }
+        let valueWeights = stackedTiles.valueWeight
+        let valueScales = stackedTiles.valueScales
+        let valueBiases = stackedTiles.valueBiases
+        let valueColumnScales = stackedTiles.valueColumnScales
 
         if repeats > 1 {
             let groupedWeights =
@@ -601,6 +774,18 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     }
 
     private func append(keys: MLXArray, values: MLXArray) {
+        if let keyDType {
+            precondition(keyDType == keys.dtype, "VarianceNormalizedKVCache key dtype changed")
+        } else {
+            keyDType = keys.dtype
+        }
+        if let valueDType {
+            precondition(
+                valueDType == values.dtype, "VarianceNormalizedKVCache value dtype changed")
+        } else {
+            valueDType = values.dtype
+        }
+
         let rotatedKeys = rotate(keys)
         let rotatedValues = rotate(values)
 
@@ -619,6 +804,9 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         append(keys: keys, values: values)
 
+        // KVCache requires this materializing fallback for attention implementations that call
+        // update directly. The standard attentionWithCacheUpdate path uses updateAndAttend below
+        // and never reconstructs completed tiles during decode.
         guard let state = materializedState() else {
             return (keys, values)
         }
@@ -698,6 +886,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
                 index += tileStateCount
             }
             tiles = restored
+            rebuildStackedTiles()
 
             if (restoredTailLength ?? 0) > 0 {
                 guard index + 1 < newValue.count else {
@@ -705,9 +894,13 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
                 }
                 tailKeys = newValue[index]
                 tailValues = newValue[index + 1]
+                keyDType = tailKeys?.dtype
+                valueDType = tailValues?.dtype
             } else {
                 tailKeys = nil
                 tailValues = nil
+                keyDType = nil
+                valueDType = nil
             }
         }
     }
@@ -743,6 +936,16 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
     public override var isTrimmable: Bool { true }
 
+    public override func isTrimmable(after positions: Int) -> Bool {
+        guard positions >= 0 else { return false }
+        let tailLength = tailKeys?.dim(2) ?? 0
+        // A staged round that crosses a tile boundary would quantize some provisional rows.
+        // Trimming back into that tile reconstructs them approximately, so it is not the exact
+        // rollback required by KVCacheRound. Refuse that round and let generation fall back to
+        // the non-speculative path; rounds wholly inside the raw tail remain exactly rewindable.
+        return tailLength + positions < tileSize
+    }
+
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         guard n > 0 else { return 0 }
@@ -769,6 +972,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
         if retainedTileCount < tiles.count {
             tiles.removeSubrange(retainedTileCount...)
+            rebuildStackedTiles()
         }
         restoredTileCount = nil
         restoredTailLength = nil

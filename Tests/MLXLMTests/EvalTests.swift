@@ -98,7 +98,7 @@ public class EvalTests: XCTestCase {
         maxTokens: Int,
         mode: TestKVCacheMode
     ) throws -> DecodeResult {
-        var cache = model.newCache(parameters: nil)
+        var cache = try model.newCache(parameters: nil)
         let start = Date.timeIntervalSinceReferenceDate
         let promptLogits = model.callAsFunction(MLXArray(prompt)[.newAxis, .ellipsis], cache: cache)
         eval(promptLogits)
@@ -126,7 +126,7 @@ public class EvalTests: XCTestCase {
         mode: TestKVCacheMode
     ) throws -> Float {
         precondition(sequence.count > 1)
-        var cache = model.newCache(parameters: nil)
+        var cache = try model.newCache(parameters: nil)
         var loss: Float = 0
 
         for i in 0 ..< sequence.count - 1 {
@@ -180,7 +180,7 @@ public class EvalTests: XCTestCase {
                 compatibility: .allowPartial),
             temperature: 0)
 
-        var cache = model.newCache(parameters: parameters)
+        var cache = try model.newCache(parameters: parameters)
         XCTAssertTrue(cache.allSatisfy { $0 is KVCacheSimple })
 
         let prompt = MLXArray([1, 2, 3, 4])[.newAxis, .ellipsis]
