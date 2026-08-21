@@ -437,7 +437,8 @@ public final class VLMModelFactory: GenericModelFactory {
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            weightFileSelection: configuration.weightFileSelection)
 
         let tokenizer = try await tokenizerTask
         let processorConfigData: Data

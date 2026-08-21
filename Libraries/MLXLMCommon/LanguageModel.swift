@@ -15,17 +15,25 @@ public protocol BaseLanguageModel: Module {
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+}
 
-    /// Weight files the model needs that `model.safetensors.index.json` may not name.
+/// Weight files a model needs that no naming convention or `model.safetensors.index.json`
+/// selects.
+///
+/// A checkpoint can ship weights in a file that neither the conventional `model*.safetensors`
+/// names nor its own index cover: `jinaai/jina-reranker-v3-mlx` keeps its reranking head in
+/// `projector.safetensors` and maps only the transformer shards in its index, so the head is
+/// never read and the model fails to load. The reference implementation has the same gap and
+/// closes it the same way -- the checkpoint's `rerank.py` loads that file by name.
+///
+/// Conform a model to this protocol to name those files. Being explicit rather than widening
+/// the selection is what keeps unrelated weights out: a stray tensor whose name a model's
+/// `sanitize(weights:)` rewrites is loaded silently rather than reported.
+public protocol AdditionalWeightFilesProviding {
+    /// File names, relative to the model directory.
     ///
-    /// A checkpoint can ship weights in a sidecar file that its index omits, e.g.
-    /// `jinaai/jina-reranker-v3-mlx` keeps the reranking head in `projector.safetensors` while
-    /// the index only maps the transformer shards.  Loading honors the index when it is present,
-    /// so those weights would never be read.  A model that owns such a sidecar lists it here.
-    ///
-    /// The names are relative to the model directory and are loaded after the indexed files, so
-    /// the index still wins for any tensor both provide.  Files that are not present are
-    /// ignored.  The default implementation returns an empty array.
+    /// They are loaded after the selected weight files, so a file that is already selected is
+    /// not loaded twice, and names that are not present are ignored.
     var additionalWeightFiles: [String] { get }
 }
 
@@ -47,8 +55,6 @@ extension BaseLanguageModel {
     {
         sanitize(weights: weights)
     }
-
-    public var additionalWeightFiles: [String] { [] }
 }
 
 /// Removes checkpoint tensors owned by an `lm_head` module when the model uses its token

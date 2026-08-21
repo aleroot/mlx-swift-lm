@@ -25,7 +25,7 @@ private final class JinaRerankerProjector: Module {
 /// It uses Qwen3 hidden states at `<|embed_token|>` and `<|rerank_token|>` positions,
 /// projects them with `projector.safetensors`, then scores documents by cosine similarity.
 public final class JinaRerankerModel: Module, LanguageModel, KVCacheDimensionProvider,
-    ListwiseRerankerModel
+    ListwiseRerankerModel, AdditionalWeightFilesProviding
 {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -101,8 +101,9 @@ public final class JinaRerankerModel: Module, LanguageModel, KVCacheDimensionPro
         return scores.asArray(Float.self).map(Double.init)
     }
 
-    /// The checkpoint keeps the projector in `projector.safetensors`, which
-    /// `model.safetensors.index.json` does not name, so it has to be requested explicitly.
+    /// The checkpoint keeps the projector in `projector.safetensors`, which neither the
+    /// conventional `model*.safetensors` names nor `model.safetensors.index.json` select, so it
+    /// has to be requested by name -- as the checkpoint's own `rerank.py` does.
     public var additionalWeightFiles: [String] { ["projector.safetensors"] }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

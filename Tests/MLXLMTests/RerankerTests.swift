@@ -517,14 +517,16 @@ struct RerankerTests {
         #expect(output.shape == [1, 3, 128])
     }
 
-    @Test func jinaDeclaresTheProjectorSidecarItsIndexOmits() throws {
+    @Test func jinaDeclaresTheProjectorSidecarNoConventionSelects() throws {
         let configuration = try decodeQwenConfiguration()
         let model = JinaRerankerModel(configuration)
 
-        // `jinaai/jina-reranker-v3-mlx` keeps the projector in `projector.safetensors` and its
-        // `model.safetensors.index.json` does not name that file, so loading honors the index
-        // and skips the head unless the model asks for it (#560).
-        #expect(model.additionalWeightFiles == ["projector.safetensors"])
+        // `jinaai/jina-reranker-v3-mlx` keeps the projector in `projector.safetensors`, which
+        // neither `model*.safetensors` nor its own index selects, so the head is skipped unless
+        // the model asks for the file by name (#560). Check the conformance, since that is what
+        // `loadWeights` looks for.
+        let provider = try #require(model as? any AdditionalWeightFilesProviding)
+        #expect(provider.additionalWeightFiles == ["projector.safetensors"])
     }
 
     @Test func jinaCosineSimilarityRemainsInDeclaredRange() {
