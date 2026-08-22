@@ -244,7 +244,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         var draftCanvas = currentCanvas
         argmaxCanvasHistory = nil
 
-        for curStep in stride(from: maxDenoisingSteps, through: 1, by: -1) {
+        denoisingLoop: for curStep in stride(from: maxDenoisingSteps, through: 1, by: -1) {
             let rawLogits =
                 if prefersLogitsSelfConditioning {
                     model.diffusionLogits(
@@ -293,7 +293,7 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
 
                 if draftRevealMask.all().item(Bool.self) {
                     argmaxCanvas = draftCanvas
-                    break
+                    break denoisingLoop
                 }
             }
 

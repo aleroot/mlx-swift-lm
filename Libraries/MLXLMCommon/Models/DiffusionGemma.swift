@@ -364,21 +364,7 @@ private enum DiffusionGemmaAttentionMode {
 }
 
 private func diffusionGemmaCacheState(_ cache: KVCache?) -> (MLXArray, MLXArray)? {
-    guard let cache else {
-        return nil
-    }
-
-    let state =
-        if let rotatingCache = cache as? RotatingKVCache {
-            rotatingCache.temporalState
-        } else {
-            cache.state
-        }
-
-    guard state.count == 2 else {
-        return nil
-    }
-    return (state[0], state[1])
+    cache?.currentKeyValues()
 }
 
 private func diffusionGemmaDecoderMask(
@@ -575,8 +561,8 @@ private final class DiffusionGemmaAttention: Module {
             }
         case .decoder:
             if let (cachedKeys, cachedValues) = diffusionGemmaCacheState(cache) {
-                var encoderKeys = cachedKeys
-                var encoderValues = cachedValues
+                var encoderKeys = cachedKeys.asType(keys.dtype)
+                var encoderValues = cachedValues.asType(values.dtype)
 
                 if isSliding {
                     let windowPrefix = Swift.max(config.slidingWindow - 1, 0)
@@ -839,12 +825,11 @@ private final class DiffusionGemmaDecoder: Module {
         if let selfConditioningEmbeddings {
             signal = selfConditioningEmbeddings.asType(h.dtype)
         } else if let selfConditioningLogits {
-            let probabilities = softmax(
-                selfConditioningLogits.asType(h.dtype), axis: -1, precise: true)
+            let probabilities = softmax(selfConditioningLogits, axis: -1, precise: true)
             let projected: MLXArray
             if let quantizedEmbedding = embedTokens as? QuantizedEmbedding {
                 projected = quantizedMM(
-                    probabilities,
+                    probabilities.asType(h.dtype),
                     quantizedEmbedding.weight,
                     scales: quantizedEmbedding.scales,
                     biases: quantizedEmbedding.biases,
@@ -853,10 +838,10 @@ private final class DiffusionGemmaDecoder: Module {
                     bits: quantizedEmbedding.bits,
                     mode: quantizedEmbedding.mode)
             } else {
-                projected = matmul(
-                    probabilities.asType(embedTokens.weight.dtype), embedTokens.weight)
+                projected = matmul(probabilities, embedTokens.weight)
             }
-            signal = projected * MLXArray(embedScale, dtype: .float32).asType(h.dtype)
+            signal =
+                projected.asType(h.dtype) * MLXArray(embedScale, dtype: .float32).asType(h.dtype)
         } else {
             signal = MLXArray.zeros(h.shape, dtype: h.dtype)
         }

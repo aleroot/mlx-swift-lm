@@ -235,6 +235,61 @@ struct DiffusionGemmaTests {
         #expect(cache.allSatisfy { $0.offset == 2 })
     }
 
+    @Test("DiffusionGemma VLM uses Gemma 4 tool-call conventions")
+    func vlmUsesGemma4ToolCallConventions() throws {
+        let config = try JSONDecoder().decode(
+            DiffusionGemmaVLMConfiguration.self, from: Data(Self.vlmConfigurationJSON.utf8))
+
+        #expect(DiffusionGemma(config).toolCallFormat == .gemma4)
+    }
+
+    @Test("DiffusionGemma reads live K/V independently of serialized cache layout")
+    func decoderUsesLiveKeyValuesInsteadOfSerializedState() throws {
+        let model = DiffusionGemmaLanguageCore(try Self.configuration())
+        eval(model)
+
+        let cache = try model.newCache(parameters: nil)
+        try model.prepareDiffusion(
+            LMInput(tokens: MLXArray([2, 7, 11]).reshaped([1, 3])),
+            cache: cache,
+            windowSize: nil)
+        let fullAttentionKV = try #require(cache[1].currentKeyValues())
+        let opaqueCache = SerializationOpaqueKVCache(
+            keys: fullAttentionKV.keys,
+            values: fullAttentionKV.values,
+            offset: cache[1].offset)
+        let canvas = MLXArray([4, 5, 6, 7]).reshaped([1, 4])
+
+        let reference = model.diffusionLogits(
+            canvasTokens: canvas, cache: cache, selfConditioningLogits: nil)
+        let opaqueStateResult = model.diffusionLogits(
+            canvasTokens: canvas,
+            cache: [cache[0], opaqueCache],
+            selfConditioningLogits: nil)
+        eval(reference, opaqueStateResult)
+
+        #expect(opaqueCache.state.count == 4)
+        #expect(abs(reference - opaqueStateResult).max().item(Float.self) < 1e-6)
+    }
+
+    @Test("Quantized KV cache exposes dense live K/V without serialization assumptions")
+    func quantizedCacheExposesLiveKeyValues() throws {
+        let keys = MLXArray((0 ..< 96).map { Float($0) / 100 }).reshaped([1, 1, 3, 32])
+        let values = MLXArray((0 ..< 96).map { Float(95 - $0) / 100 })
+            .reshaped([1, 1, 3, 32])
+        let cache = QuantizedKVCache(groupSize: 32, bits: 8)
+        _ = cache.updateQuantized(keys: keys, values: values)
+
+        let live = try #require(cache.currentKeyValues())
+        eval(live.keys, live.values)
+
+        #expect(cache.state.count == 6)
+        #expect(live.keys.shape == keys.shape)
+        #expect(live.values.shape == values.shape)
+        #expect(abs(live.keys - keys).max().item(Float.self) < 0.01)
+        #expect(abs(live.values - values).max().item(Float.self) < 0.01)
+    }
+
     @Test("Quantized DiffusionGemma self-conditions without a dense embedding table")
     func quantizedSelfConditioningUsesLogits() throws {
         let model = DiffusionGemmaLanguageCore(try Self.configuration())
@@ -254,6 +309,59 @@ struct DiffusionGemmaTests {
             tokens.append(token)
         }
         #expect(tokens.count == 4)
+    }
+
+    @Test("Quantized DiffusionGemma softmaxes self-conditioning logits before dtype conversion")
+    func quantizedSelfConditioningPreservesLogitPrecision() throws {
+        let model = DiffusionGemmaLanguageCore(try Self.configuration())
+        let bfloat16Parameters = Dictionary(
+            uniqueKeysWithValues: model.parameters().flattened().map { key, value in
+                (key, value.asType(.bfloat16))
+            })
+        try model.update(
+            parameters: ModuleParameters.unflattened(bfloat16Parameters), verify: [.all])
+        quantize(model: model, groupSize: 32, bits: 4) { path, _ in
+            path == "model.decoder.embed_tokens"
+        }
+
+        let parameters = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        let weight = try #require(parameters["model.decoder.embed_tokens.weight"])
+        let scales = try #require(parameters["model.decoder.embed_tokens.scales"])
+        let biases = try #require(parameters["model.decoder.embed_tokens.biases"])
+
+        let values = (0 ..< 4).flatMap { row in
+            (0 ..< 32).map { column in
+                Float(16) + Float((column + row * 7) % 32) * 0.02
+            }
+        }
+        let logits = MLXArray(values).reshaped([1, 4, 32])
+        let probabilities = softmax(logits, axis: -1, precise: true)
+        let projected = quantizedMM(
+            probabilities.asType(.bfloat16),
+            weight,
+            scales: scales,
+            biases: biases,
+            transpose: false,
+            groupSize: 32,
+            bits: 4)
+        let referenceEmbeddings =
+            projected.asType(.bfloat16)
+            * MLXArray(sqrt(Float(32)), dtype: .bfloat16)
+
+        let canvas = MLXArray([4, 5, 6, 7]).reshaped([1, 4])
+        let cache = try model.newCache(parameters: nil)
+        let logitsPath = model.diffusionLogits(
+            canvasTokens: canvas,
+            cache: cache,
+            selfConditioningLogits: logits)
+        let referencePath = model.diffusionLogits(
+            canvasTokens: canvas,
+            cache: cache,
+            selfConditioningEmbeddings: referenceEmbeddings)
+        eval(logitsPath, referencePath)
+
+        let maxDifference = abs(logitsPath - referencePath).max().item(Float.self)
+        #expect(maxDifference < 1e-5, "mlx-vlm parity difference: \(maxDifference)")
     }
 
     @Test("DiffusionGemma keeps official shared text checkpoint layout")
@@ -600,6 +708,7 @@ struct DiffusionGemmaTests {
         }
 
         #expect(tokens == [1, 2, 3])
+        #expect(model.decoderCalls == 1)
     }
 
     @Test("Block diffusion iterator does not apply autoregressive logit processors")
@@ -735,6 +844,54 @@ private struct DiffusionGemmaPromptTokenizer: Tokenizer {
     ) throws -> [Int] {
         tokens
     }
+}
+
+private final class SerializationOpaqueKVCache: KVCache {
+    private let liveKeys: MLXArray
+    private let liveValues: MLXArray
+    var offset: Int
+    var maxSize: Int? { nil }
+
+    init(keys: MLXArray, values: MLXArray, offset: Int) {
+        self.liveKeys = keys
+        self.liveValues = values
+        self.offset = offset
+    }
+
+    var state: [MLXArray] {
+        get { [liveKeys, liveKeys, liveValues, liveValues] }
+        set {}
+    }
+
+    var metaState: [String] {
+        get { [] }
+        set {}
+    }
+
+    var isTrimmable: Bool { false }
+
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        (keys, values)
+    }
+
+    func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? {
+        (liveKeys, liveValues)
+    }
+
+    @discardableResult
+    func trim(_ n: Int) -> Int { 0 }
+
+    func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        .none
+    }
+
+    func copy() -> any KVCache {
+        SerializationOpaqueKVCache(keys: liveKeys, values: liveValues, offset: offset)
+    }
+
+    func innerState() -> [MLXArray] { [liveKeys, liveValues] }
 }
 
 private final class PenaltySensitiveDiffusionModel: Module, BlockDiffusionLanguageModel {
