@@ -1924,6 +1924,35 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     #expect(cache.compactStorageByteCount == cache.state.reduce(0) { $0 + $1.nbytes })
 }
 
+@Test func testVarianceNormalizedKVCacheBoundsPartitionsBeforeLargeSlabBoundary() {
+    let nativeCache = VarianceNormalizedKVCache(
+        tileSize: 32, keyBits: 4, valueBits: 2, sinkhornIterations: 2)
+    let materializedCache = VarianceNormalizedKVCache(
+        tileSize: 32, keyBits: 4, valueBits: 2, sinkhornIterations: 2)
+    let tokenCount = 31 * 32
+    let queries = deterministicTensor(shape: [1, 4, 1, 32], salt: 51)
+    let keys = deterministicTensor(shape: [1, 2, tokenCount, 32], salt: 52)
+    let values = deterministicTensor(shape: [1, 2, tokenCount, 32], salt: 53)
+    let scale = 1 / sqrt(Float(32))
+
+    let native = nativeCache.updateAndAttend(
+        queries: queries, keys: keys, values: values, scale: scale)
+    let (materializedKeys, materializedValues) = materializedCache.update(
+        keys: keys, values: values)
+    let materialized = attentionWithCacheUpdate(
+        queries: queries,
+        keys: materializedKeys,
+        values: materializedValues,
+        cache: nil,
+        scale: scale)
+    eval(native, materialized)
+
+    // Four-tile base slabs cap the old 31-dispatch cliff at ten partitions while preserving
+    // the quantized attention result. The next tile still coalesces to one 32-tile slab.
+    #expect(nativeCache.attentionPartitionCount == 10)
+    #expect(relativeRMSError(native, materialized) < 1.5e-3)
+}
+
 @Test func testVarianceNormalizedKVCacheTwoBitMemoryAccountingIsPaperRelevant() {
     let cache = VarianceNormalizedKVCache(
         tileSize: 32, keyBits: 2, valueBits: 2, sinkhornIterations: 2)

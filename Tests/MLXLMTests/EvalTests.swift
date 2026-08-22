@@ -278,7 +278,7 @@ public class EvalTests: XCTestCase {
         #endif
     }
 
-    func testVarianceNormalizedKVCache32KPrefillPeakMetalMemorySmoke() throws {
+    func testVarianceNormalizedKVCache32KIngestAndDecodePeakMetalMemorySmoke() throws {
         #if os(macOS) && arch(arm64)
         let tokenCount = 32_768
         let cache = VarianceNormalizedKVCache(
@@ -316,7 +316,7 @@ public class EvalTests: XCTestCase {
         let decodeElapsed = Date.timeIntervalSinceReferenceDate - decodeStart
 
         print(
-            "KVarN 32K prefill smoke: elapsed=\(elapsed)s, raw=\(rawKVBytes) bytes, "
+            "KVarN 32K ingest/decode smoke: elapsed=\(elapsed)s, raw=\(rawKVBytes) bytes, "
                 + "compact=\(compactBytes) bytes, peak workspace=\(peakWorkspaceBytes) bytes, "
                 + "one-layer decode=\(decodeElapsed)s")
 

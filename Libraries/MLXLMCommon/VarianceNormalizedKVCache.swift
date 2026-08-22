@@ -114,7 +114,8 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     static let legacyTileStateCount = 10
     static let tailStateCount = 2
     static let metadataVersion = 1
-    static let slabTileCount = 32
+    static let compressionBatchTileCount = 32
+    static let baseSlabTileCount = 4
     static let slabFanout = 8
 
     private var tileSlabs: [VarianceNormalizedKVSlab] = []
@@ -363,8 +364,8 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         tileSlabs.append(VarianceNormalizedKVSlab(records: records, count: count))
 
         // Immutable tiered compaction: eight equal adjacent slabs become one larger slab. Each
-        // record is copied only at exponentially spaced boundaries (32, 256, 2,048 tiles...),
-        // while attention sees at most seven slabs per level instead of one dispatch per page.
+        // record is copied only at exponentially spaced boundaries (4, 32, 256 tiles...), while
+        // attention sees at most seven slabs per level instead of one dispatch per page.
         while tileSlabs.count >= Self.slabFanout {
             let suffix = Array(tileSlabs.suffix(Self.slabFanout))
             guard let first = suffix.first, suffix.allSatisfy({ $0.count == first.count }) else {
@@ -398,19 +399,19 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         while !pendingTiles.isEmpty && index < count {
             pendingTiles.append(tileView(records, index: index))
             index += 1
-            if pendingTiles.count == Self.slabTileCount {
+            if pendingTiles.count == Self.baseSlabTileCount {
                 let slabRecords = stackedRecords(pendingTiles)
                 evaluate(slabRecords)
-                appendSlab(slabRecords, count: Self.slabTileCount)
+                appendSlab(slabRecords, count: Self.baseSlabTileCount)
                 pendingTiles.removeAll(keepingCapacity: true)
             }
         }
 
-        while index + Self.slabTileCount <= count {
-            let end = index + Self.slabTileCount
+        while index + Self.baseSlabTileCount <= count {
+            let end = index + Self.baseSlabTileCount
             let slabRecords = contiguousRecords(records, range: index ..< end)
             evaluate(slabRecords)
-            appendSlab(slabRecords, count: Self.slabTileCount)
+            appendSlab(slabRecords, count: Self.baseSlabTileCount)
             index = end
         }
 
@@ -451,11 +452,11 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         tileSlabs.removeAll(keepingCapacity: true)
         pendingTiles.removeAll(keepingCapacity: true)
         var index = 0
-        while index + Self.slabTileCount <= tiles.count {
-            let records = stackedRecords(Array(tiles[index ..< index + Self.slabTileCount]))
+        while index + Self.baseSlabTileCount <= tiles.count {
+            let records = stackedRecords(Array(tiles[index ..< index + Self.baseSlabTileCount]))
             evaluate(records)
-            appendSlab(records, count: Self.slabTileCount)
-            index += Self.slabTileCount
+            appendSlab(records, count: Self.baseSlabTileCount)
+            index += Self.baseSlabTileCount
         }
         pendingTiles.append(contentsOf: tiles[index...])
     }
@@ -792,7 +793,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         while keys.dim(2) >= tileSize {
             // Thirty-two tiles amortize both prefill and decode dispatch while bounding each
             // FP32 normalization batch to 4,096 tokens at the default tile size.
-            let tileCount = min(Self.slabTileCount, keys.dim(2) / tileSize)
+            let tileCount = min(Self.compressionBatchTileCount, keys.dim(2) / tileSize)
             let length = tileCount * tileSize
             let records = compressedBatch(
                 rotatedKeys: keys[.ellipsis, ..<length, 0...],
