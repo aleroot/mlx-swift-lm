@@ -394,6 +394,12 @@ public final class DiffusionGemma: Module, VLMModel, BlockDiffusionLanguageModel
     }
 }
 
+// MARK: - Chat conventions
+
+extension DiffusionGemma {
+    public var toolCallFormat: ToolCallFormat? { .gemma4 }
+}
+
 public struct DiffusionGemma4Processor: UserInputProcessor {
     private let config: DiffusionGemma4ProcessorConfiguration
     private let tokenizer: any Tokenizer
