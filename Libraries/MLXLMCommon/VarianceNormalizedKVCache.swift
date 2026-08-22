@@ -16,6 +16,11 @@ private struct VarianceNormalizedKVTile {
     var valueColumnScales: MLXArray
 }
 
+private struct VarianceNormalizedKVSlab {
+    var records: VarianceNormalizedKVTile
+    let count: Int
+}
+
 private let varianceNormalizationEpsilon: Float = 1e-8
 private let varianceNormalizationMinimumStandardDeviation: Float = 1e-3
 private let varianceNormalizationMaximumStandardDeviation: Float = 1e3
@@ -24,6 +29,19 @@ private let varianceNormalizationMaximumLogScale: Float = 10
 
 private func isPowerOfTwo(_ value: Int) -> Bool {
     value > 0 && (value & (value - 1)) == 0
+}
+
+func isSupportedVarianceNormalizedDType(_ dtype: DType) -> Bool {
+    dtype == .float16 || dtype == .bfloat16 || dtype == .float32
+}
+
+private func varianceNormalizedDTypeName(_ dtype: DType?) -> String {
+    dtype.map { String(describing: $0) } ?? "none"
+}
+
+func varianceNormalizedDType(named name: String) -> DType? {
+    guard name != "none" else { return nil }
+    return DType.allCases.first { String(describing: $0) == name }
 }
 
 private func varianceNormalizedValueGroupSize(valueHeadDim: Int) -> Int? {
@@ -53,7 +71,7 @@ extension KVCacheSimple {
         tileSize: Int = 128,
         keyBits: Int = 4,
         valueBits: Int = 2,
-        sinkhornIterations: Int = 4
+        sinkhornIterations: Int = 8
     ) -> VarianceNormalizedKVCache {
         let cache = VarianceNormalizedKVCache(
             tileSize: tileSize,
@@ -85,23 +103,28 @@ extension KVCacheSimple {
 /// scale/bias are fused into the matching variance-normalization axis so each completed tile stores
 /// compact K/V records: packed weights, fused affine scale, fused affine bias, and the remaining
 /// variance scale.
+///
+/// - Warning: This cache remains experimental pending model-level long-context quality gates and
+///   a fused MLX/Metal attention implementation. Use `attentionWithCacheUpdate` for decode;
+///   `update(keys:values:)` is a compatibility slow path.
 public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     CustomDebugStringConvertible
 {
     static let compactTileStateCount = 8
     static let legacyTileStateCount = 10
     static let tailStateCount = 2
+    static let metadataVersion = 1
+    static let slabTileCount = 32
+    static let slabFanout = 8
 
-    private var tiles: [VarianceNormalizedKVTile] = []
-    private var tileStorage: VarianceNormalizedKVTile?
-    private var stackedTiles: VarianceNormalizedKVTile?
+    private var tileSlabs: [VarianceNormalizedKVSlab] = []
+    private var pendingTiles: [VarianceNormalizedKVTile] = []
     private var tailKeys: MLXArray?
     private var tailValues: MLXArray?
     private var keyDType: DType?
     private var valueDType: DType?
     private var restoredTileCount: Int?
     private var restoredTailLength: Int?
-
     public let tileSize: Int
     public let keyBits: Int
     public let valueBits: Int
@@ -111,7 +134,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         tileSize: Int = 128,
         keyBits: Int = 4,
         valueBits: Int = 2,
-        sinkhornIterations: Int = 4
+        sinkhornIterations: Int = 8
     ) {
         precondition(
             (try? VarianceNormalizedKVCacheConfiguration(
@@ -134,23 +157,8 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
     private func rotate(_ x: MLXArray) -> MLXArray {
         let dimensions = x.dim(-1)
-        guard isPowerOfTwo(dimensions) else { return x }
-
-        let originalShape = x.shape
-        var rotated = x.asType(.float32)
-        var stride = 1
-
-        while stride < dimensions {
-            let prefixShape = Array(rotated.shape.dropLast())
-            let paired = rotated.reshaped(prefixShape + [dimensions / (2 * stride), 2, stride])
-            let halves = split(paired, parts: 2, axis: -2)
-            let left = halves[0].squeezed(axis: -2)
-            let right = halves[1].squeezed(axis: -2)
-            rotated = concatenated([left + right, left - right], axis: -1).reshaped(originalShape)
-            stride *= 2
-        }
-
-        return (rotated / sqrt(Float(dimensions))).asType(x.dtype)
+        guard x.size > 0, isPowerOfTwo(dimensions) else { return x }
+        return hadamardTransform(x)
     }
 
     private func inverseRotate(_ x: MLXArray) -> MLXArray {
@@ -168,14 +176,16 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
     private func clippedStd(_ x: MLXArray, axis: Int) -> MLXArray {
         clip(
-            maximum(std(x, axis: axis, keepDims: true), MLXArray(varianceNormalizationEpsilon)),
+            maximum(
+                std(x, axis: axis, keepDims: true, ddof: 1),
+                MLXArray(varianceNormalizationEpsilon)),
             min: MLXArray(varianceNormalizationMinimumStandardDeviation),
             max: MLXArray(varianceNormalizationMaximumStandardDeviation))
     }
 
     private func varianceImbalance(_ x: MLXArray) -> MLXArray {
-        let columnStd = std(x, axis: -2, keepDims: true)
-        let rowStd = std(x, axis: -1, keepDims: true)
+        let columnStd = std(x, axis: -2, keepDims: true, ddof: 1)
+        let rowStd = std(x, axis: -1, keepDims: true, ddof: 1)
         let columnSpread =
             columnStd.max(axis: -1, keepDims: true)
             / maximum(
@@ -191,8 +201,10 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
     private func varianceNormalize(_ tile: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         let original = tile.asType(.float32)
-        var logColumnScales = MLXArray.zeros(std(original, axis: -2, keepDims: true).shape)
-        var logRowScales = MLXArray.zeros(std(original, axis: -1, keepDims: true).shape)
+        var logColumnScales = MLXArray.zeros(
+            std(original, axis: -2, keepDims: true, ddof: 1).shape)
+        var logRowScales = MLXArray.zeros(
+            std(original, axis: -1, keepDims: true, ddof: 1).shape)
         var columnScales = exp(logColumnScales)
         var rowScales = exp(logRowScales)
         var balancedTile = original
@@ -218,7 +230,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
                 original: original, columnScales: columnScales, rowScales: rowScales)
 
             let imbalance = varianceImbalance(balancedTile)
-            let useCandidate = imbalance .< bestImbalance
+            let useCandidate = imbalance .<= bestImbalance
             bestColumnScales = MLX.where(useCandidate, columnScales, bestColumnScales)
             bestRowScales = MLX.where(useCandidate, rowScales, bestRowScales)
             bestImbalance = MLX.where(useCandidate, imbalance, bestImbalance)
@@ -243,67 +255,65 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         )
     }
 
-    private func compress(rotatedKeys: MLXArray, rotatedValues: MLXArray) {
-        let keyTile = rotatedKeys.transposed(0, 1, 3, 2)
+    private func compactAuxiliary(_ array: MLXArray) -> MLXArray {
+        // The reference cache stores all auxiliary scales in FP16. Clamp before narrowing so a
+        // pathological BF16/FP32 activation cannot serialize an infinity into persistent state.
+        clip(array, min: MLXArray(-65_504), max: MLXArray(65_504)).asType(.float16)
+    }
+
+    /// Compress one or more complete tiles in a single MLX graph. The tile axis is retained at
+    /// index 2 so a prefill can be installed directly as bounded, immutable slabs.
+    private func compressedBatch(
+        rotatedKeys: MLXArray, rotatedValues: MLXArray
+    ) -> VarianceNormalizedKVTile {
+        let tileCount = rotatedKeys.dim(2) / tileSize
+        precondition(tileCount > 0 && rotatedKeys.dim(2).isMultiple(of: tileSize))
+
+        let keyTile = rotatedKeys.reshaped([
+            rotatedKeys.dim(0), rotatedKeys.dim(1), tileCount, tileSize, rotatedKeys.dim(3),
+        ]).transposed(0, 1, 2, 4, 3)
         let (balancedKeys, keyColumnScales, keyRowScales) = varianceNormalize(keyTile)
         let (keyWeight, keyScales, keyBiases) = quantizeBalanced(
             balancedKeys, groupSize: tileSize, bits: keyBits)
-        let fusedKeyScales = keyScales * keyRowScales
-        let fusedKeyBiases = keyBiases * keyRowScales
+        let fusedKeyScales = compactAuxiliary(keyScales * keyRowScales)
+        let fusedKeyBiases = compactAuxiliary(keyBiases * keyRowScales)
 
+        let valueTiles = rotatedValues.reshaped([
+            rotatedValues.dim(0), rotatedValues.dim(1), tileCount, tileSize,
+            rotatedValues.dim(3),
+        ])
         let valueGroupSize = validatedValueGroupSize(rotatedValues.dim(3))
-        let (balancedValues, valueColumnScales, valueRowScales) = varianceNormalize(rotatedValues)
+        let (balancedValues, valueColumnScales, valueRowScales) = varianceNormalize(valueTiles)
         let (valueWeight, valueScales, valueBiases) = quantizeBalanced(
             balancedValues, groupSize: valueGroupSize, bits: valueBits)
-        let fusedValueScales = valueScales * valueRowScales
-        let fusedValueBiases = valueBiases * valueRowScales
-
-        appendCompressedTile(
-            VarianceNormalizedKVTile(
-                keyWeight: keyWeight,
-                keyScales: fusedKeyScales,
-                keyBiases: fusedKeyBiases,
-                keyColumnScales: keyColumnScales,
-                valueWeight: valueWeight,
-                valueScales: fusedValueScales,
-                valueBiases: fusedValueBiases,
-                valueColumnScales: valueColumnScales
-            ))
-    }
-
-    private func makeTileStorage(
-        like tile: VarianceNormalizedKVTile, capacity: Int
-    ) -> VarianceNormalizedKVTile {
-        func buffer(like array: MLXArray) -> MLXArray {
-            var shape = array.shape
-            shape.insert(capacity, at: 2)
-            return MLXArray.zeros(shape, dtype: array.dtype)
-        }
+        let fusedValueScales = compactAuxiliary(valueScales * valueRowScales)
+        let fusedValueBiases = compactAuxiliary(valueBiases * valueRowScales)
 
         return VarianceNormalizedKVTile(
-            keyWeight: buffer(like: tile.keyWeight),
-            keyScales: buffer(like: tile.keyScales),
-            keyBiases: buffer(like: tile.keyBiases),
-            keyColumnScales: buffer(like: tile.keyColumnScales),
-            valueWeight: buffer(like: tile.valueWeight),
-            valueScales: buffer(like: tile.valueScales),
-            valueBiases: buffer(like: tile.valueBiases),
-            valueColumnScales: buffer(like: tile.valueColumnScales)
+            keyWeight: keyWeight,
+            keyScales: fusedKeyScales,
+            keyBiases: fusedKeyBiases,
+            keyColumnScales: compactAuxiliary(keyColumnScales),
+            valueWeight: valueWeight,
+            valueScales: fusedValueScales,
+            valueBiases: fusedValueBiases,
+            valueColumnScales: compactAuxiliary(valueColumnScales)
         )
     }
 
-    private func store(
-        _ tile: VarianceNormalizedKVTile, at index: Int,
-        in storage: inout VarianceNormalizedKVTile
-    ) {
-        storage.keyWeight[0..., 0..., index, 0..., 0...] = tile.keyWeight
-        storage.keyScales[0..., 0..., index, 0..., 0...] = tile.keyScales
-        storage.keyBiases[0..., 0..., index, 0..., 0...] = tile.keyBiases
-        storage.keyColumnScales[0..., 0..., index, 0..., 0...] = tile.keyColumnScales
-        storage.valueWeight[0..., 0..., index, 0..., 0...] = tile.valueWeight
-        storage.valueScales[0..., 0..., index, 0..., 0...] = tile.valueScales
-        storage.valueBiases[0..., 0..., index, 0..., 0...] = tile.valueBiases
-        storage.valueColumnScales[0..., 0..., index, 0..., 0...] = tile.valueColumnScales
+    private func tileView(
+        _ records: VarianceNormalizedKVTile, index: Int
+    ) -> VarianceNormalizedKVTile {
+        return VarianceNormalizedKVTile(
+            keyWeight: records.keyWeight[0..., 0..., index, 0..., 0...],
+            keyScales: records.keyScales[0..., 0..., index, 0..., 0...],
+            keyBiases: records.keyBiases[0..., 0..., index, 0..., 0...],
+            keyColumnScales: records.keyColumnScales[0..., 0..., index, 0..., 0...],
+            valueWeight: records.valueWeight[0..., 0..., index, 0..., 0...],
+            valueScales: records.valueScales[0..., 0..., index, 0..., 0...],
+            valueBiases: records.valueBiases[0..., 0..., index, 0..., 0...],
+            valueColumnScales: records.valueColumnScales[0..., 0..., index, 0..., 0...]
+        )
     }
 
     private func evaluate(_ tile: VarianceNormalizedKVTile) {
@@ -313,139 +323,162 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         ])
     }
 
-    private func activeView(
-        of storage: VarianceNormalizedKVTile, count: Int
-    ) -> VarianceNormalizedKVTile {
-        VarianceNormalizedKVTile(
-            keyWeight: storage.keyWeight[0..., 0..., ..<count, 0..., 0...],
-            keyScales: storage.keyScales[0..., 0..., ..<count, 0..., 0...],
-            keyBiases: storage.keyBiases[0..., 0..., ..<count, 0..., 0...],
-            keyColumnScales: storage.keyColumnScales[0..., 0..., ..<count, 0..., 0...],
-            valueWeight: storage.valueWeight[0..., 0..., ..<count, 0..., 0...],
-            valueScales: storage.valueScales[0..., 0..., ..<count, 0..., 0...],
-            valueBiases: storage.valueBiases[0..., 0..., ..<count, 0..., 0...],
-            valueColumnScales: storage.valueColumnScales[0..., 0..., ..<count, 0..., 0...]
+    private func byteCount(_ tile: VarianceNormalizedKVTile) -> Int {
+        tile.keyWeight.nbytes + tile.keyScales.nbytes + tile.keyBiases.nbytes
+            + tile.keyColumnScales.nbytes + tile.valueWeight.nbytes
+            + tile.valueScales.nbytes + tile.valueBiases.nbytes
+            + tile.valueColumnScales.nbytes
+    }
+
+    /// Physical compact-record bytes retained by this cache, excluding the raw tail. Slabs have
+    /// no spare capacity, and pending views share an exactly-sized backing batch.
+    var compactStorageByteCount: Int {
+        tileSlabs.reduce(0) { $0 + byteCount($1.records) }
+            + pendingTiles.reduce(0) { $0 + byteCount($1) }
+    }
+
+    var attentionPartitionCount: Int {
+        tileSlabs.count + pendingTiles.count
+    }
+
+    private func stackedRecords(_ tiles: [VarianceNormalizedKVTile]) -> VarianceNormalizedKVTile {
+        precondition(!tiles.isEmpty)
+        return VarianceNormalizedKVTile(
+            keyWeight: stacked(tiles.map(\.keyWeight), axis: 2),
+            keyScales: stacked(tiles.map(\.keyScales), axis: 2),
+            keyBiases: stacked(tiles.map(\.keyBiases), axis: 2),
+            keyColumnScales: stacked(tiles.map(\.keyColumnScales), axis: 2),
+            valueWeight: stacked(tiles.map(\.valueWeight), axis: 2),
+            valueScales: stacked(tiles.map(\.valueScales), axis: 2),
+            valueBiases: stacked(tiles.map(\.valueBiases), axis: 2),
+            valueColumnScales: stacked(tiles.map(\.valueColumnScales), axis: 2)
         )
     }
 
-    private func install(_ storage: VarianceNormalizedKVTile, count: Int) {
-        tileStorage = storage
-        let active = activeView(of: storage, count: count)
-        stackedTiles = active
-        tiles = (0 ..< count).map { index in
-            VarianceNormalizedKVTile(
-                keyWeight: active.keyWeight[0..., 0..., index, 0..., 0...],
-                keyScales: active.keyScales[0..., 0..., index, 0..., 0...],
-                keyBiases: active.keyBiases[0..., 0..., index, 0..., 0...],
-                keyColumnScales: active.keyColumnScales[0..., 0..., index, 0..., 0...],
-                valueWeight: active.valueWeight[0..., 0..., index, 0..., 0...],
-                valueScales: active.valueScales[0..., 0..., index, 0..., 0...],
-                valueBiases: active.valueBiases[0..., 0..., index, 0..., 0...],
-                valueColumnScales: active.valueColumnScales[0..., 0..., index, 0..., 0...]
+    private var completedTileCount: Int {
+        tileSlabs.reduce(pendingTiles.count) { $0 + $1.count }
+    }
+
+    private func appendSlab(_ records: VarianceNormalizedKVTile, count: Int) {
+        tileSlabs.append(VarianceNormalizedKVSlab(records: records, count: count))
+
+        // Immutable tiered compaction: eight equal adjacent slabs become one larger slab. Each
+        // record is copied only at exponentially spaced boundaries (32, 256, 2,048 tiles...),
+        // while attention sees at most seven slabs per level instead of one dispatch per page.
+        while tileSlabs.count >= Self.slabFanout {
+            let suffix = Array(tileSlabs.suffix(Self.slabFanout))
+            guard let first = suffix.first, suffix.allSatisfy({ $0.count == first.count }) else {
+                break
+            }
+            let records = suffix.map(\.records)
+            let merged = VarianceNormalizedKVTile(
+                keyWeight: contiguous(concatenated(records.map(\.keyWeight), axis: 2)),
+                keyScales: contiguous(concatenated(records.map(\.keyScales), axis: 2)),
+                keyBiases: contiguous(concatenated(records.map(\.keyBiases), axis: 2)),
+                keyColumnScales: contiguous(
+                    concatenated(records.map(\.keyColumnScales), axis: 2)),
+                valueWeight: contiguous(concatenated(records.map(\.valueWeight), axis: 2)),
+                valueScales: contiguous(concatenated(records.map(\.valueScales), axis: 2)),
+                valueBiases: contiguous(concatenated(records.map(\.valueBiases), axis: 2)),
+                valueColumnScales: contiguous(
+                    concatenated(records.map(\.valueColumnScales), axis: 2))
             )
+            evaluate(merged)
+            tileSlabs.removeLast(Self.slabFanout)
+            tileSlabs.append(
+                VarianceNormalizedKVSlab(
+                    records: merged, count: first.count * Self.slabFanout))
         }
     }
 
-    /// Keep one evaluated batch-shaped view of completed tiles. Capacity doubles as needed, so
-    /// appending tiles has amortized linear copy cost while attention avoids per-token stacking.
-    private func appendCompressedTile(_ tile: VarianceNormalizedKVTile) {
-        let previousCount = tiles.count
-        let newCount = previousCount + 1
-        guard newCount > 1 else {
-            tiles.append(tile)
-            return
+    private func appendCompressedBatch(_ records: VarianceNormalizedKVTile, count: Int) {
+        precondition(count > 0 && records.keyWeight.dim(2) == count)
+        var index = 0
+
+        while !pendingTiles.isEmpty && index < count {
+            pendingTiles.append(tileView(records, index: index))
+            index += 1
+            if pendingTiles.count == Self.slabTileCount {
+                let slabRecords = stackedRecords(pendingTiles)
+                evaluate(slabRecords)
+                appendSlab(slabRecords, count: Self.slabTileCount)
+                pendingTiles.removeAll(keepingCapacity: true)
+            }
         }
 
-        var storage: VarianceNormalizedKVTile
-        if let existing = tileStorage, existing.keyWeight.dim(2) >= newCount {
-            storage = existing
-        } else {
-            var capacity = 2
-            while capacity < newCount {
-                capacity *= 2
-            }
-            storage = makeTileStorage(like: tile, capacity: capacity)
-            if let stackedTiles {
-                storage.keyWeight[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.keyWeight
-                storage.keyScales[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.keyScales
-                storage.keyBiases[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.keyBiases
-                storage.keyColumnScales[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.keyColumnScales
-                storage.valueWeight[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.valueWeight
-                storage.valueScales[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.valueScales
-                storage.valueBiases[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.valueBiases
-                storage.valueColumnScales[0..., 0..., ..<previousCount, 0..., 0...] =
-                    stackedTiles.valueColumnScales
-            } else {
-                store(tiles[0], at: 0, in: &storage)
-            }
+        while index + Self.slabTileCount <= count {
+            let end = index + Self.slabTileCount
+            let slabRecords = contiguousRecords(records, range: index ..< end)
+            evaluate(slabRecords)
+            appendSlab(slabRecords, count: Self.slabTileCount)
+            index = end
         }
-        store(tile, at: previousCount, in: &storage)
-        evaluate(storage)
-        install(storage, count: newCount)
+
+        if index < count {
+            let pendingRecords = contiguousRecords(records, range: index ..< count)
+            evaluate(pendingRecords)
+            pendingTiles.append(
+                contentsOf: (0 ..< count - index).map {
+                    tileView(pendingRecords, index: $0)
+                })
+        }
     }
 
-    private func rebuildStackedTiles() {
-        guard !tiles.isEmpty else {
-            tileStorage = nil
-            stackedTiles = nil
-            return
-        }
-        guard tiles.count > 1 else {
-            if tileStorage != nil {
-                let tile = tiles[0]
-                let detached = VarianceNormalizedKVTile(
-                    keyWeight: contiguous(tile.keyWeight),
-                    keyScales: contiguous(tile.keyScales),
-                    keyBiases: contiguous(tile.keyBiases),
-                    keyColumnScales: contiguous(tile.keyColumnScales),
-                    valueWeight: contiguous(tile.valueWeight),
-                    valueScales: contiguous(tile.valueScales),
-                    valueBiases: contiguous(tile.valueBiases),
-                    valueColumnScales: contiguous(tile.valueColumnScales)
-                )
-                evaluate(detached)
-                tiles = [detached]
-            }
-            tileStorage = nil
-            stackedTiles = nil
-            return
-        }
+    private func contiguousRecords(
+        _ records: VarianceNormalizedKVTile, range: Range<Int>
+    ) -> VarianceNormalizedKVTile {
+        VarianceNormalizedKVTile(
+            keyWeight: contiguous(records.keyWeight[0..., 0..., range, 0..., 0...]),
+            keyScales: contiguous(records.keyScales[0..., 0..., range, 0..., 0...]),
+            keyBiases: contiguous(records.keyBiases[0..., 0..., range, 0..., 0...]),
+            keyColumnScales: contiguous(
+                records.keyColumnScales[0..., 0..., range, 0..., 0...]),
+            valueWeight: contiguous(records.valueWeight[0..., 0..., range, 0..., 0...]),
+            valueScales: contiguous(records.valueScales[0..., 0..., range, 0..., 0...]),
+            valueBiases: contiguous(records.valueBiases[0..., 0..., range, 0..., 0...]),
+            valueColumnScales: contiguous(
+                records.valueColumnScales[0..., 0..., range, 0..., 0...])
+        )
+    }
 
-        let restoredTiles = tiles
-        var capacity = 2
-        while capacity < restoredTiles.count {
-            capacity *= 2
+    private func allTiles() -> [VarianceNormalizedKVTile] {
+        tileSlabs.flatMap { slab in
+            (0 ..< slab.count).map { tileView(slab.records, index: $0) }
+        } + pendingTiles
+    }
+
+    private func installTiles(_ tiles: [VarianceNormalizedKVTile]) {
+        tileSlabs.removeAll(keepingCapacity: true)
+        pendingTiles.removeAll(keepingCapacity: true)
+        var index = 0
+        while index + Self.slabTileCount <= tiles.count {
+            let records = stackedRecords(Array(tiles[index ..< index + Self.slabTileCount]))
+            evaluate(records)
+            appendSlab(records, count: Self.slabTileCount)
+            index += Self.slabTileCount
         }
-        var storage = makeTileStorage(like: restoredTiles[0], capacity: capacity)
-        for (index, tile) in restoredTiles.enumerated() {
-            store(tile, at: index, in: &storage)
-        }
-        evaluate(storage)
-        install(storage, count: restoredTiles.count)
+        pendingTiles.append(contentsOf: tiles[index...])
     }
 
     private func reconstructedRotated(
         _ tile: VarianceNormalizedKVTile
     ) -> (MLXArray, MLXArray) {
         let scaledKeys = dequantized(
-            tile.keyWeight, scales: tile.keyScales, biases: tile.keyBiases,
+            tile.keyWeight,
+            scales: tile.keyScales.asType(.float32),
+            biases: tile.keyBiases.asType(.float32),
             groupSize: tileSize, bits: keyBits, mode: .affine)
-        let rotatedKeys = (scaledKeys * tile.keyColumnScales)
+        let rotatedKeys = (scaledKeys * tile.keyColumnScales.asType(.float32))
             .transposed(0, 1, 3, 2)
 
         let valueHeadDim = tile.valueColumnScales.dim(-1)
         let valueGroupSize = validatedValueGroupSize(valueHeadDim)
         let scaledValues = dequantized(
-            tile.valueWeight, scales: tile.valueScales, biases: tile.valueBiases,
+            tile.valueWeight,
+            scales: tile.valueScales.asType(.float32),
+            biases: tile.valueBiases.asType(.float32),
             groupSize: valueGroupSize, bits: valueBits, mode: .affine)
-        let rotatedValues = scaledValues * tile.valueColumnScales
+        let rotatedValues = scaledValues * tile.valueColumnScales.asType(.float32)
 
         return (
             rotatedKeys.asType(keyDType ?? .float32),
@@ -460,7 +493,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
     private func reconstructedParts() -> [(keys: MLXArray, values: MLXArray)] {
         var parts: [(keys: MLXArray, values: MLXArray)] = []
-        for tile in tiles {
+        for tile in allTiles() {
             let (keys, values) = reconstructed(tile)
             parts.append((keys, values))
         }
@@ -576,22 +609,20 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
     private func stackedTileScores(
         rotatedQueries: MLXArray,
+        records: VarianceNormalizedKVTile,
+        tileCount: Int,
         scale: Float
     ) -> MLXArray {
-        let tileCount = tiles.count
         let (batchSize, queryHeadCount, queryLength, headDim) = (
             rotatedQueries.dim(0), rotatedQueries.dim(1), rotatedQueries.dim(2),
             rotatedQueries.dim(3)
         )
-        let kvHeadCount = tiles[0].keyWeight.dim(1)
+        let kvHeadCount = records.keyWeight.dim(1)
         let repeats = queryHeadCount / kvHeadCount
-        guard let stackedTiles else {
-            preconditionFailure("Stacked tile scores require at least two completed tiles")
-        }
-        let keyWeights = stackedTiles.keyWeight
-        let keyScales = stackedTiles.keyScales
-        let keyBiases = stackedTiles.keyBiases
-        let keyColumnScales = stackedTiles.keyColumnScales
+        let keyWeights = records.keyWeight
+        let keyScales = records.keyScales
+        let keyBiases = records.keyBiases
+        let keyColumnScales = records.keyColumnScales
 
         if repeats > 1 {
             let groupedQueries = rotatedQueries.reshaped([
@@ -633,23 +664,21 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
 
     private func stackedTileValues(
         weights: MLXArray,
+        records: VarianceNormalizedKVTile,
+        tileCount: Int,
         queryHeadCount: Int
     ) -> MLXArray {
-        let tileCount = tiles.count
         let (batchSize, _, queryLength, _) = (
             weights.dim(0), weights.dim(1), weights.dim(2), weights.dim(3)
         )
-        let kvHeadCount = tiles[0].valueWeight.dim(1)
+        let kvHeadCount = records.valueWeight.dim(1)
         let repeats = queryHeadCount / kvHeadCount
-        let valueHeadDim = tiles[0].valueColumnScales.dim(-1)
+        let valueHeadDim = records.valueColumnScales.dim(-1)
         let groupSize = validatedValueGroupSize(valueHeadDim)
-        guard let stackedTiles else {
-            preconditionFailure("Stacked tile values require at least two completed tiles")
-        }
-        let valueWeights = stackedTiles.valueWeight
-        let valueScales = stackedTiles.valueScales
-        let valueBiases = stackedTiles.valueBiases
-        let valueColumnScales = stackedTiles.valueColumnScales
+        let valueWeights = records.valueWeight
+        let valueScales = records.valueScales
+        let valueBiases = records.valueBiases
+        let valueColumnScales = records.valueColumnScales
 
         if repeats > 1 {
             let groupedWeights =
@@ -697,42 +726,48 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         mask: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
         let rotatedQueries = rotate(queries)
-        var scoreParts =
-            if tiles.count > 1 {
-                [stackedTileScores(rotatedQueries: rotatedQueries, scale: scale)]
-            } else {
-                tiles.map { tile in
-                    quantizedTileScores(rotatedQueries: rotatedQueries, tile: tile, scale: scale)
-                }
-            }
+        var scoreParts = tileSlabs.map { slab in
+            stackedTileScores(
+                rotatedQueries: rotatedQueries,
+                records: slab.records,
+                tileCount: slab.count,
+                scale: scale)
+        }
+        scoreParts.append(
+            contentsOf: pendingTiles.map { tile in
+                quantizedTileScores(rotatedQueries: rotatedQueries, tile: tile, scale: scale)
+            })
         if let tailKeys {
             scoreParts.append(
                 attentionScores(queries: rotatedQueries, keys: tailKeys, scale: scale))
         }
 
         let scores = applyAttentionMask(scores: concatenated(scoreParts, axis: -1), mask: mask)
-        let weights = softmax(scores, axis: -1)
+        // `precise` makes MLX compute the normalization in FP32 for half/bfloat inputs. This is
+        // particularly important once the score vector spans many compressed slabs.
+        let weights = softmax(scores, axis: -1, precise: true)
 
         var start = 0
         var rotatedOutputParts: [MLXArray] = []
-        if tiles.count > 1 {
-            let end = tiles.count * tileSize
+        for slab in tileSlabs {
+            let end = start + slab.count * tileSize
             rotatedOutputParts.append(
                 stackedTileValues(
                     weights: weights[.ellipsis, start ..< end],
+                    records: slab.records,
+                    tileCount: slab.count,
                     queryHeadCount: queries.dim(1)))
             start = end
-        } else {
-            for tile in tiles {
-                let end = start + tileSize
-                let tileWeights = weights[.ellipsis, start ..< end]
-                rotatedOutputParts.append(
-                    quantizedTileValues(
-                        weights: tileWeights,
-                        tile: tile,
-                        queryHeadCount: queries.dim(1)))
-                start = end
-            }
+        }
+        for tile in pendingTiles {
+            let end = start + tileSize
+            let tileWeights = weights[.ellipsis, start ..< end]
+            rotatedOutputParts.append(
+                quantizedTileValues(
+                    weights: tileWeights,
+                    tile: tile,
+                    queryHeadCount: queries.dim(1)))
+            start = end
         }
 
         if let tailValues {
@@ -755,18 +790,23 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         guard var keys = tailKeys, var values = tailValues else { return }
 
         while keys.dim(2) >= tileSize {
-            compress(
-                rotatedKeys: keys[.ellipsis, ..<tileSize, 0...],
-                rotatedValues: values[.ellipsis, ..<tileSize, 0...])
+            // Thirty-two tiles amortize both prefill and decode dispatch while bounding each
+            // FP32 normalization batch to 4,096 tokens at the default tile size.
+            let tileCount = min(Self.slabTileCount, keys.dim(2) / tileSize)
+            let length = tileCount * tileSize
+            let records = compressedBatch(
+                rotatedKeys: keys[.ellipsis, ..<length, 0...],
+                rotatedValues: values[.ellipsis, ..<length, 0...])
+            appendCompressedBatch(records, count: tileCount)
 
-            if keys.dim(2) == tileSize {
+            if keys.dim(2) == length {
                 tailKeys = nil
                 tailValues = nil
                 return
             }
 
-            keys = keys[.ellipsis, tileSize..., 0...]
-            values = values[.ellipsis, tileSize..., 0...]
+            keys = keys[.ellipsis, length..., 0...]
+            values = values[.ellipsis, length..., 0...]
         }
 
         tailKeys = keys
@@ -774,6 +814,10 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     }
 
     private func append(keys: MLXArray, values: MLXArray) {
+        precondition(
+            isSupportedVarianceNormalizedDType(keys.dtype)
+                && isSupportedVarianceNormalizedDType(values.dtype),
+            "VarianceNormalizedKVCache supports float16, bfloat16, and float32 K/V tensors")
         if let keyDType {
             precondition(keyDType == keys.dtype, "VarianceNormalizedKVCache key dtype changed")
         } else {
@@ -827,7 +871,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     public override var state: [MLXArray] {
         get {
             var arrays: [MLXArray] = []
-            for tile in tiles {
+            for tile in allTiles() {
                 arrays.append(contentsOf: [
                     tile.keyWeight, tile.keyScales, tile.keyBiases,
                     tile.keyColumnScales,
@@ -885,8 +929,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
                 }
                 index += tileStateCount
             }
-            tiles = restored
-            rebuildStackedTiles()
+            installTiles(restored)
 
             if (restoredTailLength ?? 0) > 0 {
                 guard index + 1 < newValue.count else {
@@ -899,8 +942,6 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
             } else {
                 tailKeys = nil
                 tailValues = nil
-                keyDType = nil
-                valueDType = nil
             }
         }
     }
@@ -913,13 +954,16 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
                 String(keyBits),
                 String(valueBits),
                 String(sinkhornIterations),
-                String(tiles.count),
+                String(completedTileCount),
                 String(tailKeys?.dim(2) ?? 0),
+                String(Self.metadataVersion),
+                varianceNormalizedDTypeName(keyDType),
+                varianceNormalizedDTypeName(valueDType),
             ]
         }
         set {
-            guard newValue.count == 7 else {
-                fatalError("VarianceNormalizedKVCache metaState must have exactly 7 values")
+            guard newValue.count == 7 || newValue.count == 10 else {
+                fatalError("VarianceNormalizedKVCache metaState must have 7 or 10 values")
             }
             guard
                 let offset = Int(newValue[1]),
@@ -931,6 +975,26 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
             self.offset = offset
             self.restoredTileCount = tileCount
             self.restoredTailLength = tailLength
+            if newValue.count == 10 {
+                guard Int(newValue[7]) == Self.metadataVersion else {
+                    fatalError("Unsupported VarianceNormalizedKVCache metadata version")
+                }
+                let restoredKeyDType = varianceNormalizedDType(named: newValue[8])
+                let restoredValueDType = varianceNormalizedDType(named: newValue[9])
+                guard
+                    newValue[8] == "none"
+                        || restoredKeyDType.map(isSupportedVarianceNormalizedDType) == true,
+                    newValue[9] == "none"
+                        || restoredValueDType.map(isSupportedVarianceNormalizedDType) == true
+                else {
+                    fatalError("Invalid VarianceNormalizedKVCache dtype metadata")
+                }
+                keyDType = restoredKeyDType
+                valueDType = restoredValueDType
+            } else {
+                keyDType = nil
+                valueDType = nil
+            }
         }
     }
 
@@ -959,8 +1023,8 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         if retainedTailLength == 0 {
             tailKeys = nil
             tailValues = nil
-        } else if retainedTileCount < tiles.count {
-            let (rotatedKeys, rotatedValues) = reconstructedRotated(tiles[retainedTileCount])
+        } else if retainedTileCount < completedTileCount {
+            let (rotatedKeys, rotatedValues) = reconstructedRotated(allTiles()[retainedTileCount])
             tailKeys = rotatedKeys[.ellipsis, ..<retainedTailLength, 0...]
             tailValues = rotatedValues[.ellipsis, ..<retainedTailLength, 0...]
         } else if let tailKeys, let tailValues {
@@ -970,9 +1034,8 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
             preconditionFailure("VarianceNormalizedKVCache is missing its retained tail")
         }
 
-        if retainedTileCount < tiles.count {
-            tiles.removeSubrange(retainedTileCount...)
-            rebuildStackedTiles()
+        if retainedTileCount < completedTileCount {
+            installTiles(Array(allTiles().prefix(retainedTileCount)))
         }
         restoredTileCount = nil
         restoredTailLength = nil
@@ -993,7 +1056,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     }
 
     public var debugDescription: String {
-        "\(String(describing: Self.self)) offset: \(offset), tileSize: \(tileSize), keyBits: \(keyBits), valueBits: \(valueBits), tiles: \(tiles.count), tail: \(tailKeys?.shape.description ?? "-")"
+        "\(String(describing: Self.self)) offset: \(offset), tileSize: \(tileSize), keyBits: \(keyBits), valueBits: \(valueBits), tiles: \(completedTileCount), slabs: \(tileSlabs.count), pending: \(pendingTiles.count), tail: \(tailKeys?.shape.description ?? "-")"
     }
 }
 
@@ -1011,19 +1074,19 @@ public func resolveVarianceNormalizedScheme(
 
     switch scheme {
     case "varn", "varn4v2":
-        return (4, 2, 128, 4)
+        return (4, 2, 128, 8)
     case "varn4", "varn4v4":
-        return (4, 4, 128, 4)
+        return (4, 4, 128, 8)
     case "varn2", "varn2v2":
-        return (2, 2, 128, 4)
+        return (2, 2, 128, 8)
     case "varn4v2t32":
-        return (4, 2, 32, 4)
+        return (4, 2, 32, 8)
     case "varn4v2t64":
-        return (4, 2, 64, 4)
+        return (4, 2, 64, 8)
     case "varn4v2t128":
-        return (4, 2, 128, 4)
+        return (4, 2, 128, 8)
     case "varn4v4t32":
-        return (4, 4, 32, 4)
+        return (4, 4, 32, 8)
     default:
         return nil
     }

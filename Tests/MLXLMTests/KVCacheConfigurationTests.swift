@@ -23,6 +23,7 @@ struct KVCacheConfigurationTests {
         #expect(TurboQuantKVCacheConfiguration.qualityFirst.valuePrecision == .fourBit)
         #expect(TurboQuantKVCacheConfiguration.balanced.keyPrecision == .affineEightBit)
         #expect(TurboQuantKVCacheConfiguration.balanced.valuePrecision == .threeBit)
+        #expect(VarianceNormalizedKVCacheConfiguration.memoryFirst.sinkhornIterations == 8)
     }
 
     @Test func invalidTypedValuesAreRejectedAtConstruction() {

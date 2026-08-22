@@ -278,6 +278,59 @@ public class EvalTests: XCTestCase {
         #endif
     }
 
+    func testVarianceNormalizedKVCache32KPrefillPeakMetalMemorySmoke() throws {
+        #if os(macOS) && arch(arm64)
+        let tokenCount = 32_768
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 128, keyBits: 4, valueBits: 2, sinkhornIterations: 8)
+        let queries = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+        let keys = MLXRandom.normal([1, 4, tokenCount, 128]).asType(.float16)
+        let values = MLXRandom.normal([1, 4, tokenCount, 128]).asType(.float16)
+        eval(queries, keys, values)
+        Memory.clearCache()
+        let baselineActiveMemory = Memory.activeMemory
+        Memory.peakMemory = 0
+
+        let start = Date.timeIntervalSinceReferenceDate
+        let output = cache.updateAndAttend(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: 1 / sqrt(Float(128)))
+        eval(output)
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
+        let peakWorkspaceBytes = max(0, Memory.peakMemory - baselineActiveMemory)
+        let rawKVBytes = keys.nbytes + values.nbytes
+        let compactBytes = cache.state.reduce(0) { $0 + $1.nbytes }
+
+        let decodeQuery = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+        let decodeKey = MLXRandom.normal([1, 4, 1, 128]).asType(.float16)
+        let decodeValue = MLXRandom.normal([1, 4, 1, 128]).asType(.float16)
+        let decodeStart = Date.timeIntervalSinceReferenceDate
+        let decodeOutput = cache.updateAndAttend(
+            queries: decodeQuery,
+            keys: decodeKey,
+            values: decodeValue,
+            scale: 1 / sqrt(Float(128)))
+        eval(decodeOutput)
+        let decodeElapsed = Date.timeIntervalSinceReferenceDate - decodeStart
+
+        print(
+            "KVarN 32K prefill smoke: elapsed=\(elapsed)s, raw=\(rawKVBytes) bytes, "
+                + "compact=\(compactBytes) bytes, peak workspace=\(peakWorkspaceBytes) bytes, "
+                + "one-layer decode=\(decodeElapsed)s")
+
+        XCTAssertEqual(output.shape, [1, 8, 1, 128])
+        XCTAssertLessThan(compactBytes, rawKVBytes)
+        // A regression guard against retaining prompt-sized geometric spare capacity or an
+        // unbounded normalization graph. This is deliberately loose for different Apple GPUs.
+        XCTAssertLessThan(peakWorkspaceBytes, 768 * 1_024 * 1_024)
+        XCTAssertLessThan(decodeElapsed, 0.25)
+        #else
+        throw XCTSkip("Metal memory instrumentation requires arm64 macOS.")
+        #endif
+    }
+
     func testLlamaLora() throws {
         let config = LlamaConfiguration(
             hiddenSize: 64, hiddenLayers: 16, intermediateSize: 512, attentionHeads: 32,

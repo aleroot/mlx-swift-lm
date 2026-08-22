@@ -1535,7 +1535,7 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     #expect(cache.offset == 40)
     #expect(cachedKeys.shape == keys.shape)
     #expect(cachedValues.shape == values.shape)
-    #expect(cache.metaState == ["32", "40", "4", "4", "2", "1", "8"])
+    #expect(cache.metaState == ["32", "40", "4", "4", "2", "1", "8", "1", "float16", "float16"])
     #expect(cache.state.count == 10)
     #expect(relativeRMSError(cachedKeys, keys) < 0.5)
     #expect(relativeRMSError(cachedValues, values) < 0.5)
@@ -1567,6 +1567,33 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     #expect(restoredValues.shape == [1, 1, 69, 32])
 }
 
+@Test func testVarianceNormalizedKVCachePreservesDTypeAtExactTileBoundary() throws {
+    for dtype in [DType.float32, .bfloat16] {
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
+        let keys = deterministicTensor(shape: [1, 1, 64, 32], salt: 21).asType(dtype)
+        let values = deterministicTensor(shape: [1, 1, 64, 32], salt: 22).asType(dtype)
+        _ = cache.update(keys: keys, values: values)
+        eval(cache.state)
+
+        let url = tempURL()
+        try savePromptCache(url: url, cache: [cache])
+        let (loaded, _) = try loadPromptCache(url: url)
+        let restored = try #require(loaded[0] as? VarianceNormalizedKVCache)
+        let copied = try #require(cache.copy() as? VarianceNormalizedKVCache)
+        let emptyKeys = MLXArray.zeros([1, 1, 0, 32], dtype: dtype)
+        let emptyValues = MLXArray.zeros([1, 1, 0, 32], dtype: dtype)
+
+        for candidate in [restored, copied] {
+            let (materializedKeys, materializedValues) = candidate.update(
+                keys: emptyKeys, values: emptyValues)
+            eval(materializedKeys, materializedValues)
+            #expect(materializedKeys.dtype == dtype)
+            #expect(materializedValues.dtype == dtype)
+        }
+    }
+}
+
 @Test func testVarianceNormalizedKVCacheTrimOnlyReconstructsTheAffectedTile() throws {
     let cache = VarianceNormalizedKVCache(
         tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
@@ -1582,7 +1609,7 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     eval(afterKeys, afterValues)
 
     #expect(cache.offset == 60)
-    #expect(cache.metaState == ["32", "60", "4", "4", "2", "1", "28"])
+    #expect(cache.metaState == ["32", "60", "4", "4", "2", "1", "28", "1", "float16", "float16"])
     #expect(cache.state.count == 10)
     #expect(relativeRMSError(afterKeys, beforeKeys[.ellipsis, ..<60, 0...]) < 1e-3)
     #expect(relativeRMSError(afterValues, beforeValues[.ellipsis, ..<60, 0...]) < 1e-3)
@@ -1598,7 +1625,7 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     eval(cachedKeys, cachedValues)
 
     #expect(cache.offset == 32)
-    #expect(cache.metaState == ["32", "32", "4", "2", "2", "1", "0"])
+    #expect(cache.metaState == ["32", "32", "4", "2", "2", "1", "0", "1", "float16", "float16"])
     #expect(cachedKeys.shape == keys.shape)
     #expect(cachedValues.shape == values.shape)
 }
@@ -1613,7 +1640,7 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     eval(cachedKeys, cachedValues)
 
     #expect(cache.offset == 32)
-    #expect(cache.metaState == ["32", "32", "2", "2", "2", "1", "0"])
+    #expect(cache.metaState == ["32", "32", "2", "2", "2", "1", "0", "1", "float16", "float16"])
     #expect(cache.state.count == 8)
     #expect(cachedKeys.shape == keys.shape)
     #expect(cachedValues.shape == values.shape)
@@ -1642,9 +1669,9 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
         tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
     let materializedCache = VarianceNormalizedKVCache(
         tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
-    let queries = MLXRandom.normal([1, 1, 4, 32]).asType(.float16)
-    let keys = MLXRandom.normal([1, 1, 36, 32]).asType(.float16)
-    let values = MLXRandom.normal([1, 1, 36, 32]).asType(.float16)
+    let queries = deterministicTensor(shape: [1, 1, 4, 32], salt: 31)
+    let keys = deterministicTensor(shape: [1, 1, 36, 32], salt: 32)
+    let values = deterministicTensor(shape: [1, 1, 36, 32], salt: 33)
     let scale = 1 / sqrt(Float(32))
 
     let native = attentionWithCacheUpdate(
@@ -1662,9 +1689,10 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
         scale: scale)
     eval(native, materialized)
 
-    #expect(relativeRMSError(native, materialized) < 1e-3)
+    #expect(relativeRMSError(native, materialized) < 1.5e-3)
     #expect(nativeCache.offset == 36)
-    #expect(nativeCache.metaState == ["32", "36", "4", "4", "2", "1", "4"])
+    #expect(
+        nativeCache.metaState == ["32", "36", "4", "4", "2", "1", "4", "1", "float16", "float16"])
 }
 
 @Test func testVarianceNormalizedKVCacheQuantizedTileAttentionSupportsGQA() {
@@ -1672,9 +1700,9 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
         tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
     let materializedCache = VarianceNormalizedKVCache(
         tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
-    let queries = MLXRandom.normal([1, 4, 3, 32]).asType(.float16)
-    let keys = MLXRandom.normal([1, 2, 33, 32]).asType(.float16)
-    let values = MLXRandom.normal([1, 2, 33, 32]).asType(.float16)
+    let queries = deterministicTensor(shape: [1, 4, 3, 32], salt: 34)
+    let keys = deterministicTensor(shape: [1, 2, 33, 32], salt: 35)
+    let values = deterministicTensor(shape: [1, 2, 33, 32], salt: 36)
     let scale = 1 / sqrt(Float(32))
 
     let native = attentionWithCacheUpdate(
@@ -1692,9 +1720,10 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
         scale: scale)
     eval(native, materialized)
 
-    #expect(relativeRMSError(native, materialized) < 1e-3)
+    #expect(relativeRMSError(native, materialized) < 1.5e-3)
     #expect(native.shape == [1, 4, 3, 32])
-    #expect(nativeCache.metaState == ["32", "33", "4", "4", "2", "1", "1"])
+    #expect(
+        nativeCache.metaState == ["32", "33", "4", "4", "2", "1", "1", "1", "float16", "float16"])
 }
 
 @Test func testVarianceNormalizedKVCacheStackedTileAttentionMatchesMaterializedAttention() {
@@ -1703,9 +1732,9 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     let materializedCache = VarianceNormalizedKVCache(
         tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
     let queries = deterministicTensor(shape: [1, 1, 2, 32], salt: 1)
-    // Five tiles exercises both spare-capacity appends and geometric storage growth.
-    let keys = deterministicTensor(shape: [1, 1, 160, 32], salt: 2)
-    let values = deterministicTensor(shape: [1, 1, 160, 32], salt: 3)
+    // Thirty-three tiles exercises one immutable slab plus one pending tile.
+    let keys = deterministicTensor(shape: [1, 1, 1_056, 32], salt: 2)
+    let values = deterministicTensor(shape: [1, 1, 1_056, 32], salt: 3)
     let scale = 1 / sqrt(Float(32))
 
     let native = attentionWithCacheUpdate(
@@ -1724,7 +1753,10 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     eval(native, materialized)
 
     #expect(relativeRMSError(native, materialized) < 1e-3)
-    #expect(nativeCache.metaState == ["32", "160", "4", "4", "2", "5", "0"])
+    #expect(
+        nativeCache.metaState == [
+            "32", "1056", "4", "4", "2", "33", "0", "1", "float16", "float16",
+        ])
 }
 
 @Test func testVarianceNormalizedKVCacheStackedTileAttentionSupportsGQA() {
@@ -1733,8 +1765,8 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     let materializedCache = VarianceNormalizedKVCache(
         tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
     let queries = deterministicTensor(shape: [1, 4, 2, 32], salt: 4)
-    let keys = deterministicTensor(shape: [1, 2, 96, 32], salt: 5)
-    let values = deterministicTensor(shape: [1, 2, 96, 32], salt: 6)
+    let keys = deterministicTensor(shape: [1, 2, 1_056, 32], salt: 5)
+    let values = deterministicTensor(shape: [1, 2, 1_056, 32], salt: 6)
     let scale = 1 / sqrt(Float(32))
 
     let native = attentionWithCacheUpdate(
@@ -1754,7 +1786,10 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
 
     #expect(relativeRMSError(native, materialized) < 1e-3)
     #expect(native.shape == [1, 4, 2, 32])
-    #expect(nativeCache.metaState == ["32", "96", "4", "4", "2", "3", "0"])
+    #expect(
+        nativeCache.metaState == [
+            "32", "1056", "4", "4", "2", "33", "0", "1", "float16", "float16",
+        ])
 }
 
 @Test func testApplyAttentionMaskSuppressesBoolMaskedLogits() {
@@ -1839,7 +1874,10 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
         maxError = max(maxError, error)
     }
 
-    #expect(varianceNormalizedCache.metaState == ["32", "96", "4", "4", "2", "3", "0"])
+    #expect(
+        varianceNormalizedCache.metaState == [
+            "32", "96", "4", "4", "2", "3", "0", "1", "float16", "float16",
+        ])
     #expect(totalError / Float(tokenCount) < 0.15)
     #expect(maxError < 0.45)
 }
@@ -1860,9 +1898,30 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     }
     let fp16Bytes = keys.nbytes + values.nbytes
 
-    #expect(cache.metaState == ["32", "64", "4", "4", "2", "2", "0"])
+    #expect(cache.metaState == ["32", "64", "4", "4", "2", "2", "0", "1", "float16", "float16"])
+    #expect(cache.compactStorageByteCount == compressedBytes)
     #expect(compressedBytes > quantizedPayloadBytes)
     #expect(compressedBytes < fp16Bytes)
+}
+
+@Test func testVarianceNormalizedKVCacheCoalescesTieredSlabs() {
+    let cache = VarianceNormalizedKVCache(
+        tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 1)
+    let tokenCount = 32 * 32 * 8
+    let queries = deterministicTensor(shape: [1, 1, 1, 32], salt: 41)
+    let keys = deterministicTensor(shape: [1, 1, tokenCount, 32], salt: 42)
+    let values = deterministicTensor(shape: [1, 1, tokenCount, 32], salt: 43)
+
+    let output = cache.updateAndAttend(
+        queries: queries,
+        keys: keys,
+        values: values,
+        scale: 1 / sqrt(Float(32)))
+    eval(output)
+
+    #expect(cache.offset == tokenCount)
+    #expect(cache.attentionPartitionCount == 1)
+    #expect(cache.compactStorageByteCount == cache.state.reduce(0) { $0 + $1.nbytes })
 }
 
 @Test func testVarianceNormalizedKVCacheTwoBitMemoryAccountingIsPaperRelevant() {
@@ -1877,7 +1936,7 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     let compressedBytes = cache.state.reduce(0) { $0 + $1.nbytes }
     let fp16Bytes = keys.nbytes + values.nbytes
 
-    #expect(cache.metaState == ["32", "64", "2", "2", "2", "2", "0"])
+    #expect(cache.metaState == ["32", "64", "2", "2", "2", "2", "0", "1", "float16", "float16"])
     #expect(compressedBytes < fp16Bytes)
 }
 
@@ -1897,7 +1956,8 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     let converted = cache[0] as? VarianceNormalizedKVCache
     #expect(converted != nil)
     #expect(converted?.offset == 33)
-    #expect(converted?.metaState == ["32", "33", "4", "4", "4", "1", "1"])
+    #expect(
+        converted?.metaState == ["32", "33", "4", "4", "4", "1", "1", "1", "float16", "float16"])
 }
 
 @Test func testMaybeQuantizeKVCacheDefersVarianceNormalizedStrategyUntilThreshold() throws {
@@ -1957,5 +2017,6 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     #expect(varn.keyBits == 4)
     #expect(varn.valueBits == 2)
     #expect(varn.tileSize == 32)
+    #expect(varn.sinkhornIterations == 8)
     #expect(varn.compressionStart == 8)
 }

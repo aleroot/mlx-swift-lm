@@ -268,6 +268,10 @@ public struct TurboQuantKVCacheConfiguration: Sendable, Hashable {
 /// asymmetrically (keys and values may use different bit widths). The intended
 /// use case is memory-constrained long-context decoding rather than latency-
 /// sensitive generation.
+///
+/// - Warning: This strategy is experimental. Models must route attention through
+///   `attentionWithCacheUpdate`; direct `KVCache.update` call sites use a full-cache
+///   materialization fallback that is not suitable for long-context decode.
 public struct VarianceNormalizedKVCacheConfiguration: Sendable, Hashable {
     private static let supportedBitWidths: Set<Int> = [2, 3, 4, 5, 6, 8]
     private static let supportedTileSizes: Set<Int> = [32, 64, 128]
@@ -282,7 +286,7 @@ public struct VarianceNormalizedKVCacheConfiguration: Sendable, Hashable {
         keyBits: Int = 4,
         valueBits: Int = 2,
         tileSize: Int = 128,
-        sinkhornIterations: Int = 4,
+        sinkhornIterations: Int = 8,
         compressionStart: Int = 0
     ) throws {
         guard Self.supportedBitWidths.contains(keyBits) else {
@@ -323,12 +327,12 @@ public struct VarianceNormalizedKVCacheConfiguration: Sendable, Hashable {
 
     /// 4-bit keys and 2-bit values with 128-token tiles; the paper-inspired default.
     public static let memoryFirst = VarianceNormalizedKVCacheConfiguration(
-        uncheckedKeyBits: 4, valueBits: 2, tileSize: 128, sinkhornIterations: 4,
+        uncheckedKeyBits: 4, valueBits: 2, tileSize: 128, sinkhornIterations: 8,
         compressionStart: 0)
 
     /// 4-bit keys and values for higher fidelity at still-reduced memory.
     public static let balanced = VarianceNormalizedKVCacheConfiguration(
-        uncheckedKeyBits: 4, valueBits: 4, tileSize: 128, sinkhornIterations: 4,
+        uncheckedKeyBits: 4, valueBits: 4, tileSize: 128, sinkhornIterations: 8,
         compressionStart: 0)
 }
 

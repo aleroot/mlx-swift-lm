@@ -2102,13 +2102,13 @@ private func restoreCacheFromMetaState(
         return cache
 
     case "VarianceNormalizedKVCache":
-        guard metaState.count == 7 else {
+        guard metaState.count == 7 || metaState.count == 10 else {
             throw KVCacheError(
                 message:
-                    "Corrupt prompt cache: VarianceNormalizedKVCache metadata must contain 7 integers."
+                    "Corrupt prompt cache: VarianceNormalizedKVCache metadata must contain 7 legacy or 10 versioned values."
             )
         }
-        let values = try promptCacheIntegers(metaState, className: className)
+        let values = try promptCacheIntegers(Array(metaState.prefix(7)), className: className)
         let tileSize = values[0]
         let offset = values[1]
         let keyBits = values[2]
@@ -2124,7 +2124,15 @@ private func restoreCacheFromMetaState(
                 sinkhornIterations: sinkhornIterations)) != nil,
             offset >= 0,
             tileCount >= 0,
-            (0 ..< tileSize).contains(tailLength)
+            (0 ..< tileSize).contains(tailLength),
+            metaState.count == 7
+                || (Int(metaState[7]) == VarianceNormalizedKVCache.metadataVersion
+                    && (metaState[8] == "none"
+                        || varianceNormalizedDType(named: metaState[8])
+                            .map(isSupportedVarianceNormalizedDType) == true)
+                    && (metaState[9] == "none"
+                        || varianceNormalizedDType(named: metaState[9])
+                            .map(isSupportedVarianceNormalizedDType) == true))
         else {
             throw KVCacheError(
                 message: "Corrupt prompt cache: invalid VarianceNormalizedKVCache metadata."
