@@ -1282,7 +1282,8 @@ public final class ChatSession {
                                 input: input,
                                 model: diffusionModel,
                                 cacheStorage: kvCache,
-                                parameters: generateParameters)
+                                parameters: generateParameters,
+                                components: components)
 
                             generation = GenerationRun(
                                 MLXLMCommon.generateTaskRecordingTokens(
