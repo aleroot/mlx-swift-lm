@@ -115,6 +115,7 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
     static let tailStateCount = 2
     static let metadataVersion = 1
     static let compressionBatchTileCount = 32
+    static let compressionBatchHeadCount = 4
     static let baseSlabTileCount = 4
     static let slabFanout = 8
 
@@ -262,9 +263,9 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
         clip(array, min: MLXArray(-65_504), max: MLXArray(65_504)).asType(.float16)
     }
 
-    /// Compress one or more complete tiles in a single MLX graph. The tile axis is retained at
-    /// index 2 so a prefill can be installed directly as bounded, immutable slabs.
-    private func compressedBatch(
+    /// Compress one or more complete tiles for a bounded group of KV heads. The tile axis is
+    /// retained at index 2 so a prefill can be installed directly as immutable slabs.
+    private func compressedHeadBatch(
         rotatedKeys: MLXArray, rotatedValues: MLXArray
     ) -> VarianceNormalizedKVTile {
         let tileCount = rotatedKeys.dim(2) / tileSize
@@ -300,6 +301,45 @@ public class VarianceNormalizedKVCache: BaseKVCache, KVCacheAttentionProtocol,
             valueBiases: fusedValueBiases,
             valueColumnScales: compactAuxiliary(valueColumnScales)
         )
+    }
+
+    /// Compress complete tiles while bounding the FP32 normalization workspace. Variance
+    /// normalization is independent across KV heads, so realizing four heads at a time preserves
+    /// the exact algorithm and 32-tile batching without making all model heads live at once.
+    private func compressedBatch(
+        rotatedKeys: MLXArray, rotatedValues: MLXArray
+    ) -> VarianceNormalizedKVTile {
+        precondition(rotatedKeys.dim(1) == rotatedValues.dim(1))
+        guard rotatedKeys.dim(1) > Self.compressionBatchHeadCount else {
+            return compressedHeadBatch(rotatedKeys: rotatedKeys, rotatedValues: rotatedValues)
+        }
+
+        var headRecords: [VarianceNormalizedKVTile] = []
+        for start in stride(
+            from: 0, to: rotatedKeys.dim(1), by: Self.compressionBatchHeadCount)
+        {
+            let end = min(start + Self.compressionBatchHeadCount, rotatedKeys.dim(1))
+            let record = compressedHeadBatch(
+                rotatedKeys: rotatedKeys[0..., start ..< end, 0..., 0...],
+                rotatedValues: rotatedValues[0..., start ..< end, 0..., 0...])
+            evaluate(record)
+            headRecords.append(record)
+        }
+
+        let merged = VarianceNormalizedKVTile(
+            keyWeight: contiguous(concatenated(headRecords.map(\.keyWeight), axis: 1)),
+            keyScales: contiguous(concatenated(headRecords.map(\.keyScales), axis: 1)),
+            keyBiases: contiguous(concatenated(headRecords.map(\.keyBiases), axis: 1)),
+            keyColumnScales: contiguous(
+                concatenated(headRecords.map(\.keyColumnScales), axis: 1)),
+            valueWeight: contiguous(concatenated(headRecords.map(\.valueWeight), axis: 1)),
+            valueScales: contiguous(concatenated(headRecords.map(\.valueScales), axis: 1)),
+            valueBiases: contiguous(concatenated(headRecords.map(\.valueBiases), axis: 1)),
+            valueColumnScales: contiguous(
+                concatenated(headRecords.map(\.valueColumnScales), axis: 1))
+        )
+        evaluate(merged)
+        return merged
     }
 
     private func tileView(

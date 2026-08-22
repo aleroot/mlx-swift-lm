@@ -1953,6 +1953,33 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     #expect(relativeRMSError(native, materialized) < 1.5e-3)
 }
 
+@Test func testVarianceNormalizedKVCacheHeadBatchesMatchIndependentHeads() {
+    let keys = deterministicTensor(shape: [1, 8, 128, 32], salt: 54)
+    let values = deterministicTensor(shape: [1, 8, 128, 32], salt: 55)
+    let batchedCache = VarianceNormalizedKVCache(
+        tileSize: 32, keyBits: 4, valueBits: 2, sinkhornIterations: 2)
+    let (batchedKeys, batchedValues) = batchedCache.update(keys: keys, values: values)
+
+    var independentKeys: [MLXArray] = []
+    var independentValues: [MLXArray] = []
+    for head in 0 ..< 8 {
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 32, keyBits: 4, valueBits: 2, sinkhornIterations: 2)
+        let (headKeys, headValues) = cache.update(
+            keys: keys[0..., head ..< head + 1, 0..., 0...],
+            values: values[0..., head ..< head + 1, 0..., 0...])
+        independentKeys.append(headKeys)
+        independentValues.append(headValues)
+    }
+
+    let referenceKeys = concatenated(independentKeys, axis: 1)
+    let referenceValues = concatenated(independentValues, axis: 1)
+    eval(batchedKeys, batchedValues, referenceKeys, referenceValues)
+
+    #expect(relativeRMSError(batchedKeys, referenceKeys) < 1e-6)
+    #expect(relativeRMSError(batchedValues, referenceValues) < 1e-6)
+}
+
 @Test func testVarianceNormalizedKVCacheTwoBitMemoryAccountingIsPaperRelevant() {
     let cache = VarianceNormalizedKVCache(
         tileSize: 32, keyBits: 2, valueBits: 2, sinkhornIterations: 2)

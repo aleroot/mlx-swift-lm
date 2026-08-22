@@ -283,9 +283,11 @@ public class EvalTests: XCTestCase {
         let tokenCount = 32_768
         let cache = VarianceNormalizedKVCache(
             tileSize: 128, keyBits: 4, valueBits: 2, sinkhornIterations: 8)
-        let queries = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
-        let keys = MLXRandom.normal([1, 4, tokenCount, 128]).asType(.float16)
-        let values = MLXRandom.normal([1, 4, tokenCount, 128]).asType(.float16)
+        // Qwen3-4B-like grouped-query attention exercises the bounded four-KV-head
+        // normalization batches instead of measuring only the unsplit four-head path.
+        let queries = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
+        let keys = MLXRandom.normal([1, 8, tokenCount, 128]).asType(.float16)
+        let values = MLXRandom.normal([1, 8, tokenCount, 128]).asType(.float16)
         eval(queries, keys, values)
         Memory.clearCache()
         let baselineActiveMemory = Memory.activeMemory
@@ -303,9 +305,9 @@ public class EvalTests: XCTestCase {
         let rawKVBytes = keys.nbytes + values.nbytes
         let compactBytes = cache.state.reduce(0) { $0 + $1.nbytes }
 
-        let decodeQuery = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
-        let decodeKey = MLXRandom.normal([1, 4, 1, 128]).asType(.float16)
-        let decodeValue = MLXRandom.normal([1, 4, 1, 128]).asType(.float16)
+        let decodeQuery = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
+        let decodeKey = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+        let decodeValue = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
         let decodeStart = Date.timeIntervalSinceReferenceDate
         let decodeOutput = cache.updateAndAttend(
             queries: decodeQuery,
@@ -320,7 +322,7 @@ public class EvalTests: XCTestCase {
                 + "compact=\(compactBytes) bytes, peak workspace=\(peakWorkspaceBytes) bytes, "
                 + "one-layer decode=\(decodeElapsed)s")
 
-        XCTAssertEqual(output.shape, [1, 8, 1, 128])
+        XCTAssertEqual(output.shape, [1, 32, 1, 128])
         XCTAssertLessThan(compactBytes, rawKVBytes)
         // A regression guard against retaining prompt-sized geometric spare capacity or an
         // unbounded normalization graph. This is deliberately loose for different Apple GPUs.
