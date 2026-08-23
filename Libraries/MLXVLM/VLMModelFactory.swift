@@ -505,20 +505,31 @@ struct ProcessorConfigError: Error {
     let underlying: Error
 }
 
-/// Selects checkpoint processor metadata, then applies any registered type correction.
+/// Selects checkpoint processor metadata, then resolves the processor type.
 func resolveProcessorConfiguration(
     from modelDirectory: URL,
     context: VLMProcessorLoadingContext,
     registry: VLMProcessorLoadingRegistry
 ) async throws -> VLMProcessorConfiguration {
     let configuration = try await loadProcessorConfig(from: modelDirectory) {
-        try registry.processorConfigurationFallback(for: context)
+        try registry.fallbackProcessorConfiguration(for: context)
     }
     let processorType =
-        try registry.processorTypeOverride(
+        try registry.processorType(
             for: context, declaredProcessorType: configuration.processorType)
         ?? configuration.processorType
+    guard let processorType else {
+        throw missingProcessorTypeError(filename: configuration.filename)
+    }
     return VLMProcessorConfiguration(data: configuration.data, processorType: processorType)
+}
+
+/// Processor configuration selected from a checkpoint file or a generated fallback.
+/// The type remains optional until loading resolvers have had a chance to supply one.
+struct LoadedVLMProcessorConfiguration {
+    let data: Data
+    let processorType: String?
+    let filename: String
 }
 
 /// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
@@ -527,7 +538,7 @@ func resolveProcessorConfiguration(
 func loadProcessorConfig(
     from modelDirectory: URL,
     fallback: () throws -> VLMProcessorConfiguration? = { nil }
-) async throws -> VLMProcessorConfiguration {
+) async throws -> LoadedVLMProcessorConfiguration {
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
 
@@ -538,17 +549,47 @@ func loadProcessorConfig(
         return try readProcessorConfig(from: processorConfigURL)
     }
     if let fallback = try fallback() {
-        return fallback
+        return LoadedVLMProcessorConfiguration(
+            data: fallback.data,
+            processorType: fallback.processorType,
+            filename: "config.json")
     }
 
     return try readProcessorConfig(from: processorConfigURL)
 }
 
-private func readProcessorConfig(from url: URL) throws -> VLMProcessorConfiguration {
+private struct DeclaredProcessorConfiguration: Decodable {
+    let processorClass: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case processorClass = "processor_class"
+    }
+}
+
+private enum ProcessorConfigurationCodingKey: String, CodingKey {
+    case processorClass = "processor_class"
+}
+
+private func missingProcessorTypeError(filename: String) -> ProcessorConfigError {
+    ProcessorConfigError(
+        filename: filename,
+        underlying: DecodingError.keyNotFound(
+            ProcessorConfigurationCodingKey.processorClass,
+            DecodingError.Context(
+                codingPath: [],
+                debugDescription:
+                    "No processor_class was declared and no processor loading resolver supplied one."
+            )))
+}
+
+private func readProcessorConfig(from url: URL) throws -> LoadedVLMProcessorConfiguration {
     do {
         let data = try Data(contentsOf: url)
-        let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
-        return VLMProcessorConfiguration(data: data, processorType: config.processorClass)
+        let config = try JSONDecoder.json5().decode(DeclaredProcessorConfiguration.self, from: data)
+        return LoadedVLMProcessorConfiguration(
+            data: data,
+            processorType: config.processorClass,
+            filename: url.lastPathComponent)
     } catch {
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
     }

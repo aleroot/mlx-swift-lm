@@ -7,7 +7,7 @@ import XCTest
 
 final class VLMProcessorLoadingRegistryTests: XCTestCase {
 
-    func testExternalResolversComposeFallbackAndTypeOverride() async throws {
+    func testExternalResolversComposeFallbackAndTypeResolution() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let fallbackData = Data(#"{"source":"external-package"}"#.utf8)
@@ -32,21 +32,21 @@ final class VLMProcessorLoadingRegistryTests: XCTestCase {
             TestResolver(
                 configuration: VLMProcessorConfiguration(
                     data: firstData, processorType: "FirstDeclared"),
-                processorType: "FirstOverride")
+                processorType: "FirstChoice")
         ])
         registry.register(
             TestResolver(
                 configuration: VLMProcessorConfiguration(
                     data: secondData, processorType: "SecondDeclared"),
-                processorType: "SecondOverride"))
+                processorType: "SecondChoice"))
 
         XCTAssertEqual(
-            try registry.processorConfigurationFallback(for: context())?.data,
+            try registry.fallbackProcessorConfiguration(for: context())?.data,
             secondData)
         XCTAssertEqual(
-            try registry.processorTypeOverride(
+            try registry.processorType(
                 for: context(), declaredProcessorType: "CheckpointProcessor"),
-            "SecondOverride")
+            "SecondChoice")
     }
 
     func testNilDefersEachHookIndependently() throws {
@@ -55,17 +55,17 @@ final class VLMProcessorLoadingRegistryTests: XCTestCase {
             TestResolver(
                 configuration: VLMProcessorConfiguration(
                     data: fallbackData, processorType: "FallbackProcessor"),
-                processorType: "EarlierOverride"),
-            TestResolver(processorType: "LaterOverride"),
+                processorType: "EarlierChoice"),
+            TestResolver(processorType: "LaterChoice"),
         ])
 
         XCTAssertEqual(
-            try registry.processorConfigurationFallback(for: context())?.data,
+            try registry.fallbackProcessorConfiguration(for: context())?.data,
             fallbackData)
         XCTAssertEqual(
-            try registry.processorTypeOverride(
+            try registry.processorType(
                 for: context(), declaredProcessorType: "CheckpointProcessor"),
-            "LaterOverride")
+            "LaterChoice")
     }
 
     func testCheckpointConfigurationDoesNotInvokeFallbackResolver() async throws {
@@ -83,24 +83,78 @@ final class VLMProcessorLoadingRegistryTests: XCTestCase {
         XCTAssertEqual(resolved.processorType, "CheckpointProcessor")
     }
 
+    func testCheckpointProcessorTypeCanBeCorrected() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let checkpointData = Data(#"{"processor_class":"IncorrectProcessor"}"#.utf8)
+        try checkpointData.write(
+            to: directory.appending(component: "processor_config.json"))
+        let registry = VLMProcessorLoadingRegistry(resolvers: [
+            TestResolver(processorType: "ExternalProcessor")
+        ])
+
+        let resolved = try await resolveProcessorConfiguration(
+            from: directory, context: context(), registry: registry)
+
+        XCTAssertEqual(resolved.data, checkpointData)
+        XCTAssertEqual(resolved.processorType, "ExternalProcessor")
+    }
+
+    func testExistingConfigurationWithoutProcessorClassCanBeResolved() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let checkpointData = Data(#"{"image_mean":[0.5,0.5,0.5]}"#.utf8)
+        try checkpointData.write(
+            to: directory.appending(component: "preprocessor_config.json"))
+        let registry = VLMProcessorLoadingRegistry(resolvers: [
+            MissingProcessorTypeResolver(processorType: "ExternalProcessor")
+        ])
+
+        let resolved = try await resolveProcessorConfiguration(
+            from: directory, context: context(), registry: registry)
+
+        XCTAssertEqual(resolved.data, checkpointData)
+        XCTAssertEqual(resolved.processorType, "ExternalProcessor")
+    }
+
+    func testExistingConfigurationWithoutProcessorClassFailsWhenUnresolved() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(#"{"image_mean":[0.5,0.5,0.5]}"#.utf8).write(
+            to: directory.appending(component: "preprocessor_config.json"))
+
+        do {
+            _ = try await resolveProcessorConfiguration(
+                from: directory, context: context(),
+                registry: VLMProcessorLoadingRegistry())
+            XCTFail("Expected an unresolved processor type to throw")
+        } catch let error as ProcessorConfigError {
+            XCTAssertEqual(error.filename, "preprocessor_config.json")
+            guard case DecodingError.keyNotFound(let key, _) = error.underlying else {
+                return XCTFail("Expected a missing processor_class decoding error")
+            }
+            XCTAssertEqual(key.stringValue, "processor_class")
+        }
+    }
+
     func testBuiltInTypeRulesUseThePublicResolverPath() throws {
-        let resolver = ModelTypeProcessorOverrideResolver(processorTypes: [
+        let resolver = ModelTypeProcessorResolver(processorTypes: [
             "mistral3": "Mistral3Processor",
             "gemma4_unified": "Gemma4UnifiedProcessor",
         ])
 
         XCTAssertEqual(
-            try resolver.processorTypeOverride(
+            try resolver.processorType(
                 for: context(modelType: "mistral3"),
                 declaredProcessorType: "PixtralProcessor"),
             "Mistral3Processor")
         XCTAssertEqual(
-            try resolver.processorTypeOverride(
+            try resolver.processorType(
                 for: context(modelType: "gemma4_unified"),
                 declaredProcessorType: "AutoProcessor"),
             "Gemma4UnifiedProcessor")
         XCTAssertNil(
-            try resolver.processorTypeOverride(
+            try resolver.processorType(
                 for: context(modelType: "unrelated"),
                 declaredProcessorType: "AutoProcessor"))
     }
@@ -121,7 +175,7 @@ final class VLMProcessorLoadingRegistryTests: XCTestCase {
     }
 }
 
-private struct TestResolver: VLMProcessorLoadingResolving {
+private struct TestResolver: VLMProcessorLoadingResolver {
     var configuration: VLMProcessorConfiguration?
     var processorType: String?
 
@@ -133,28 +187,39 @@ private struct TestResolver: VLMProcessorLoadingResolving {
         self.processorType = processorType
     }
 
-    func processorConfigurationFallback(
+    func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? {
         configuration
     }
 
-    func processorTypeOverride(
+    func processorType(
         for context: VLMProcessorLoadingContext,
-        declaredProcessorType: String
+        declaredProcessorType: String?
     ) throws -> String? {
         processorType
     }
 }
 
-private struct ThrowingFallbackResolver: VLMProcessorLoadingResolving {
+private struct ThrowingFallbackResolver: VLMProcessorLoadingResolver {
     enum Failure: Error {
         case unexpectedlyInvoked
     }
 
-    func processorConfigurationFallback(
+    func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? {
         throw Failure.unexpectedlyInvoked
+    }
+}
+
+private struct MissingProcessorTypeResolver: VLMProcessorLoadingResolver {
+    let processorType: String
+
+    func processorType(
+        for context: VLMProcessorLoadingContext,
+        declaredProcessorType: String?
+    ) throws -> String? {
+        declaredProcessorType == nil ? processorType : nil
     }
 }

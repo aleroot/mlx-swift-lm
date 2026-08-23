@@ -33,75 +33,78 @@ public struct VLMProcessorConfiguration: Sendable {
 /// Supplies model-specific processor loading policy that is not present in a checkpoint.
 ///
 /// Both hooks are optional. A fallback is consulted only when neither
-/// `preprocessor_config.json` nor `processor_config.json` exists. A type override is
-/// consulted after a configuration has been selected, so it can correct processor metadata
-/// shipped by a checkpoint.
-public protocol VLMProcessorLoadingResolving: Sendable {
-    func processorConfigurationFallback(
+/// `preprocessor_config.json` nor `processor_config.json` exists. Processor type resolvers are
+/// consulted after a configuration has been selected, so they can supply missing metadata or
+/// correct metadata shipped by a checkpoint.
+public protocol VLMProcessorLoadingResolver: Sendable {
+    func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration?
 
-    func processorTypeOverride(
+    /// The processor type to use for this model, or `nil` to defer to another resolver or
+    /// the checkpoint declaration. `declaredProcessorType` is `nil` when the selected
+    /// processor configuration does not contain `processor_class`.
+    func processorType(
         for context: VLMProcessorLoadingContext,
-        declaredProcessorType: String
+        declaredProcessorType: String?
     ) throws -> String?
 }
 
-extension VLMProcessorLoadingResolving {
-    public func processorConfigurationFallback(
+extension VLMProcessorLoadingResolver {
+    public func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? { nil }
 
-    public func processorTypeOverride(
+    public func processorType(
         for context: VLMProcessorLoadingContext,
-        declaredProcessorType: String
+        declaredProcessorType: String?
     ) throws -> String? { nil }
 }
 
 /// Ordered registry of processor-loading resolvers used by ``VLMModelFactory``.
 ///
 /// Most recently registered wins for each hook independently. This lets a downstream
-/// package override one decision while deferring the other to an earlier resolver.
+/// package choose one value while deferring the other to an earlier resolver.
 public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
 
     /// Shared instance, preloaded with this package's built-in loading rules.
     public static let shared = VLMProcessorLoadingRegistry(resolvers: [
         Qwen35ProcessorLoadingResolver(),
-        ModelTypeProcessorOverrideResolver(processorTypes: [
+        ModelTypeProcessorResolver(processorTypes: [
             "mistral3": "Mistral3Processor",
             "gemma4_unified": "Gemma4UnifiedProcessor",
         ]),
     ])
 
     private let lock = NSLock()
-    private var resolvers: [any VLMProcessorLoadingResolving]
+    private var resolvers: [any VLMProcessorLoadingResolver]
 
-    public init(resolvers: [any VLMProcessorLoadingResolving] = []) {
+    public init(resolvers: [any VLMProcessorLoadingResolver] = []) {
         self.resolvers = resolvers
     }
 
     /// Add a resolver. It takes precedence over resolvers registered before it.
-    public func register(_ resolver: any VLMProcessorLoadingResolving) {
+    public func register(_ resolver: any VLMProcessorLoadingResolver) {
         lock.withLock { resolvers.append(resolver) }
     }
 
-    func processorConfigurationFallback(
+    func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? {
         for resolver in snapshot() {
-            if let configuration = try resolver.processorConfigurationFallback(for: context) {
+            if let configuration = try resolver.fallbackProcessorConfiguration(for: context) {
                 return configuration
             }
         }
         return nil
     }
 
-    func processorTypeOverride(
+    func processorType(
         for context: VLMProcessorLoadingContext,
-        declaredProcessorType: String
+        declaredProcessorType: String?
     ) throws -> String? {
         for resolver in snapshot() {
-            if let processorType = try resolver.processorTypeOverride(
+            if let processorType = try resolver.processorType(
                 for: context, declaredProcessorType: declaredProcessorType)
             {
                 return processorType
@@ -112,32 +115,32 @@ public final class VLMProcessorLoadingRegistry: @unchecked Sendable {
 
     /// Copy under the lock, then execute external code outside it. A resolver may be slow
     /// or may re-enter this registry, neither of which should block registration.
-    private func snapshot() -> [any VLMProcessorLoadingResolving] {
+    private func snapshot() -> [any VLMProcessorLoadingResolver] {
         lock.withLock { resolvers.reversed() }
     }
 }
 
 /// A reusable processor-type rule keyed by `model_type` from `config.json`.
-public struct ModelTypeProcessorOverrideResolver: VLMProcessorLoadingResolving {
+public struct ModelTypeProcessorResolver: VLMProcessorLoadingResolver {
     public let processorTypes: [String: String]
 
     public init(processorTypes: [String: String]) {
         self.processorTypes = processorTypes
     }
 
-    public func processorTypeOverride(
+    public func processorType(
         for context: VLMProcessorLoadingContext,
-        declaredProcessorType: String
+        declaredProcessorType: String?
     ) throws -> String? {
         processorTypes[context.modelType]
     }
 }
 
 /// Reconstructs processor metadata omitted by Qwen3.5 checkpoints from their vision config.
-public struct Qwen35ProcessorLoadingResolver: VLMProcessorLoadingResolving {
+public struct Qwen35ProcessorLoadingResolver: VLMProcessorLoadingResolver {
     public init() {}
 
-    public func processorConfigurationFallback(
+    public func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? {
         guard context.modelType == "qwen3_5" || context.modelType == "qwen3_5_moe" else {

@@ -82,7 +82,7 @@ final class Qwen35ProcessorFallbackTests: XCTestCase {
 
     func testDenseFallbackEncodesVisionGeometryAndQwenDefaults() throws {
         let fallback = try XCTUnwrap(
-            Qwen35ProcessorLoadingResolver().processorConfigurationFallback(
+            Qwen35ProcessorLoadingResolver().fallbackProcessorConfiguration(
                 for: VLMProcessorLoadingContext(
                     modelId: "example/qwen",
                     modelType: "qwen3_5",
@@ -103,7 +103,7 @@ final class Qwen35ProcessorFallbackTests: XCTestCase {
 
     func testMoEFallbackUsesInheritedQwen35Configuration() throws {
         let fallback = try XCTUnwrap(
-            Qwen35ProcessorLoadingResolver().processorConfigurationFallback(
+            Qwen35ProcessorLoadingResolver().fallbackProcessorConfiguration(
                 for: VLMProcessorLoadingContext(
                     modelId: "example/qwen-moe",
                     modelType: "qwen3_5_moe",
@@ -121,7 +121,7 @@ final class Qwen35ProcessorFallbackTests: XCTestCase {
 
     func testFallbackRejectsUnrelatedModelType() throws {
         XCTAssertNil(
-            try Qwen35ProcessorLoadingResolver().processorConfigurationFallback(
+            try Qwen35ProcessorLoadingResolver().fallbackProcessorConfiguration(
                 for: VLMProcessorLoadingContext(
                     modelId: "example/qwen",
                     modelType: "qwen3_vl",

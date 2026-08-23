@@ -426,8 +426,8 @@ right implementation for their model type. An external model package can handle 
 without changing `VLMModelFactory`:
 
 ```swift
-struct YourModelProcessorLoadingResolver: VLMProcessorLoadingResolving {
-    func processorConfigurationFallback(
+struct YourModelProcessorLoadingResolver: VLMProcessorLoadingResolver {
+    func fallbackProcessorConfiguration(
         for context: VLMProcessorLoadingContext
     ) throws -> VLMProcessorConfiguration? {
         guard context.modelType == "your_model" else { return nil }
@@ -440,9 +440,9 @@ struct YourModelProcessorLoadingResolver: VLMProcessorLoadingResolving {
             processorType: "YourModelProcessor")
     }
 
-    func processorTypeOverride(
+    func processorType(
         for context: VLMProcessorLoadingContext,
-        declaredProcessorType: String
+        declaredProcessorType: String?
     ) throws -> String? {
         context.modelType == "your_model" ? "YourModelProcessor" : nil
     }
@@ -452,8 +452,9 @@ VLMProcessorLoadingRegistry.shared.register(YourModelProcessorLoadingResolver())
 ```
 
 Implement only the hook your model needs. A checkpoint's `preprocessor_config.json` or
-`processor_config.json` always wins over a generated fallback. Type overrides are applied
-afterward. For isolated applications and tests, pass a separate
+`processor_config.json` always wins over a generated fallback. Processor type resolution is
+applied afterward and can supply a missing `processor_class` or correct an incorrect one.
+For isolated applications and tests, pass a separate
 `VLMProcessorLoadingRegistry` to `VLMModelFactory` instead of registering globally.
 
 Add a constant for the model in the VLMRegistry (not strictly required but useful
