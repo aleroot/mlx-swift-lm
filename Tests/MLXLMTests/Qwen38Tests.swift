@@ -133,6 +133,27 @@ final class Qwen38Tests: XCTestCase {
         """
     }
 
+    private func layerScheduleConfigData(_ layerTypes: [String]) throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: [
+                "model_type": "qwen3_8_text",
+                "hidden_size": 16,
+                "num_hidden_layers": layerTypes.count,
+                "intermediate_size": 32,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 8,
+                "linear_num_value_heads": 2,
+                "linear_num_key_heads": 1,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_conv_kernel_dim": 4,
+                "vocab_size": 64,
+                "full_attention_interval": 4,
+                "layer_types": layerTypes,
+            ])
+    }
+
     // MARK: - Configuration & Type Registry Tests
 
     func testReleasedQwen38MetadataRoutesThroughExistingQwen35Architecture() async throws {
@@ -198,6 +219,52 @@ final class Qwen38Tests: XCTestCase {
         XCTAssertFalse(model.model.layers[3].isLinear)
         XCTAssertEqual(model.model.ssmIdx, 0)
         XCTAssertEqual(model.model.faIdx, 1)
+    }
+
+    func testQwen38CacheAnchorsFollowResolvedLayerSchedule() throws {
+        let cases: [([String], Int?, Int?)] = [
+            (["full_attention", "linear_attention"], 1, 0),
+            (["linear_attention", "linear_attention"], 0, nil),
+            (["full_attention", "full_attention"], nil, 0),
+        ]
+
+        for (layerTypes, expectedSSMIndex, expectedFullAttentionIndex) in cases {
+            let data = try layerScheduleConfigData(layerTypes)
+            let textConfig = try JSONDecoder.json5().decode(
+                MLXLLM.Qwen35TextConfiguration.self, from: data)
+            let textModel = MLXLLM.Qwen35TextModel(textConfig)
+            XCTAssertEqual(textModel.model.ssmIdx, expectedSSMIndex)
+            XCTAssertEqual(textModel.model.faIdx, expectedFullAttentionIndex)
+
+            let caches = try textModel.newCache(parameters: nil)
+            XCTAssertEqual(
+                caches.map { $0 is MambaCache },
+                layerTypes.map { $0 == "linear_attention" })
+            let tokens = MLXArray([1, 2]).reshaped(1, 2)
+            let textOutput = textModel(tokens, cache: caches)
+            eval(textOutput)
+            XCTAssertEqual(textOutput.shape, [1, 2, 64])
+            let nextToken = MLXArray([3]).reshaped(1, 1)
+            let textDecodeOutput = textModel(nextToken, cache: caches)
+            eval(textDecodeOutput)
+            XCTAssertEqual(textDecodeOutput.shape, [1, 1, 64])
+
+            let vlmConfig = try JSONDecoder.json5().decode(
+                MLXVLM.Qwen35Configuration.TextConfiguration.self, from: data)
+            let vlmModel = MLXVLM.Qwen35Language.Model(vlmConfig)
+            XCTAssertEqual(vlmModel.ssmIdx, expectedSSMIndex)
+            XCTAssertEqual(vlmModel.faIdx, expectedFullAttentionIndex)
+
+            let vlmCaches: [KVCache?] = layerTypes.map {
+                $0 == "linear_attention" ? MambaCache() : KVCacheSimple()
+            }
+            let vlmOutput = vlmModel(tokens, cache: vlmCaches)
+            eval(vlmOutput)
+            XCTAssertEqual(vlmOutput.shape, [1, 2, 16])
+            let vlmDecodeOutput = vlmModel(nextToken, cache: vlmCaches)
+            eval(vlmDecodeOutput)
+            XCTAssertEqual(vlmDecodeOutput.shape, [1, 1, 16])
+        }
     }
 
     func testQwen38ExplicitLayerTypesMustDescribeEveryLayer() throws {

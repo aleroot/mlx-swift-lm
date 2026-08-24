@@ -21,7 +21,6 @@ final class Qwen35VLMNextNPredictor: Module {
             repeating: HybridAttentionSchedule.fullAttention, count: mtpArgs.hiddenLayers)
         mtpArgs.layerTypes = layerTypes
         mtpArgs.resolvedLayerTypes = layerTypes
-        mtpArgs.fullAttentionLayerIndex = 0
 
         if args.mtpUseDedicatedEmbeddings {
             _embedTokens.wrappedValue = Embedding(
