@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 import XCTest
 
@@ -40,9 +41,13 @@ final class Qwen35DirectExpertReductionTests: XCTestCase {
         quantize(model: block, groupSize: 32, bits: 4)
         let input = MLXRandom.normal([1, 19, 64]).asType(.bfloat16)
 
-        block.directExpertReductionEnabled = false
-        let expected = block.forward(input)
-        block.directExpertReductionEnabled = true
+        var gates = block.gate(input)
+        gates = softmax(gates, axis: -1, precise: true)
+        let (indices, scores) = moeRouterTopK(
+            gates, k: block.topK, normalize: block.normTopkProb)
+        let expertOutput = weightedExpertSum(block.switchMLP(input, indices), scores)
+        let sharedOutput = sigmoid(block.sharedExpertGate(input)) * block.sharedExpert(input)
+        let expected = expertOutput + sharedOutput
         let actual = block.forward(input)
         eval(expected, actual)
 
