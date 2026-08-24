@@ -464,6 +464,12 @@ enum Qwen35Language {
         @ModuleInfo(key: "in_proj_b") var inProjB: Linear
         @ModuleInfo(key: "in_proj_a") var inProjA: Linear
 
+        // Inference-only physical projection. The four registered modules
+        // remain as views so checkpoint and adapter paths stay unchanged.
+        private var fusedInProj: QuantizedLinear?
+        private var fusedInputProjectionAttempted = false
+        var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+
         @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
         @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -511,6 +517,98 @@ enum Qwen35Language {
             super.init()
         }
 
+        @discardableResult
+        override func update(
+            parameters: ModuleParameters, verify: VerifyUpdate,
+            path: [String] = [], modulePath: [String] = []
+        ) throws -> Self {
+            let inputProjectionPrefixes = [
+                "in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a.",
+            ]
+            let replacesInputProjection = parameters.flattened().contains { key, _ in
+                inputProjectionPrefixes.contains(where: key.hasPrefix)
+            }
+            let result = try super.update(
+                parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+            if replacesInputProjection {
+                invalidateFusedInputProjection()
+            }
+            return result
+        }
+
+        override func updateModule(key: String, _ value: Any) throws {
+            try super.updateModule(key: key, value)
+            if key == "in_proj_qkv" || key == "in_proj_z"
+                || key == "in_proj_b" || key == "in_proj_a"
+            {
+                invalidateFusedInputProjection()
+            }
+        }
+
+        private func invalidateFusedInputProjection() {
+            fusedInProj = nil
+            fusedInputProjectionAttempted = false
+        }
+
+        var hasFusedInputProjection: Bool { fusedInProj != nil }
+
+        @discardableResult
+        func prepareFusedInputProjection() -> Bool {
+            guard fusedInputProjectionEnabled else { return false }
+            if fusedInProj != nil { return true }
+            guard !fusedInputProjectionAttempted else { return false }
+            fusedInputProjectionAttempted = true
+
+            guard
+                let projection = fuseQuantizedLinearProjections([
+                    inProjQKV, inProjZ, inProjB, inProjA,
+                ])
+            else {
+                return false
+            }
+            guard projection.sourceViews.count == 4,
+                (try? update(
+                    modules: ModuleChildren(values: [
+                        "in_proj_qkv": .value(projection.sourceViews[0]),
+                        "in_proj_z": .value(projection.sourceViews[1]),
+                        "in_proj_b": .value(projection.sourceViews[2]),
+                        "in_proj_a": .value(projection.sourceViews[3]),
+                    ]), verify: [])) != nil
+            else {
+                return false
+            }
+
+            fusedInputProjectionAttempted = true
+            fusedInProj = projection.fused
+            return true
+        }
+
+        func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
+            qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+        ) {
+            guard prepareFusedInputProjection(), let fusedInProj else {
+                return (
+                    inProjQKV(inputs),
+                    inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
+                    inProjB(inputs),
+                    inProjA(inputs)
+                )
+            }
+
+            let projected = fusedInProj(inputs)
+            let qkvEnd = keyDim * 2 + valueDim
+            let zEnd = qkvEnd + valueDim
+            let bEnd = zEnd + numVHeads
+            let aEnd = bEnd + numVHeads
+            return (
+                projected[0..., 0..., ..<qkvEnd],
+                projected[0..., 0..., qkvEnd ..< zEnd].reshaped(
+                    batch, sequence, numVHeads, headVDim),
+                projected[0..., 0..., zEnd ..< bEnd],
+                projected[0..., 0..., bEnd ..< aEnd]
+            )
+        }
+
         func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
@@ -520,10 +618,8 @@ enum Qwen35Language {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
 
-            var mixedQKV = inProjQKV(inputs)
-            let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-            let b = inProjB(inputs)
-            let a = inProjA(inputs)
+            var (mixedQKV, z, b, a) = projectInputs(
+                inputs, batch: B, sequence: S)
 
             let convState: MLXArray
             if let cacheState = cache?[0] {
