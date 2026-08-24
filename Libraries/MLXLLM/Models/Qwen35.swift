@@ -513,10 +513,19 @@ final class Qwen35Attention: Module {
 
 // MARK: - SparseMoeBlock
 
+/// Default-on rollback switch for the sorted Qwen MoE prefill reduction.
+private let qwenDirectExpertReductionEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN_DIRECT_EXPERT_REDUCTION"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return raw != "0" && raw != "false" && raw != "off"
+}()
+
 final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let normTopkProb: Bool
     let numExperts: Int
     let topK: Int
+    var directExpertReductionEnabled = qwenDirectExpertReductionEnabled
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -578,8 +587,22 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         let (inds, scores) = moeRouterTopK(
             gates, k: topK, normalize: normTopkProb)
 
-        let y = switchMLP(x, inds)
-        let combined = weightedExpertSum(y, scores)
+        let combined: MLXArray
+        let tokenCount = x.size / x.dim(-1)
+        let flatX = x.reshaped(tokenCount, x.dim(-1))
+        let flatIndices = inds.reshaped(tokenCount, topK)
+        let flatScores = scores.reshaped(tokenCount, topK)
+        if directExpertReductionEnabled,
+            switchMLP.supportsDirectWeightedReduction(
+                flatX, flatIndices, weights: flatScores)
+        {
+            combined = switchMLP.callAndWeightedReduce(
+                flatX, flatIndices, weights: flatScores, fuseSortedReduction: true
+            ).reshaped(x.shape)
+        } else {
+            let y = switchMLP(x, inds)
+            combined = weightedExpertSum(y, scores)
+        }
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
