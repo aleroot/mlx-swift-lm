@@ -9,15 +9,6 @@ import XCTest
 @testable import MLXLLM
 @testable import MLXVLM
 
-private final class Qwen35GDNTestWrapper: Module {
-    @ModuleInfo(key: "gdn") var gdn: Qwen35GatedDeltaNet
-
-    init(_ gdn: Qwen35GatedDeltaNet) {
-        _gdn.wrappedValue = gdn
-        super.init()
-    }
-}
-
 final class Qwen35FusedGDNProjectionTests: XCTestCase {
 
     private let configurationJSON = """
@@ -192,12 +183,14 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         XCTAssertFalse(layer.hasFusedInputProjection)
     }
 
-    func testLoadTimePreparationWalksNestedModules() throws {
-        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+    func testLanguageModelLifecyclePreparesNestedGDNModules() throws {
+        let model = Qwen35TextModel(try llmConfiguration())
+        let layer = try XCTUnwrap(
+            model.modules().compactMap { $0 as? Qwen35GatedDeltaNet }.first)
         try quantize(layer)
         XCTAssertFalse(layer.hasFusedInputProjection)
 
-        prepareInferenceState(in: Qwen35GDNTestWrapper(layer))
+        try model.prepareForInference()
 
         XCTAssertTrue(layer.hasFusedInputProjection)
     }

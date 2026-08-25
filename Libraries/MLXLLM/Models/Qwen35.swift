@@ -168,7 +168,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
-final class Qwen35GatedDeltaNet: Module, InferenceStatePreparable {
+final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -298,10 +298,6 @@ final class Qwen35GatedDeltaNet: Module, InferenceStatePreparable {
                     "in_proj_a": .value(sourceViews[3]),
                 ]), verify: [])
         }
-    }
-
-    func prepareForInference() throws {
-        _ = try prepareFusedInputProjection()
     }
 
     func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
@@ -1184,6 +1180,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    public func prepareForInference() throws {
+        for layer in model.layers {
+            if let linearAttn = layer.linearAttn {
+                _ = try linearAttn.prepareFusedInputProjection()
+            }
+        }
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
         let hasUnsanitizedConv1d = weights.contains { key, value in
@@ -1283,6 +1287,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try languageModel.newCache(parameters: parameters)
+    }
+
+    public func prepareForInference() throws {
+        try languageModel.prepareForInference()
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

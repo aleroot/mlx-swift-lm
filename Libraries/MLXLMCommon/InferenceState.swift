@@ -4,19 +4,8 @@ import Foundation
 import MLX
 import MLXNN
 
-/// A module with derived inference state that must be built after checkpoint
-/// parameters have been installed and before the model is published to callers.
-///
-/// Preparation deliberately belongs to the loading lifecycle rather than a
-/// forward pass: implementations may materialize arrays or replace storage-
-/// sharing module views and therefore must run while the loader or explicit
-/// model-topology owner has exclusive access to the model.
-package protocol InferenceStatePreparable: AnyObject {
-    func prepareForInference() throws
-}
-
 package struct InferenceStatePreparationFailure {
-    package let moduleType: String
+    package let modelType: String
     package let error: any Error
 }
 
@@ -29,29 +18,31 @@ package struct InferenceStatePreparationReport {
 private let inferenceStateLogger = Logger(
     subsystem: "mlx-swift-lm", category: "inference-state")
 
-/// Prepare every participating module after checkpoint loading or an explicit
-/// model-topology update.
+/// Prepare a language model after checkpoint loading or an explicit topology
+/// update.
 ///
-/// Take a snapshot before invoking callbacks because a callback may replace
-/// child modules while preserving their checkpoint-visible topology. A failed
-/// optional optimization is logged and reported while the model remains usable
-/// through its unfused path.
+/// A failed optional optimization is logged and reported while the model
+/// remains usable through its unfused path. `BaseLanguageModel` values outside
+/// the inference lifecycle, such as rerankers, require no preparation.
 @discardableResult
-package func prepareInferenceState(in model: Module) -> InferenceStatePreparationReport {
-    let modules = model.modules()
-    var failures: [InferenceStatePreparationFailure] = []
-    for module in modules {
-        guard let preparable = module as? any InferenceStatePreparable else { continue }
-        do {
-            try preparable.prepareForInference()
-        } catch {
-            let moduleType = String(reflecting: type(of: preparable))
-            failures.append(.init(moduleType: moduleType, error: error))
-            inferenceStateLogger.error(
-                "Failed to prepare inference state for \(moduleType): \(String(describing: error))")
-        }
+package func prepareInferenceState(
+    in model: BaseLanguageModel
+) -> InferenceStatePreparationReport {
+    guard let languageModel = model as? any LanguageModel else {
+        return InferenceStatePreparationReport(failures: [])
     }
-    return InferenceStatePreparationReport(failures: failures)
+
+    do {
+        try languageModel.prepareForInference()
+        return InferenceStatePreparationReport(failures: [])
+    } catch {
+        let modelType = String(reflecting: type(of: languageModel))
+        inferenceStateLogger.error(
+            "Failed to prepare inference state for \(modelType): \(String(describing: error))")
+        return InferenceStatePreparationReport(failures: [
+            .init(modelType: modelType, error: error)
+        ])
+    }
 }
 
 /// Prepare derived state and realize a fully loaded model before publication.
@@ -60,7 +51,7 @@ package func prepareInferenceState(in model: Module) -> InferenceStatePreparatio
 /// inference-only optimizations are applied consistently.
 @discardableResult
 package func materializeModelForInference(
-    _ model: Module
+    _ model: BaseLanguageModel
 ) -> InferenceStatePreparationReport {
     let report = prepareInferenceState(in: model)
     eval(model)

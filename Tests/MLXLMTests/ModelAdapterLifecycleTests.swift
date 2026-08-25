@@ -7,9 +7,7 @@ import XCTest
 
 @testable import MLXLMCommon
 
-private final class AdapterLifecycleModel: Module, LanguageModel,
-    InferenceStatePreparable, KVCacheDimensionProvider
-{
+private final class AdapterLifecycleModel: Module, LanguageModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "projection") var projection: Linear
 
     let kvHeads: [Int] = []

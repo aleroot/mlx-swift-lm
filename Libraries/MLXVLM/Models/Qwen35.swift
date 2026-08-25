@@ -447,7 +447,7 @@ enum Qwen35Language {
         }
     }
 
-    final class GatedDeltaNet: Module, InferenceStatePreparable {
+    final class GatedDeltaNet: Module {
         let hiddenSize: Int
         let numVHeads: Int
         let numKHeads: Int
@@ -566,10 +566,6 @@ enum Qwen35Language {
                         "in_proj_a": .value(sourceViews[3]),
                     ]), verify: [])
             }
-        }
-
-        func prepareForInference() throws {
-            _ = try prepareFusedInputProjection()
         }
 
         func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
@@ -1042,6 +1038,14 @@ enum Qwen35Language {
                 return KVCacheSimple()
             }
         }
+
+        func prepareForInference() throws {
+            for layer in model.layers {
+                if let linearAttn = layer.linearAttn {
+                    _ = try linearAttn.prepareFusedInputProjection()
+                }
+            }
+        }
     }
 }
 
@@ -1098,6 +1102,10 @@ public class Qwen35: Module, VLMModel {
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         languageModel.makeCache(capacity: try parameters?.effectiveKVCacheCapacity())
+    }
+
+    public func prepareForInference() throws {
+        try languageModel.prepareForInference()
     }
 
     private func mergeInputIdsWithImageFeatures(

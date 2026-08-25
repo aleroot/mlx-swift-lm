@@ -25,9 +25,10 @@ private final class SidecarDeclaringModel: TwoLayerModel, AdditionalWeightFilesP
 }
 
 private final class PreparedSidecarDeclaringModel: TwoLayerModel,
-    AdditionalWeightFilesProviding, InferenceStatePreparable
+    AdditionalWeightFilesProviding, LanguageModel, KVCacheDimensionProvider
 {
     var additionalWeightFiles: [String] { ["projector.safetensors"] }
+    let kvHeads: [Int] = []
     private(set) var preparationCount = 0
     private(set) var projectorValuesAtPreparation: [Float] = []
 
@@ -35,13 +36,37 @@ private final class PreparedSidecarDeclaringModel: TwoLayerModel,
         preparationCount += 1
         projectorValuesAtPreparation = projector.weight.asArray(Float.self)
     }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        layer(inputs)
+    }
 }
 
-private final class FailingInferenceStateModel: Module, InferenceStatePreparable {
+private final class FailingInferenceStateModel: Module, LanguageModel,
+    KVCacheDimensionProvider
+{
     enum ExpectedFailure: Error { case preparation }
+
+    let kvHeads: [Int] = []
 
     func prepareForInference() throws {
         throw ExpectedFailure.preparation
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        inputs
     }
 }
 
@@ -161,7 +186,7 @@ final class LoadWeightsTests: XCTestCase {
 
         XCTAssertFalse(report.succeeded)
         XCTAssertEqual(report.failures.count, 1)
-        XCTAssertTrue(report.failures[0].moduleType.contains("FailingInferenceStateModel"))
+        XCTAssertTrue(report.failures[0].modelType.contains("FailingInferenceStateModel"))
         XCTAssertTrue(
             report.failures[0].error is FailingInferenceStateModel.ExpectedFailure)
     }
