@@ -1039,7 +1039,7 @@ enum Qwen35Language {
             }
         }
 
-        func prepareForInference() throws {
+        func prepare() throws {
             for layer in model.layers {
                 if let linearAttn = layer.linearAttn {
                     _ = try linearAttn.prepareFusedInputProjection()
@@ -1104,8 +1104,8 @@ public class Qwen35: Module, VLMModel {
         languageModel.makeCache(capacity: try parameters?.effectiveKVCacheCapacity())
     }
 
-    public func prepareForInference() throws {
-        try languageModel.prepareForInference()
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     private func mergeInputIdsWithImageFeatures(

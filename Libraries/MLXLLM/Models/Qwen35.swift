@@ -1180,7 +1180,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
-    public func prepareForInference() throws {
+    public func prepare() throws {
         for layer in model.layers {
             if let linearAttn = layer.linearAttn {
                 _ = try linearAttn.prepareFusedInputProjection()
@@ -1289,8 +1289,8 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         try languageModel.newCache(parameters: parameters)
     }
 
-    public func prepareForInference() throws {
-        try languageModel.prepareForInference()
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

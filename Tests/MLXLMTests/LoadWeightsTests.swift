@@ -32,7 +32,7 @@ private final class PreparedSidecarDeclaringModel: TwoLayerModel,
     private(set) var preparationCount = 0
     private(set) var projectorValuesAtPreparation: [Float] = []
 
-    func prepareForInference() throws {
+    func prepare() throws {
         preparationCount += 1
         projectorValuesAtPreparation = projector.weight.asArray(Float.self)
     }
@@ -55,7 +55,7 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
 
     let kvHeads: [Int] = []
 
-    func prepareForInference() throws {
+    func prepare() throws {
         throw ExpectedFailure.preparation
     }
 

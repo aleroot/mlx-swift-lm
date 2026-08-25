@@ -314,7 +314,7 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     /// Implementations may materialize arrays or replace storage-sharing
     /// module views. The library invokes this lifecycle hook while it has
     /// exclusive access to the model; inference calls must remain read-only.
-    func prepareForInference() throws
+    func prepare() throws
 
     /// Prepare the cache state and consume the ``LMInput``.
     ///
@@ -376,7 +376,7 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 
 extension LanguageModel {
     /// Most language models have no derived inference state to prepare.
-    public func prepareForInference() throws {}
+    public func prepare() throws {}
 
     @available(
         *, deprecated, renamed: "prepare(_:cache:state:prefill:)",

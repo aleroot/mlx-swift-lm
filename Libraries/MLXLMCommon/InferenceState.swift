@@ -33,7 +33,7 @@ package func prepareInferenceState(
     }
 
     do {
-        try languageModel.prepareForInference()
+        try languageModel.prepare()
         return InferenceStatePreparationReport(failures: [])
     } catch {
         let modelType = String(reflecting: type(of: languageModel))

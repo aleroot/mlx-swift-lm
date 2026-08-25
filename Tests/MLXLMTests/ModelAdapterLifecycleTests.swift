@@ -18,7 +18,7 @@ private final class AdapterLifecycleModel: Module, LanguageModel, KVCacheDimensi
         super.init()
     }
 
-    func prepareForInference() throws {
+    func prepare() throws {
         preparationCount += 1
     }
 

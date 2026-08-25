@@ -190,7 +190,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         try quantize(layer)
         XCTAssertFalse(layer.hasFusedInputProjection)
 
-        try model.prepareForInference()
+        try model.prepare()
 
         XCTAssertTrue(layer.hasFusedInputProjection)
     }
