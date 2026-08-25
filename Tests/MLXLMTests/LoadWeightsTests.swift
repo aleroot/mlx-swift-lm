@@ -24,6 +24,27 @@ private final class SidecarDeclaringModel: TwoLayerModel, AdditionalWeightFilesP
     var additionalWeightFiles: [String] { ["projector.safetensors"] }
 }
 
+private final class PreparedSidecarDeclaringModel: TwoLayerModel,
+    AdditionalWeightFilesProviding, InferenceStatePreparable
+{
+    var additionalWeightFiles: [String] { ["projector.safetensors"] }
+    private(set) var preparationCount = 0
+    private(set) var projectorValuesAtPreparation: [Float] = []
+
+    func prepareForInference() throws {
+        preparationCount += 1
+        projectorValuesAtPreparation = projector.weight.asArray(Float.self)
+    }
+}
+
+private final class FailingInferenceStateModel: Module, InferenceStatePreparable {
+    enum ExpectedFailure: Error { case preparation }
+
+    func prepareForInference() throws {
+        throw ExpectedFailure.preparation
+    }
+}
+
 final class LoadWeightsTests: XCTestCase {
 
     // MARK: - Concurrent loading
@@ -133,6 +154,16 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertEqual(weightLoadConcurrency(processorCount: 8), 8)
         XCTAssertEqual(weightLoadConcurrency(processorCount: 14), 14)
         XCTAssertEqual(weightLoadConcurrency(processorCount: 32), 16)
+    }
+
+    func testInferencePreparationFailureIsReportedWithoutEscaping() {
+        let report = prepareInferenceState(in: FailingInferenceStateModel())
+
+        XCTAssertFalse(report.succeeded)
+        XCTAssertEqual(report.failures.count, 1)
+        XCTAssertTrue(report.failures[0].moduleType.contains("FailingInferenceStateModel"))
+        XCTAssertTrue(
+            report.failures[0].error is FailingInferenceStateModel.ExpectedFailure)
     }
 
     // MARK: - Index
@@ -321,6 +352,19 @@ final class LoadWeightsTests: XCTestCase {
         try loadWeights(modelDirectory: directory, model: model)
 
         XCTAssertEqual(model.projector.weight.asArray(Float.self), [1, 2, 3, 4])
+    }
+
+    func testLoadWeightsPreparesInferenceStateAfterInstallingParameters() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try writeSidecarCheckpoint(in: directory)
+
+        let model = PreparedSidecarDeclaringModel()
+        try loadWeights(modelDirectory: directory, model: model)
+
+        XCTAssertEqual(model.preparationCount, 1)
+        XCTAssertEqual(model.projectorValuesAtPreparation, [1, 2, 3, 4])
     }
 
     func testLoadWeightsFailsWhenTheSidecarIsNotDeclared() throws {

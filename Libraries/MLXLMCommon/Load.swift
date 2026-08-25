@@ -358,7 +358,8 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// This function loads model weight `safetensor` files in the given `modelDirectory`,
 /// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
 /// applies optional quantization, and
-/// updates the model with the weights.
+/// updates the model with the weights. Derived inference-only state is prepared after the
+/// checkpoint update and before the model is evaluated and returned to callers.
 ///
 /// The weight files are chosen from `model.safetensors.index.json` when it names files that
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
@@ -402,5 +403,7 @@ public func loadWeights(
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
 
-    eval(model)
+    // Build derived inference-only state and realize the model while the loader
+    // still has exclusive access. Forward passes must remain read-only.
+    materializeModelForInference(model)
 }

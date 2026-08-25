@@ -168,7 +168,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
-final class Qwen35GatedDeltaNet: Module {
+final class Qwen35GatedDeltaNet: Module, InferenceStatePreparable {
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -187,8 +187,7 @@ final class Qwen35GatedDeltaNet: Module {
 
     // Inference-only physical projection. The four registered modules remain
     // as views so checkpoint, adapter, and parameter paths do not change.
-    private var fusedInProj: QuantizedLinear?
-    private var fusedInputProjectionAttempted = false
+    private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
     var fusedInputProjectionEnabled = qwen35FourGDNEnabled
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
@@ -250,71 +249,65 @@ final class Qwen35GatedDeltaNet: Module {
         let replacesInputProjection = parameters.flattened().contains { key, _ in
             inputProjectionPrefixes.contains(where: key.hasPrefix)
         }
-        let result = try super.update(
-            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-        if replacesInputProjection {
-            invalidateFusedInputProjection()
+        defer {
+            // Parameter updates are incremental and can throw after changing an
+            // earlier tensor. Invalidate on both success and failure so a stale
+            // physical projection can never remain published.
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
         }
-        return result
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     override func updateModule(key: String, _ value: Any) throws {
-        try super.updateModule(key: key, value)
-        if key == "in_proj_qkv" || key == "in_proj_z"
+        let replacesInputProjection =
+            key == "in_proj_qkv" || key == "in_proj_z"
             || key == "in_proj_b" || key == "in_proj_a"
-        {
-            invalidateFusedInputProjection()
+        defer {
+            // This is conservative when the setter itself rejects the value,
+            // and necessary when a bulk update changed an earlier key first.
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
         }
+        try super.updateModule(key: key, value)
     }
 
-    private func invalidateFusedInputProjection() {
-        fusedInProj = nil
-        fusedInputProjectionAttempted = false
-    }
-
-    var hasFusedInputProjection: Bool { fusedInProj != nil }
+    var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
 
     /// Build one physical quantized projection while retaining the four named
     /// module paths as storage-sharing views. This runs at most once between
     /// parameter/module updates; failed eligibility checks are not repeated on
-    /// every token.
+    /// every token. The model loader calls this before publishing the model;
+    /// forward passes never invoke it.
     @discardableResult
-    func prepareFusedInputProjection() -> Bool {
-        guard fusedInputProjectionEnabled else { return false }
-        if fusedInProj != nil { return true }
-        guard !fusedInputProjectionAttempted else { return false }
-        fusedInputProjectionAttempted = true
-
-        guard
-            let projection = fuseQuantizedLinearProjections([
+    func prepareFusedInputProjection() throws -> Bool {
+        try fusedInputProjection.prepare(
+            enabled: fusedInputProjectionEnabled,
+            linears: [
                 inProjQKV, inProjZ, inProjB, inProjA,
-            ])
-        else {
-            return false
-        }
-        guard projection.sourceViews.count == 4,
-            (try? update(
+            ]
+        ) { sourceViews in
+            try update(
                 modules: ModuleChildren(values: [
-                    "in_proj_qkv": .value(projection.sourceViews[0]),
-                    "in_proj_z": .value(projection.sourceViews[1]),
-                    "in_proj_b": .value(projection.sourceViews[2]),
-                    "in_proj_a": .value(projection.sourceViews[3]),
-                ]), verify: [])) != nil
-        else {
-            return false
+                    "in_proj_qkv": .value(sourceViews[0]),
+                    "in_proj_z": .value(sourceViews[1]),
+                    "in_proj_b": .value(sourceViews[2]),
+                    "in_proj_a": .value(sourceViews[3]),
+                ]), verify: [])
         }
+    }
 
-        // updateModule invalidates while the views are installed. Publish the
-        // fused projection only after the stable source topology is in place.
-        fusedInputProjectionAttempted = true
-        fusedInProj = projection.fused
-        return true
+    func prepareForInference() throws {
+        _ = try prepareFusedInputProjection()
     }
 
     func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
-        guard prepareFusedInputProjection(), let fusedInProj else {
+        guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),

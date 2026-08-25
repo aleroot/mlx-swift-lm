@@ -9,6 +9,15 @@ import XCTest
 @testable import MLXLLM
 @testable import MLXVLM
 
+private final class Qwen35GDNTestWrapper: Module {
+    @ModuleInfo(key: "gdn") var gdn: Qwen35GatedDeltaNet
+
+    init(_ gdn: Qwen35GatedDeltaNet) {
+        _gdn.wrappedValue = gdn
+        super.init()
+    }
+}
+
 final class Qwen35FusedGDNProjectionTests: XCTestCase {
 
     private let configurationJSON = """
@@ -98,6 +107,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
             eval(reference.qkv, reference.z, reference.b, reference.a)
 
             layer.fusedInputProjectionEnabled = true
+            XCTAssertTrue(try layer.prepareFusedInputProjection())
             let fused = layer.projectInputs(input, batch: batch, sequence: sequence)
             eval(fused.qkv, fused.z, fused.b, fused.a)
 
@@ -119,6 +129,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         eval(reference)
 
         layer.fusedInputProjectionEnabled = true
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
         let fused = layer(input)
         eval(fused)
 
@@ -136,6 +147,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         eval(reference.qkv, reference.z, reference.b, reference.a)
 
         layer.fusedInputProjectionEnabled = true
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
         let fused = layer.projectInputs(input, batch: 1, sequence: 7)
         eval(fused.qkv, fused.z, fused.b, fused.a)
 
@@ -144,6 +156,50 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         assertBitIdentical(fused.z, reference.z, "VLM z")
         assertBitIdentical(fused.b, reference.b, "VLM b")
         assertBitIdentical(fused.a, reference.a, "VLM a")
+    }
+
+    func testForwardDoesNotMutateOrLazilyPrepareFusion() throws {
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        let modulesBefore = [
+            ObjectIdentifier(layer.inProjQKV),
+            ObjectIdentifier(layer.inProjZ),
+            ObjectIdentifier(layer.inProjB),
+            ObjectIdentifier(layer.inProjA),
+        ]
+
+        let output = layer(MLXRandom.normal([1, 3, 64]).asType(.bfloat16))
+        eval(output)
+
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertEqual(
+            modulesBefore,
+            [
+                ObjectIdentifier(layer.inProjQKV),
+                ObjectIdentifier(layer.inProjZ),
+                ObjectIdentifier(layer.inProjB),
+                ObjectIdentifier(layer.inProjA),
+            ])
+    }
+
+    func testVLMForwardDoesNotLazilyPrepareFusion() throws {
+        let layer = Qwen35Language.GatedDeltaNet(try vlmConfiguration())
+        try quantize(layer)
+
+        let output = layer(MLXRandom.normal([1, 3, 64]).asType(.bfloat16))
+        eval(output)
+
+        XCTAssertFalse(layer.hasFusedInputProjection)
+    }
+
+    func testLoadTimePreparationWalksNestedModules() throws {
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        XCTAssertFalse(layer.hasFusedInputProjection)
+
+        prepareInferenceState(in: Qwen35GDNTestWrapper(layer))
+
+        XCTAssertTrue(layer.hasFusedInputProjection)
     }
 
     func testIncompatibleProjectionPoliciesFallBack() throws {
@@ -160,7 +216,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
                     QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
             ]), verify: [])
 
-        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(try layer.prepareFusedInputProjection())
         XCTAssertFalse(layer.hasFusedInputProjection)
     }
 
@@ -172,7 +228,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         try layer.update(
             modules: ModuleChildren(values: ["in_proj_qkv": .value(adapted)]), verify: [])
 
-        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(try layer.prepareFusedInputProjection())
         XCTAssertFalse(layer.hasFusedInputProjection)
         XCTAssertTrue(layer.inProjQKV is QLoRALinear)
     }
@@ -182,7 +238,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
         try quantize(layer)
         let keysBefore = Set(layer.parameters().flattened().map(\.0))
 
-        XCTAssertTrue(layer.prepareFusedInputProjection())
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
 
         let keysAfter = Set(layer.parameters().flattened().map(\.0))
         XCTAssertEqual(keysAfter, keysBefore)
@@ -196,7 +252,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
     func testParameterAndModuleUpdatesInvalidateFusion() throws {
         let layer = Qwen35GatedDeltaNet(try llmConfiguration())
         try quantize(layer)
-        XCTAssertTrue(layer.prepareFusedInputProjection())
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
 
         let replacement =
             layer.inProjQKV.weight
@@ -207,14 +263,113 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
                 "in_proj_qkv.weight": replacement
             ]), verify: [])
         XCTAssertFalse(layer.hasFusedInputProjection)
-        XCTAssertTrue(layer.prepareFusedInputProjection())
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
 
         let adapted = try XCTUnwrap(
             LoRALinear.from(linear: layer.inProjQKV, rank: 4, scale: 1) as? Linear)
         try layer.update(
             modules: ModuleChildren(values: ["in_proj_qkv": .value(adapted)]), verify: [])
         XCTAssertFalse(layer.hasFusedInputProjection)
-        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(try layer.prepareFusedInputProjection())
+    }
+
+    func testThrowingParameterUpdateInvalidatesPublishedFusion() throws {
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
+
+        let replacement =
+            layer.inProjQKV.weight
+            + MLXArray.zeros(
+                layer.inProjQKV.weight.shape, dtype: layer.inProjQKV.weight.dtype)
+        XCTAssertThrowsError(
+            try layer.update(
+                parameters: ModuleParameters.unflattened([
+                    "in_proj_qkv.weight": replacement,
+                    "unknown.weight": MLXArray.zeros([1]),
+                ]), verify: .noUnusedKeys))
+
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
+    }
+
+    func testRejectedModuleUpdateInvalidatesPublishedFusion() throws {
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
+
+        XCTAssertThrowsError(
+            try layer.updateModule(
+                key: "in_proj_qkv",
+                Conv1d(inputChannels: 1, outputChannels: 1, kernelSize: 1)))
+
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertTrue(try layer.prepareFusedInputProjection())
+    }
+
+    func testFailedPreparationDoesNotRetryUntilInvalidated() throws {
+        enum ExpectedFailure: Error { case install }
+
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        let linears = [layer.inProjQKV, layer.inProjZ, layer.inProjB, layer.inProjA]
+        let cache = FusedQuantizedLinearProjectionCache()
+        var installAttempts = 0
+        var installedModules: [[Linear]] = []
+
+        XCTAssertThrowsError(
+            try cache.prepare(enabled: true, linears: linears) { modules in
+                installAttempts += 1
+                installedModules.append(modules)
+                if installAttempts == 1 {
+                    throw ExpectedFailure.install
+                }
+            }
+        ) { error in
+            let preparationError = error as? FusedQuantizedLinearPreparationError
+            XCTAssertNotNil(preparationError)
+            XCTAssertNil(preparationError?.rollbackError)
+        }
+        XCTAssertEqual(installAttempts, 2, "the second installation restores the originals")
+        XCTAssertEqual(
+            installedModules[1].map(ObjectIdentifier.init),
+            linears.map(ObjectIdentifier.init))
+
+        XCTAssertFalse(
+            try cache.prepare(enabled: true, linears: linears) { _ in
+                installAttempts += 1
+            })
+        XCTAssertEqual(installAttempts, 2)
+
+        cache.invalidate()
+        XCTAssertTrue(
+            try cache.prepare(enabled: true, linears: linears) { _ in
+                installAttempts += 1
+            })
+        XCTAssertEqual(installAttempts, 3)
+    }
+
+    func testRollbackFailureIsIncludedInPreparationError() throws {
+        enum ExpectedFailure: Error { case install, rollback }
+
+        let layer = Qwen35GatedDeltaNet(try llmConfiguration())
+        try quantize(layer)
+        let linears = [layer.inProjQKV, layer.inProjZ, layer.inProjB, layer.inProjA]
+        let cache = FusedQuantizedLinearProjectionCache()
+        var installAttempts = 0
+
+        XCTAssertThrowsError(
+            try cache.prepare(enabled: true, linears: linears) { _ in
+                installAttempts += 1
+                throw installAttempts == 1
+                    ? ExpectedFailure.install : ExpectedFailure.rollback
+            }
+        ) { error in
+            let preparationError = error as? FusedQuantizedLinearPreparationError
+            XCTAssertNotNil(preparationError?.rollbackError)
+        }
+        XCTAssertEqual(installAttempts, 2)
+        XCTAssertFalse(cache.isPrepared)
     }
 
     /// Opt-in paired benchmark for a local Qwen 3.5 checkpoint.
@@ -252,7 +407,7 @@ final class Qwen35FusedGDNProjectionTests: XCTestCase {
             for layer in layers {
                 layer.fusedInputProjectionEnabled = fused
                 if fused {
-                    XCTAssertTrue(layer.prepareFusedInputProjection())
+                    XCTAssertTrue(try layer.prepareFusedInputProjection())
                 }
             }
             return model

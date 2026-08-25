@@ -21,6 +21,110 @@ package struct FusedQuantizedLinearProjection {
     package let sourceViews: [QuantizedLinear]
 }
 
+/// A fused projection could not replace its source modules atomically.
+///
+/// `rollbackError` is non-nil only when restoring the original source modules
+/// also failed; callers can then surface both failures while retaining the
+/// conservative unfused execution path.
+package struct FusedQuantizedLinearPreparationError: Error, CustomStringConvertible {
+    package let installationError: any Error
+    package let rollbackError: (any Error)?
+
+    package var description: String {
+        if let rollbackError {
+            return "unable to install fused projection views (\(installationError)); "
+                + "restoring the original projections also failed (\(rollbackError))"
+        }
+        return "unable to install fused projection views (\(installationError)); "
+            + "the original projections were restored"
+    }
+}
+
+/// Lifecycle state for a physical projection derived from several registered
+/// quantized linears.
+///
+/// The cache is intentionally not synchronized. Its only mutating operations
+/// run during model loading or an explicit model update, both of which require
+/// exclusive access. Inference only reads ``fused`` after the model has been
+/// published, avoiding a lock in the token-generation hot path.
+package final class FusedQuantizedLinearProjectionCache {
+    private enum State {
+        case unprepared
+        case preparing
+        case ready
+        case ineligible
+    }
+
+    private var state = State.unprepared
+    package private(set) var fused: QuantizedLinear?
+
+    package init() {}
+
+    package var isPrepared: Bool {
+        state == .ready && fused != nil
+    }
+
+    /// Drop derived state after any source-module or source-parameter update.
+    /// Invalidations caused by installing the cache's own storage-sharing views
+    /// are ignored; the preparation transaction publishes `fused` only after
+    /// every view has been installed successfully.
+    package func invalidate() {
+        guard state != .preparing else { return }
+        fused = nil
+        state = .unprepared
+    }
+
+    /// Build and publish the fused projection once for the current source
+    /// topology. A failed or ineligible attempt is terminal until a subsequent
+    /// source update calls ``invalidate()``.
+    @discardableResult
+    package func prepare(
+        enabled: Bool,
+        linears: [Linear],
+        installSourceModules: ([Linear]) throws -> Void
+    ) throws -> Bool {
+        guard enabled else { return false }
+
+        switch state {
+        case .ready:
+            return fused != nil
+        case .preparing, .ineligible:
+            return false
+        case .unprepared:
+            break
+        }
+
+        state = .preparing
+        guard let projection = fuseQuantizedLinearProjections(linears),
+            projection.sourceViews.count == linears.count
+        else {
+            state = .ineligible
+            return false
+        }
+
+        do {
+            try installSourceModules(projection.sourceViews)
+        } catch let installationError {
+            let rollbackError: (any Error)?
+            do {
+                try installSourceModules(linears)
+                rollbackError = nil
+            } catch let error {
+                rollbackError = error
+            }
+            fused = nil
+            state = .ineligible
+            throw FusedQuantizedLinearPreparationError(
+                installationError: installationError,
+                rollbackError: rollbackError)
+        }
+
+        fused = projection.fused
+        state = .ready
+        return true
+    }
+}
+
 /// Coalesce compatible quantized linears along their output dimension.
 ///
 /// This is intentionally stricter than merely casting to `QuantizedLinear`:
