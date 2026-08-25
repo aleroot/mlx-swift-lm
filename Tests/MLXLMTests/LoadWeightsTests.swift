@@ -26,6 +26,20 @@ private final class SidecarDeclaringModel: TwoLayerModel, AdditionalWeightFilesP
 
 final class LoadWeightsTests: XCTestCase {
 
+    // MARK: - Read ahead
+
+    func testReadAheadUsesABoundedLeadWindowForLargeShards() {
+        XCTAssertEqual(
+            safetensorReadAheadByteCount(fileSize: 5_349_771_222),
+            64 * 1024 * 1024)
+    }
+
+    func testReadAheadCoversSmallFilesAndIgnoresEmptyFiles() {
+        XCTAssertEqual(safetensorReadAheadByteCount(fileSize: 4096), 4096)
+        XCTAssertEqual(safetensorReadAheadByteCount(fileSize: 0), 0)
+        XCTAssertEqual(safetensorReadAheadByteCount(fileSize: -1), 0)
+    }
+
     // MARK: - Index
 
     func testIndexSelectsOnlyTheFilesItNames() throws {

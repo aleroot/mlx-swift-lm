@@ -4,6 +4,53 @@ import Foundation
 import MLX
 import MLXNN
 
+#if canImport(Darwin)
+import Darwin
+#endif
+
+// `F_RDADVISE` queues real I/O. Keep at most 128 MiB in flight; larger windows
+// can compete with the reads MLX is about to issue instead of hiding their latency.
+private let maximumPrefetchShardCount = 2
+private let maximumPrefetchBytesPerShard: Int64 = 64 * 1024 * 1024
+
+/// A small lead window overlaps useful I/O with model setup without flooding the
+/// unified buffer cache or competing with MLX's own reads.
+func safetensorReadAheadByteCount(fileSize: Int64) -> Int32 {
+    guard fileSize > 0 else { return 0 }
+    return Int32(Swift.min(fileSize, maximumPrefetchBytesPerShard))
+}
+
+#if canImport(Darwin)
+/// Ask Darwin to asynchronously read the selected safetensors into its unified
+/// buffer cache. Advice is best-effort: an open, stat, or `fcntl` failure leaves
+/// the normal MLX loading path unchanged.
+private func prefetchSafetensorLeadWindows(_ urls: [URL]) {
+    guard !urls.isEmpty else { return }
+
+    let shardCount = Swift.min(urls.count, maximumPrefetchShardCount)
+    DispatchQueue.concurrentPerform(iterations: shardCount) { index in
+        urls[index].withUnsafeFileSystemRepresentation { path in
+            guard let path else { return }
+
+            let descriptor = open(path, O_RDONLY | O_CLOEXEC)
+            guard descriptor >= 0 else { return }
+            defer { close(descriptor) }
+
+            var status = stat()
+            guard fstat(descriptor, &status) == 0 else { return }
+
+            let byteCount = safetensorReadAheadByteCount(fileSize: status.st_size)
+            guard byteCount > 0 else { return }
+
+            var advice = radvisory(ra_offset: 0, ra_count: byteCount)
+            _ = fcntl(descriptor, F_RDADVISE, &advice)
+        }
+    }
+}
+#else
+private func prefetchSafetensorLeadWindows(_: [URL]) {}
+#endif
+
 private struct SafetensorsIndex: Decodable {
     let weightMap: [String: String]
 
@@ -160,11 +207,13 @@ public func loadWeights(
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
-    for url in try safetensorWeightURLs(
+    let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    {
+    prefetchSafetensorLeadWindows(weightURLs)
+
+    for url in weightURLs {
         let (w, m) = try loadArraysAndMetadata(url: url)
         for (key, value) in w {
             weights[key] = value
