@@ -404,3 +404,32 @@ public func loadWeights(
 
     eval(model)
 }
+
+/// Async variant of
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)``.
+///
+/// Loading blocks its thread on file I/O and fans out with `DispatchQueue.concurrentPerform`.
+/// Swift concurrency's cooperative threads must never block, so this overload runs the load
+/// on a global queue and suspends the caller instead. Async callers resolve to this overload;
+/// the synchronous one remains for synchronous code such as model conversion.
+public func loadWeights(
+    modelDirectory: URL, model: BaseLanguageModel,
+    quantization: BaseConfiguration.Quantization? = nil,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
+) async throws {
+    let model = SendableBox(model)
+    try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, any Error>) in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(
+                with: Result {
+                    try loadWeights(
+                        modelDirectory: modelDirectory, model: model.consume(),
+                        quantization: quantization,
+                        perLayerQuantization: perLayerQuantization,
+                        weightFileSelection: weightFileSelection)
+                })
+        }
+    }
+}
