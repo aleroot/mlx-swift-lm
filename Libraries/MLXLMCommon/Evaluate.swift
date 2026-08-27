@@ -1152,6 +1152,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: token)
             y = .init(tokens: token)
             state = result.state
+            // The verify pass only emits tokens *after* `y`, so the
+            // prefill-sampled token must be queued here or the stream would
+            // silently start at the second generated token.
+            pendingTokens.append(token.item(Int.self))
         }
 
         // Prefill draft model, don't call didSample here -- processor tracks main model's accepted sequence only
