@@ -406,7 +406,7 @@ public func loadWeights(
 }
 
 /// Async variant of
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)``.
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7``.
 ///
 /// Loading blocks its thread on file I/O and fans out with `DispatchQueue.concurrentPerform`.
 /// Swift concurrency's cooperative threads must never block, so this overload runs the load
