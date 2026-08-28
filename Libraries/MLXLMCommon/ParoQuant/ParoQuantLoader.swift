@@ -279,6 +279,7 @@ private func patchRotationLayers(
 
     if !updates.isEmpty {
         try model.update(modules: ModuleChildren.unflattened(updates), verify: [.noUnusedKeys])
+        model.invalidateCompiledTraces()
 
         let patchedLeaves = rotationLeafModules(model: model)
         for (path, _) in updates {
