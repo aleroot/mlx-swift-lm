@@ -20,6 +20,10 @@ struct TextToolCallRecoveryTests {
         let text: String
     }
 
+    /// Explicitly marked dialects that the conservative default may promote.
+    /// The markerless `name[ARGS]{...}` rehearsal syntax is deliberately not
+    /// in this list: it carries no protocol marker and is promoted only under
+    /// the permissive policy.
     private static let alternateDialects = [
         Dialect(
             format: .lfm2,
@@ -29,14 +33,13 @@ struct TextToolCallRecoveryTests {
             text: #"[TOOL_CALLS]weather{"city":"Paris"}"#),
         Dialect(
             format: .json,
-            text: #"weather[ARGS]{"city":"Paris"}"#),
-        Dialect(
-            format: .json,
             text: "<function=weather><parameter=city>Paris</parameter></function>"),
         Dialect(
             format: .json,
             text: #"<|tool_call>call:weather{city:<|"|>Paris<|"|>}<tool_call|>"#),
     ]
+
+    private static let markerlessText = #"weather[ARGS]{"city":"Paris"}"#
 
     private func responseText(_ outputs: [ToolCallProcessor.Output]) -> String {
         outputs.compactMap { output in
@@ -75,6 +78,73 @@ struct TextToolCallRecoveryTests {
                 #expect(processor.toolCalls.first?.function.name == "weather")
             }
         }
+    }
+
+    @Test("Markerless rehearsals stay response text under the conservative default")
+    func markerlessStaysTextUnderConservative() {
+        let processor = ToolCallProcessor(format: .json, tools: Self.tools)
+
+        #expect(processor.processChunk(Self.markerlessText) == Self.markerlessText)
+        processor.processEOS()
+
+        #expect(processor.toolCalls.isEmpty)
+        #expect(processor.rejectedToolCalls.isEmpty)
+        #expect(processor.recoveredToolCallCount == 0)
+        #expect(processor.recoveryEvents.isEmpty)
+    }
+
+    @Test("Markerless rehearsals promote only under the permissive policy")
+    func markerlessPromotesUnderPermissive() throws {
+        let processor = ToolCallProcessor(
+            format: .json, tools: Self.tools, recoveryPolicy: .permissive)
+        _ = processor.processChunk(Self.markerlessText)
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(processor.toolCalls.count == 1)
+        #expect(call.function.name == "weather")
+        #expect(call.function.arguments["city"] == .string("Paris"))
+        #expect(processor.recoveryEvents.first?.dialect == .declaredArgs)
+    }
+
+    @Test("Markerless promotion is invariant at every permissive streaming boundary")
+    func markerlessPermissiveStreamingBoundaries() {
+        let characters = Array(Self.markerlessText)
+        for split in 1 ..< characters.count {
+            let processor = ToolCallProcessor(
+                format: .json, tools: Self.tools, recoveryPolicy: .permissive)
+            _ = processor.processChunk(String(characters[..<split]))
+            _ = processor.processChunk(String(characters[split...]))
+
+            #expect(processor.toolCalls.count == 1, "split: \(split)")
+            #expect(processor.toolCalls.first?.function.name == "weather")
+        }
+    }
+
+    @Test("EOS recovery never fabricates a Mistral frame around leading prose")
+    func eosRecoveryDoesNotFabricateLeadingFrame() throws {
+        var scanner = try #require(
+            TextToolCallRecoveryScanner(
+                primaryFormat: .mistral,
+                policy: .conservative,
+                tools: Self.tools,
+                allowedToolNames: ["weather"]))
+
+        // Prose before the first marker must never be re-framed as a call,
+        // even when it happens to parse as `name{json}`.
+        let recovered = scanner.recoverEOSPayloads(
+            #"weather{"city":"Paris"}[TOOL_CALLS]weather{"city":"Rome"}"#)
+        #expect(recovered.count == 1)
+        #expect(recovered.first?.function.name == "weather")
+        #expect(recovered.first?.function.arguments["city"] == .string("Rome"))
+
+        // A marker with no payload yields nothing; the prose is not promoted.
+        var trailing = try #require(
+            TextToolCallRecoveryScanner(
+                primaryFormat: .mistral,
+                policy: .conservative,
+                tools: Self.tools,
+                allowedToolNames: ["weather"]))
+        #expect(trailing.recoverEOSPayloads(#"weather{"city":"Paris"}[TOOL_CALLS]"#).isEmpty)
     }
 
     @Test("Mistral heals the no-ARGS variant at EOS")
@@ -175,7 +245,8 @@ struct TextToolCallRecoveryTests {
 
     @Test("Markerless names require an exact lexical boundary across chunks")
     func markerlessLexicalBoundary() {
-        let processor = ToolCallProcessor(format: .json, tools: Self.tools)
+        let processor = ToolCallProcessor(
+            format: .json, tools: Self.tools, recoveryPolicy: .permissive)
         let first = processor.processChunk("not")
         let second = processor.processChunk(#"weather[ARGS]{"city":"Paris"}"#)
 
@@ -185,7 +256,10 @@ struct TextToolCallRecoveryTests {
 
     @Test("Incomplete recovery buffers are bounded")
     func boundedBuffer() {
-        let processor = ToolCallProcessor(format: .json, tools: Self.tools)
+        // Permissive policy so the post-EOS probe exercises markerless
+        // promotion; the byte limit itself is policy-independent.
+        let processor = ToolCallProcessor(
+            format: .json, tools: Self.tools, recoveryPolicy: .permissive)
         // Combining scalars form very few extended grapheme clusters, so this
         // verifies the limit is a byte limit rather than `String.count`.
         let text =
@@ -263,7 +337,8 @@ struct TextToolCallRecoveryTests {
 
     @Test("Oversized JSON remains fail-closed until EOS")
     func oversizedJSONCannotReenterExecutableContext() {
-        let processor = ToolCallProcessor(format: .lfm2, tools: Self.tools)
+        let processor = ToolCallProcessor(
+            format: .lfm2, tools: Self.tools, recoveryPolicy: .permissive)
         let prefix = "[\"" + String(repeating: "a", count: 65_536)
 
         #expect(processor.processChunk(prefix) == prefix)

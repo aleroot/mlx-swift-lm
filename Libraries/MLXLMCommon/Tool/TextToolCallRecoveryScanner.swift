@@ -6,7 +6,8 @@ import Foundation
 ///
 /// The selected `ToolCallParser` remains authoritative. This scanner only owns
 /// dialect markers that the selected parser cannot consume, plus exact
-/// `declaredTool[ARGS]{...}` rehearsals. It deliberately uses fixed-string
+/// `declaredTool[ARGS]{...}` rehearsals under the permissive policy. It
+/// deliberately uses fixed-string
 /// searches and structural JSON scanning instead of regular expressions or
 /// speculative JSON decoding on ordinary response text.
 ///
@@ -217,7 +218,7 @@ struct TextToolCallRecoveryScanner: Sendable {
                 prefixes.insert(String(signal.text.prefix(length)))
             }
         }
-        if policy != .disabled {
+        if policy == .permissive {
             for name in allowedToolNames {
                 let marker = name + "[ARGS]"
                 for length in 1 ..< marker.count {
@@ -646,8 +647,13 @@ struct TextToolCallRecoveryScanner: Sendable {
     /// heals Mistral's observed `[TOOL_CALLS]name{json}` variant.
     mutating func recoverEOSPayloads(_ raw: String) -> [ToolCall] {
         guard policy != .disabled else { return [] }
-        if raw.contains("[TOOL_CALLS]") {
-            return raw.components(separatedBy: "[TOOL_CALLS]").compactMap { segment in
+        if let firstMarker = raw.range(of: "[TOOL_CALLS]") {
+            // Only text that actually followed a `[TOOL_CALLS]` marker may be
+            // re-framed as a Mistral call. Re-prefixing the prose before the
+            // first marker would fabricate a frame the model never emitted
+            // and could promote plain response text shaped like `name{json}`.
+            let framed = raw[firstMarker.lowerBound...]
+            return framed.components(separatedBy: "[TOOL_CALLS]").compactMap { segment in
                 guard !segment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     return nil
                 }
@@ -699,7 +705,11 @@ struct TextToolCallRecoveryScanner: Sendable {
             }
         }
 
-        guard policy != .disabled else { return earliest }
+        // Markerless `name[ARGS]{...}` rehearsals carry no protocol marker,
+        // so prose that merely mentions a declared call is indistinguishable
+        // from an intended call. Promotion of this dialect is opt-in via the
+        // permissive policy; the conservative default leaves it as text.
+        guard policy == .permissive else { return earliest }
 
         var argsSearchStart = text.startIndex
         while argsSearchStart < text.endIndex,
