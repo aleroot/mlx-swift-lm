@@ -1501,9 +1501,14 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
             messages: messages, tools: input.tools, additionalContext: input.additionalContext)
 
         guard !input.images.isEmpty else {
+            // Deliberately no attention mask: a batch-of-one text prompt has
+            // nothing to pad, the language model never reads `LMInput.text.mask`
+            // (its layer masks are built from the KV caches), and a non-nil mask
+            // makes `ChatSession` treat the turn as non-resumable — vetoing
+            // prompt-cache reuse (`carriesAttentionMask`) and forcing a full
+            // re-prefill of the conversation on every agentic turn.
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: promptArray).asType(.int8)
-            return LMInput(text: .init(tokens: promptArray, mask: mask))
+            return LMInput(text: .init(tokens: promptArray))
         }
 
         let processed = try input.images.map {
