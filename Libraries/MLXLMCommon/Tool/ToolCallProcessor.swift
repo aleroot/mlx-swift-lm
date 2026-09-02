@@ -730,36 +730,12 @@ public class ToolCallProcessor {
             fallthrough
 
         case .potentialToolCall:
-            if partialMatch(buffer: toolCallBuffer, tag: startTag) {
-                if toolCallBuffer.starts(with: startTag) {
-                    state = .collectingToolCall
-                    recordResponse(leadingToken ?? "")
-                    leadingTokenWasRecorded = true
-                    fallthrough
-                } else {
-                    recordResponse(leadingToken ?? "")
-                    leadingTokenWasRecorded = true
-                    return nil
-                }
-            } else {
-                // Otherwise, return the collected text and reset the state.
-                state = .normal
-                let buffer = toolCallBuffer
-                toolCallBuffer = ""
-                if let attempt = protocolMarkerAttempt(in: buffer, startTag: startTag) {
-                    recordResponse(leadingToken ?? "")
-                    appendRejectedToolCall(
-                        reason: .malformedSyntax,
-                        rawText: attempt,
-                        detail: RejectedToolCall.Reason.malformedSyntax.diagnosticDetail)
-                    let remainder = buffer.replacingOccurrences(of: attempt, with: "")
-                    recordResponse(sanitizingProtocol: remainder)
-                    return combine(leadingToken, stripProtocolSpans(from: remainder))
-                }
-                let response = (leadingToken ?? "") + buffer
-                recordResponse(sanitizingProtocol: response)
-                return response
-            }
+            leadingToken = scanTaggedStart(
+                startTag: startTag, startChar: startChar, leadingToken: leadingToken)
+            leadingTokenWasRecorded = true
+            guard toolCallBuffer.hasPrefix(startTag) else { return leadingToken }
+            state = .collectingToolCall
+            fallthrough
 
         case .collectingToolCall:
             if toolCallBuffer.utf8.count > maximumToolCallBufferByteCount {
@@ -769,7 +745,7 @@ public class ToolCallProcessor {
             }
 
             guard let endTag = parser.endTag else {
-                return nil
+                return leadingToken
             }
 
             // `<tool_call>` frames close only after a structurally complete
@@ -843,7 +819,7 @@ public class ToolCallProcessor {
                 return combine(leadingToken, trailingToken.isEmpty ? nil : trailingToken)
             }
 
-            return nil
+            return leadingToken
 
         case .collectingJSONToolCall:
             return processCollectingJSONToolCall(
@@ -855,6 +831,54 @@ public class ToolCallProcessor {
         case .quarantiningOversizedToolCall:
             return nil
         }
+    }
+
+    private func scanTaggedStart(
+        startTag: String, startChar: Character, leadingToken: String?
+    ) -> String? {
+        let buffer = toolCallBuffer
+        var candidate = buffer.startIndex
+        var responseStart = candidate
+        var response = leadingToken ?? ""
+        var rejectedMarker = false
+        recordResponse(response)
+
+        func emitText(until end: String.Index) {
+            let text = String(buffer[responseStart ..< end])
+            recordResponse(sanitizingProtocol: text)
+            response += rejectedMarker ? stripProtocolSpans(from: text) : text
+        }
+
+        // A disproven opener only rules out that candidate, not the remaining chunk.
+        while candidate < buffer.endIndex {
+            let suffix = buffer[candidate...]
+            if suffix.hasPrefix(startTag) || startTag.hasPrefix(suffix) {
+                emitText(until: candidate)
+                toolCallBuffer = String(suffix)
+                return response.isEmpty ? nil : response
+            }
+
+            let next =
+                buffer[buffer.index(after: candidate)...].firstIndex(of: startChar)
+                ?? buffer.endIndex
+            if let attempt = protocolMarkerAttempt(
+                in: String(buffer[candidate ..< next]), startTag: startTag)
+            {
+                emitText(until: candidate)
+                appendRejectedToolCall(
+                    reason: .malformedSyntax,
+                    rawText: attempt,
+                    detail: RejectedToolCall.Reason.malformedSyntax.diagnosticDetail)
+                rejectedMarker = true
+                responseStart = buffer.index(candidate, offsetBy: attempt.count)
+            }
+            candidate = next
+        }
+
+        emitText(until: buffer.endIndex)
+        toolCallBuffer = ""
+        state = .normal
+        return response.isEmpty ? nil : response
     }
 
     private func processCollectingJSONToolCall(
