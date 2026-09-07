@@ -187,6 +187,16 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
         projectLogits(hiddenStates(inputs, cache: cache))
     }
 
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        var hidden = hiddenStates(input.tokens, cache: cache)
+        if lmHead == nil {
+            hidden = quantizedVocabularyProjectionInput(hidden, projection: model.embedTokens)
+        }
+        return .init(logits: projectLogits(hidden))
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
