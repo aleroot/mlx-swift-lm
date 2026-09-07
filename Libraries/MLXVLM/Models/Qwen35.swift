@@ -920,7 +920,8 @@ public enum Qwen35Language {
             positionIds providedPositionIds: MLXArray? = nil,
             pixelValues: MLXArray? = nil,
             imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
+            videoGridTHW: [THW]? = nil,
+            lastTokenOnly: Bool = false
         ) -> LMOutput {
             var state = state ?? .init()
 
@@ -1007,7 +1008,11 @@ public enum Qwen35Language {
             )
             let hiddenStates = emitDrafterState ? model.norm(preNormHidden) : preNormHidden
 
-            var out = hiddenStates
+            let projection: Module = lmHead ?? model.embedTokens
+            var out =
+                lastTokenOnly && !emitDrafterState
+                ? quantizedVocabularyProjectionInput(hiddenStates, projection: projection)
+                : hiddenStates
             if let lmHead {
                 out = lmHead(out)
             } else {
@@ -1264,7 +1269,8 @@ public class Qwen35: Module, VLMModel {
                 positionIds: nil,
                 pixelValues: pixelValues,
                 imageGridTHW: imageFrames,
-                videoGridTHW: videoFrames
+                videoGridTHW: videoFrames,
+                lastTokenOnly: true
             )
         }
 
