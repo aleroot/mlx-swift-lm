@@ -568,10 +568,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
-    /// Whether the buffer is in ring layout: rows at `idx...` chronologically precede
-    /// rows at `keep ..< idx`. `nil` only after restoring a legacy metaState, where the
-    /// layout is derived on demand: of the states legacy code could save, exactly the
-    /// wrapped ring has a mid-buffer write position with more history than rows behind it.
+    /// In ring layout all rows are live, with `idx...` preceding `keep ..< idx`.
+    /// At the end of the buffer the ring is already in temporal order. Otherwise,
+    /// temporal layout holds only the first `idx` rows, even when `offset` is larger.
+    /// `nil` defers legacy inference until arrays and metadata have both been restored.
+    /// Every write or trim resolves it before changing either buffers or counters.
     private var wrappedFlag: Bool? = false
 
     private var wrapped: Bool {
@@ -772,6 +773,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        wrappedFlag = wrapped
         let result =
             if keys.dim(2) == 1 {
                 updateInPlace(keys: keys, values: values)
@@ -849,7 +851,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 }
                 self.wrappedFlag = wrappedValue
             } else {
-                // Legacy metaState: derive the layout lazily via `wrapped`.
+                // Either setter may run first. Defer inference until the restored
+                // arrays are available, then freeze the layout before any mutation.
                 self.wrappedFlag = nil
             }
         }
@@ -876,26 +879,30 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// of the window cannot come back, so the window is up to `n` rows short until
     /// it refills. Callers that need an exact rewind must gate on
     /// ``isTrimmable(after:)`` instead of calling this unconditionally.
+    /// Once older rows have been evicted, trimming stops at the pinned `keep` prefix.
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        guard n > 0 else { return 0 }
-        if wrapped, let keys = self.keys, let values = self.values {
-            // Ring layout: linearize to temporal order, then cut the newest rows.
-            // The pinned `keep` prefix is never evictable, so it bounds the cut.
-            let live = keys.dim(2)
-            let trimmed = Swift.min(n, live - keep)
-            guard trimmed > 0 else { return 0 }
-            let bound = live - trimmed
+        guard n > 0, let keys, let values else { return 0 }
+        wrappedFlag = wrapped
+        let live = wrapped ? keys.dim(2) : idx
+        // A gap between history and live rows means eviction has occurred. Preserve
+        // the pinned prefix regardless of layout, including after repeated trims.
+        // Without a gap, an exact rewind can still remove any of the original rows.
+        let minimum = offset > live ? Swift.min(keep, live) : 0
+        let trimmed = Swift.min(n, live - minimum)
+        guard trimmed > 0 else { return 0 }
+        let bound = live - trimmed
+
+        if wrapped || keys.dim(2) > maxCacheSize {
+            // Linearize a ring before cutting its newest rows. Also shrink oversized
+            // prefill buffers: the next single-token write compacts those buffers to
+            // maxCacheSize and must not treat a discarded suffix as live history.
             self.keys = temporalOrder(keys)[.ellipsis, ..<bound, 0...]
             self.values = temporalOrder(values)[.ellipsis, ..<bound, 0...]
-            idx = bound
-            offset -= trimmed
-            wrappedFlag = false
-            return trimmed
         }
-        let trimmed = Swift.min(Swift.min(offset, idx), n)
+        idx = bound
         offset -= trimmed
-        idx -= trimmed
+        wrappedFlag = false
         return trimmed
     }
 

@@ -2195,6 +2195,259 @@ private func fillOneAtATime(_ cache: RotatingKVCache, positions: Range<Int>) {
     #expect(encodedPositions(trimmedView.0) == Array(12 ..< 17))
 }
 
+@Test(arguments: [5, 6, 7])
+func testRotatingRestoredTrimAtRingBoundary(metadataCount: Int) throws {
+    let source = RotatingKVCache(maxSize: 8)
+    fillOneAtATime(source, positions: 0 ..< 16)
+
+    let restored = RotatingKVCache(maxSize: 8)
+    restored.state = source.state.map { $0[.ellipsis] }
+    restored.metaState = Array(source.metaState.prefix(metadataCount))
+
+    #expect(restored.trim(3) == 3)
+    #expect(restored.offset == 13)
+    let view = try #require(restored.logicalView(tail: 8))
+    #expect(encodedPositions(view.0) == Array(8 ..< 13))
+    #expect(encodedPositions(view.1) == Array(8 ..< 13).map { -$0 })
+    #expect(restored.state.allSatisfy { $0.dim(2) == 5 })
+}
+
+@Test(arguments: [5, 6, 7])
+func testRotatingRestoredTrimKeepsKeysAndValuesAligned(metadataCount: Int) throws {
+    let source = RotatingKVCache(maxSize: 8)
+    fillOneAtATime(source, positions: 0 ..< 20)
+
+    let restored = RotatingKVCache(maxSize: 8)
+    restored.state = source.state.map { $0[.ellipsis] }
+    restored.metaState = Array(source.metaState.prefix(metadataCount))
+
+    // The shortened key buffer ends before the old write index. Its new shape
+    // must not change how the value buffer is ordered during the same trim.
+    #expect(restored.trim(5) == 5)
+    #expect(restored.offset == 15)
+    let view = try #require(restored.logicalView(tail: 8))
+    #expect(encodedPositions(view.0) == Array(12 ..< 15))
+    #expect(encodedPositions(view.1) == Array(12 ..< 15).map { -$0 })
+}
+
+private func expectRotatingContents(
+    _ cache: RotatingKVCache, _ positions: [Int],
+    sourceLocation: SourceLocation = #_sourceLocation
+) throws {
+    let view = try #require(cache.logicalView(tail: Int.max), sourceLocation: sourceLocation)
+    #expect(view.0.dim(2) == positions.count, sourceLocation: sourceLocation)
+    #expect(view.1.dim(2) == positions.count, sourceLocation: sourceLocation)
+    #expect(
+        cache.state.allSatisfy { $0.dim(2) == positions.count }, sourceLocation: sourceLocation)
+    // Empty MLX arrays need no host readback.
+    if !positions.isEmpty {
+        #expect(encodedPositions(view.0) == positions, sourceLocation: sourceLocation)
+        #expect(encodedPositions(view.1) == positions.map { -$0 }, sourceLocation: sourceLocation)
+    }
+}
+
+@Test(arguments: [5, 6, 7], [false, true])
+func testRotatingRestorationAcceptsEitherSetterOrder(
+    metadataCount: Int, metadataFirst: Bool
+) throws {
+    for count in [3, 8, 9, 16, 20] {
+        for prefill in [false, true] {
+            let source = RotatingKVCache(maxSize: 8, step: 4)
+            if prefill {
+                let (k, v) = positionedKV(0 ..< count)
+                _ = source.update(keys: k, values: v)
+            } else {
+                fillOneAtATime(source, positions: 0 ..< count)
+            }
+            let metadata = Array(source.metaState.prefix(metadataCount))
+            let arrays = source.state.map { $0[.ellipsis] }
+            // The saved capacity must replace the constructor's capacity before inference.
+            let restored = RotatingKVCache(maxSize: 1)
+            if metadataFirst {
+                restored.metaState = metadata
+                restored.state = arrays
+            } else {
+                restored.state = arrays
+                restored.metaState = metadata
+            }
+
+            let start = prefill ? 0 : max(0, count - 8)
+            try expectRotatingContents(restored, Array(start ..< count))
+            #expect(restored.trim(2) == 2)
+            #expect(restored.offset == count - 2)
+            try expectRotatingContents(restored, Array(start ..< (count - 2)))
+        }
+    }
+}
+
+@Test(arguments: [5, 6, 7], [false, true])
+func testRotatingRestoredShortChronologicalBufferCanGrow(
+    metadataCount: Int, metadataFirst: Bool
+) throws {
+    let source = RotatingKVCache(maxSize: 8)
+    fillOneAtATime(source, positions: 0 ..< 20)
+    // Legacy updateConcat could leave maxSize - 1 chronological rows when given
+    // an empty append. idx < maxSize && offset > idx cannot identify its layout.
+    let empty = positionedKV(20 ..< 20)
+    _ = source.update(keys: empty.0, values: empty.1)
+    try expectRotatingContents(source, Array(13 ..< 20))
+
+    let restored = RotatingKVCache(maxSize: 8)
+    let metadata = Array(source.metaState.prefix(metadataCount))
+    let arrays = source.state.map { $0[.ellipsis] }
+    if metadataFirst {
+        restored.metaState = metadata
+        restored.state = arrays
+    } else {
+        restored.state = arrays
+        restored.metaState = metadata
+    }
+    #expect(restored.metaState.last == "false")
+    fillOneAtATime(restored, positions: 20 ..< 21)
+    try expectRotatingContents(restored, Array(13 ..< 21))
+    #expect(restored.trim(3) == 3)
+    try expectRotatingContents(restored, Array(13 ..< 18))
+}
+
+@Test(arguments: [5, 6, 7], [13, 14, 20])
+func testRotatingRestoredTrimPreservesPinnedPrefix(metadataCount: Int, count: Int) throws {
+    let source = RotatingKVCache(maxSize: 8, keep: 2)
+    fillOneAtATime(source, positions: 0 ..< count)
+
+    for firstTrim in [3, 100] {
+        let restored = RotatingKVCache(maxSize: 8)
+        restored.state = source.state.map { $0[.ellipsis] }
+        restored.metaState = Array(source.metaState.prefix(metadataCount))
+        let removed = min(firstTrim, 6)
+        #expect(restored.trim(firstTrim) == removed)
+        try expectRotatingContents(
+            restored, [0, 1] + Array((count - 6) ..< (count - removed)))
+        // The second trim operates on temporal storage, even if the first used a ring.
+        #expect(restored.trim(100) == 6 - removed)
+        #expect(restored.trim(1) == 0)
+        #expect(restored.offset == count - 6)
+        try expectRotatingContents(restored, [0, 1])
+
+        let next = restored.offset
+        fillOneAtATime(restored, positions: next ..< (next + 8))
+        try expectRotatingContents(restored, [0, 1] + Array((next + 2) ..< (next + 8)))
+    }
+    try expectRotatingContents(source, [0, 1] + Array((count - 6) ..< count))
+}
+
+@Test(arguments: [1, 2, 5, 8])
+func testRotatingTrimBeforeEvictionCanRewindThroughPrefix(count: Int) throws {
+    let cache = RotatingKVCache(maxSize: 8, keep: 2)
+    fillOneAtATime(cache, positions: 0 ..< count)
+    let metadata = cache.metaState
+    #expect(cache.trim(0) == 0)
+    #expect(cache.trim(-1) == 0)
+    #expect(cache.metaState == metadata)
+    #expect(cache.trim(100) == count)
+    #expect(cache.offset == 0)
+    try expectRotatingContents(cache, [])
+    fillOneAtATime(cache, positions: 0 ..< 3)
+    try expectRotatingContents(cache, [0, 1, 2])
+}
+
+@Test(arguments: [0, 2], [1, 3])
+func testRotatingTrimOversizedPrefillThenResume(keep: Int, nextCount: Int) throws {
+    let cache = RotatingKVCache(maxSize: 8, keep: keep, step: 4)
+    fillOneAtATime(cache, positions: 0 ..< 20)
+    let (k, v) = positionedKV(20 ..< 23)
+    _ = cache.update(keys: k, values: v)  // ten chronological rows
+    #expect(cache.trim(5) == 5)
+    #expect(cache.offset == 18)
+    let prefix = Array(0 ..< keep)
+    try expectRotatingContents(cache, prefix + Array((13 + keep) ..< 18))
+
+    let mask = cache.makeMask(n: nextCount, windowSize: 8, returnArray: true)
+    let next = positionedKV(18 ..< (18 + nextCount))
+    let presented = cache.update(keys: next.0, values: next.1)
+    let expected = prefix + Array((13 + keep) ..< (18 + nextCount))
+    #expect(encodedPositions(presented.0) == expected)
+    #expect(encodedPositions(presented.1) == expected.map { -$0 })
+    if case .array(let array) = mask {
+        #expect(array.dim(-1) == presented.0.dim(2))
+    }
+    fillOneAtATime(cache, positions: (18 + nextCount) ..< 30)
+    try expectRotatingContents(cache, prefix + Array((22 + keep) ..< 30))
+}
+
+@Test(arguments: [5, 6, 7])
+func testRotatingTrimSurvivesPromptCachePersistenceAndCopy(metadataCount: Int) throws {
+    let source = RotatingKVCache(maxSize: 8)
+    fillOneAtATime(source, positions: 0 ..< 16)
+    let url = tempURL()
+    let legacyURL = tempURL()
+    let roundTripURL = tempURL()
+    defer {
+        for file in [url, legacyURL, roundTripURL] {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+    try savePromptCache(url: url, cache: [source])
+    // Exercise the real file loader with each historical metadata format.
+    let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    var metadata = savedMetadata
+    for index in metadataCount ..< 7 {
+        metadata.removeValue(forKey: "0.0.\(index)")
+    }
+    // MLX loads lazily, so keep the source files intact while their arrays are live.
+    try save(arrays: arrays, metadata: metadata, url: legacyURL)
+    let (loaded, _) = try loadPromptCache(url: legacyURL)
+    let restored = try #require(loaded.first as? RotatingKVCache)
+    #expect(restored.trim(3) == 3)
+    try expectRotatingContents(restored, Array(8 ..< 13))
+
+    // A post-trim cache has more history than live rows; its explicit false flag
+    // must survive serialization instead of being inferred from those counters.
+    try savePromptCache(url: roundTripURL, cache: [restored])
+    let (reloaded, _) = try loadPromptCache(url: roundTripURL)
+    let roundTrip = try #require(reloaded.first as? RotatingKVCache)
+    let copied = try #require(roundTrip.copy() as? RotatingKVCache)
+    #expect(copied.trim(2) == 2)
+    fillOneAtATime(copied, positions: 11 ..< 20)
+    try expectRotatingContents(copied, Array(12 ..< 20))
+    try expectRotatingContents(roundTrip, Array(8 ..< 13))
+    try expectRotatingContents(restored, Array(8 ..< 13))
+    try expectRotatingContents(source, Array(8 ..< 16))
+    #expect(roundTrip.offset == 13)
+    #expect(source.offset == 16)
+}
+
+@Test(arguments: [5, 6, 7], [1, 3])
+func testRotatingRestoredTrimAttentionMatchesSurvivingContext(
+    metadataCount: Int, queryCount: Int
+) throws {
+    let keys = deterministicTensor(shape: [1, 2, 20, 4], salt: 1).asType(.float32)
+    let values = deterministicTensor(shape: [1, 2, 20, 4], salt: 2).asType(.float32)
+    let queries = deterministicTensor(shape: [1, 2, queryCount, 4], salt: 3).asType(.float32)
+    let source = RotatingKVCache(maxSize: 8)
+    for p in 0 ..< 20 {
+        _ = source.update(
+            keys: keys[.ellipsis, p ..< (p + 1), 0...],
+            values: values[.ellipsis, p ..< (p + 1), 0...])
+    }
+    let restored = RotatingKVCache(maxSize: 8)
+    restored.state = source.state.map { $0[.ellipsis] }
+    restored.metaState = Array(source.metaState.prefix(metadataCount))
+    #expect(restored.trim(5) == 5)  // only positions 12, 13, 14 survive
+    let mask = restored.makeMask(n: queryCount, windowSize: 4, returnArray: false)
+    let (cachedKeys, cachedValues) = restored.update(
+        keys: keys[.ellipsis, 15 ..< (15 + queryCount), 0...],
+        values: values[.ellipsis, 15 ..< (15 + queryCount), 0...])
+    let output = MLXFast.scaledDotProductAttention(
+        queries: queries, keys: cachedKeys, values: cachedValues, scale: 0.5, mask: mask)
+    let reference = MLXFast.scaledDotProductAttention(
+        queries: queries,
+        keys: keys[.ellipsis, 12 ..< (15 + queryCount), 0...],
+        values: values[.ellipsis, 12 ..< (15 + queryCount), 0...],
+        scale: 0.5,
+        mask: .array(createCausalMask(n: queryCount, offset: 3, windowSize: 4)))
+    #expect(allClose(output, reference, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+}
+
 @Test func testRotatingSingleTokenMaskAfterWrapTrimMatchesEquivalentFreshCache() throws {
     // After a wrapped trim the cache holds 5 live rows; the sliding-window mask for
     // the next single-token step must match a fresh cache holding the same rows.
