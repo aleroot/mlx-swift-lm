@@ -23,6 +23,22 @@ public struct LoRAModelMetadata: Sendable, Equatable {
     }
 }
 
+extension ModelTypeRegistry where T == any LanguageModel {
+    /// Inspects the registered model's LoRA layers without loading checkpoint weights.
+    ///
+    /// Model construction and metadata access use an independent random state.
+    /// Returns `nil` if the model does not conform to ``LoRAModel``.
+    public func loraMetadata(configurationData: Data) throws -> LoRAModelMetadata? {
+        try withRandomState(MLXRandom.RandomState(seed: 0)) {
+            let configuration = try JSONDecoder.json5().decode(
+                BaseConfiguration.self, from: configurationData)
+            let model = try createModel(
+                configuration: configurationData, modelType: configuration.modelType)
+            return (model as? LoRAModel)?.loraMetadata
+        }
+    }
+}
+
 public protocol LoRAModel {
 
     /// Return the layers to apply LoRA adapters to.

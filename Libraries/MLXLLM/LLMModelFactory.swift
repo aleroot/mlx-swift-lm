@@ -663,11 +663,7 @@ public final class LLMModelFactory: GenericModelFactory {
     /// The registered model architecture is instantiated so custom `LoRAModel.loraDefaultKeys`
     /// implementations remain authoritative. No checkpoint files are read.
     public func loraMetadata(configurationData: Data) async throws -> LoRAModelMetadata? {
-        let baseConfiguration = try JSONDecoder.json5().decode(
-            BaseConfiguration.self, from: configurationData)
-        let model = try await typeRegistry.createModel(
-            configuration: configurationData, modelType: baseConfiguration.modelType)
-        return (model as? LoRAModel)?.loraMetadata
+        try await typeRegistry.loraMetadata(configurationData: configurationData)
     }
 
     public func _load(
