@@ -29,15 +29,15 @@ package struct HarmonyOutputRouter {
     /// tools were offered for this generation, so no tool calls are accepted.
     private let allowedToolNames: Set<String>?
     private var hasEmittedToolCall = false
-    private var reasoningDetokenizer: NaiveStreamingDetokenizer
-    private var responseDetokenizer: NaiveStreamingDetokenizer
+    private var reasoningDetokenizer: any StreamingDetokenizer
+    private var responseDetokenizer: any StreamingDetokenizer
     private let tokenizer: any Tokenizer
 
     package init(tokenizer: any Tokenizer, allowedToolNames: Set<String>?) {
         self.tokenizer = tokenizer
         self.allowedToolNames = allowedToolNames
-        self.reasoningDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        self.responseDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        self.reasoningDetokenizer = tokenizer.makeStreamingDetokenizer()
+        self.responseDetokenizer = tokenizer.makeStreamingDetokenizer()
     }
 
     /// Routes one parse step. `final` payloads and recipient-less `commentary`
@@ -65,24 +65,29 @@ package struct HarmonyOutputRouter {
 
         case .closed(let frame):
             if frame.header.channel == .analysis {
-                reasoningDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-                return []
+                let text = reasoningDetokenizer.finish()
+                reasoningDetokenizer = tokenizer.makeStreamingDetokenizer()
+                return text.map { [.reasoning($0)] } ?? []
             }
             // Reset the response detokenizer between frames so a later final
             // frame starts clean after a tool turn.
             if isPublicResponse(frame.header) {
-                responseDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-                return []
+                let text = responseDetokenizer.finish()
+                responseDetokenizer = tokenizer.makeStreamingDetokenizer()
+                return text.map { [.response($0)] } ?? []
             }
             return routeClosedFrame(frame)
         }
     }
 
-    /// Flushes any open response detokenizer state. Currently a no-op because
-    /// public payload tokens are already streamed; kept for symmetry with the
-    /// parser's ``HarmonyFrameParser/finish()``.
+    /// Flushes any text held by the open frame's decoder.
     package mutating func finish() -> [Event] {
-        []
+        var events: [Event] = []
+        if let text = reasoningDetokenizer.finish(), !text.isEmpty {
+            events.append(.reasoning(text))
+        }
+        if let text = responseDetokenizer.finish(), !text.isEmpty { events.append(.response(text)) }
+        return events
     }
 
     // MARK: - Frame → tool call
