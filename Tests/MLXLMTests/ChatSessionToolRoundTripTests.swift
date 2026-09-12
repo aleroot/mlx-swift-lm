@@ -236,11 +236,11 @@ public class ChatSessionToolRoundTripTests: XCTestCase {
             let context = Self.makeContext(
                 tokenizer: ScriptedToolCallTokenizer(),
                 messageGenerator: DefaultMessageGenerator())
+            var policy = ToolCallPolicy(recovery: .disabled)
+            if validation == .strict { policy.validation = .strict }
             let session = ChatSession(
                 context,
-                generateParameters: .init(
-                    maxTokens: 24,
-                    toolCallPolicy: .init(recovery: .disabled, validation: validation)),
+                generateParameters: .init(maxTokens: 24, toolCallPolicy: policy),
                 tools: [restrictedTool],
                 toolDispatch: { call in
                     dispatched.record(call)

@@ -12,7 +12,7 @@ public struct ToolCallPolicy: Hashable, Sendable {
 
     public init(
         recovery: ToolCallRecoveryPolicy = .conservative,
-        validation: ToolCallValidationPolicy = .strict
+        validation: ToolCallValidationPolicy = .permissive
     ) {
         self.recovery = recovery
         self.validation = validation
@@ -23,10 +23,10 @@ public struct ToolCallPolicy: Hashable, Sendable {
 /// authorization. Both modes normalize unambiguous, schema-declared values.
 public enum ToolCallValidationPolicy: String, Hashable, Sendable, CaseIterable {
     /// Reject proven schema violations. Unsupported schema assertions remain
-    /// unknown. This is the default, including for automatic tool dispatch.
+    /// unknown. Enable this to check arguments before automatic tool dispatch.
     case strict
     /// Forward parsed arguments after normalization, even if they violate the
-    /// schema, for applications that validate or repair arguments themselves.
+    /// schema. This is the default; applications validate arguments themselves.
     /// Native parser requirements and declared-tool authorization still apply.
     case permissive
 }

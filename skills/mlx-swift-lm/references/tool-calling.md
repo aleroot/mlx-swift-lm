@@ -187,11 +187,12 @@ let processor = ToolCallProcessor(
 
 ### Schema Validation
 
-When you supply tool schemas, the processor does two checks before a call
-becomes executable:
+When you supply tool schemas, the processor checks calls before dispatch:
 
 1. The function name must be in the declared tools.
-2. The arguments must not definitively violate the tool's `parameters` schema.
+2. With `toolCallPolicy: .init(validation: .strict)`, arguments must not
+   definitively violate the tool's `parameters` schema. The default is
+   `.permissive`, which leaves schema validation to the application.
 
 A call that fails a check is not dispatched. It is reported as a
 `RejectedToolCall` with the reason `undeclaredTool` or `invalidArguments`.

@@ -133,7 +133,8 @@ struct ParameterCoercionTests {
     @Test("Definite violations still reject after coercion")
     func definiteViolationsStillReject() {
         let tools = Self.envelopeTools(parameterSchema: ["type": ["integer", "null"]])
-        let processor = ToolCallProcessor(format: .json, tools: tools)
+        let processor = ToolCallProcessor(
+            format: .json, tools: tools, toolCallPolicy: .init(validation: .strict))
 
         _ = processor.processChunk(
             "<function=weather><parameter=hour>Paris</parameter></function>")

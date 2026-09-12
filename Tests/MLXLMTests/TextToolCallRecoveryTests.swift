@@ -400,7 +400,8 @@ struct TextToolCallRecoveryTests {
                 ] as [String: any Sendable]
             ]
         ]
-        let processor = ToolCallProcessor(format: .json, tools: tools)
+        let processor = ToolCallProcessor(
+            format: .json, tools: tools, toolCallPolicy: .init(validation: .strict))
 
         _ = processor.processChunk("<function=weather></function>")
         #expect(processor.toolCalls.isEmpty)
@@ -410,7 +411,8 @@ struct TextToolCallRecoveryTests {
         #expect(processor.recoveredToolCallCount == 0)
         #expect(processor.recoveryEvents.isEmpty)
 
-        let native = ToolCallProcessor(format: .json, tools: tools)
+        let native = ToolCallProcessor(
+            format: .json, tools: tools, toolCallPolicy: .init(validation: .strict))
         _ = native.processChunk(
             #"<tool_call>{"name":"weather","arguments":{}}</tool_call>"#)
         #expect(native.toolCalls.isEmpty)

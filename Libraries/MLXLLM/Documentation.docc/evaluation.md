@@ -81,10 +81,10 @@ if !toolResults.isEmpty {
 }
 ```
 
-By default, when tool schemas are supplied, `Generation.toolCall` contains only parsed and
+When tool schemas are supplied, `Generation.toolCall` contains only parsed and
 authorized calls that may be considered for dispatch. Tool-call-shaped output
 that is malformed, incomplete, exceeds the parser's bounded safety limit,
-omits a required argument, or names an undeclared function is emitted separately as
+or names an undeclared function is emitted separately as
 `Generation.rejectedToolCall`; rejected protocol is never returned as a normal
 response chunk. `rawTextPreview` is bounded for diagnostics but can contain
 sensitive argument values, so applications should not log or persist it
@@ -98,9 +98,10 @@ only the selected native dialect, or `.permissive` to allow the documented
 end-of-stream outer-close repair. `GenerateCompletionInfo` reports both
 `recoveredToolCallCount` and `rejectedToolCallCount` for production telemetry.
 
-`GenerateParameters.toolCallPolicy.validation` defaults to `.strict`. Use
-`.permissive` only when the application validates arguments itself; declared-tool
-authorization and native parser requirements still apply.
+`GenerateParameters.toolCallPolicy.validation` defaults to `.permissive`, leaving
+schema validation to the application. Set it to `.strict` to reject proven schema
+violations, including missing required arguments. Declared-tool authorization
+and native parser requirements apply in both modes.
 
 The example buffers accepted calls until the generation finishes. This makes
 dispatch atomic at the turn level: if a later call in the same model output is

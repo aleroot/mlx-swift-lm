@@ -534,7 +534,8 @@ struct ToolSchemaValidatorTests {
     @Test("The processor rejects only a proven schema violation")
     func processorProofBoundary() {
         let invalid = ToolCallProcessor(
-            format: .json, tools: [tool("weather", parameters: weatherSchema)])
+            format: .json, tools: [tool("weather", parameters: weatherSchema)],
+            toolCallPolicy: .init(validation: .strict))
         _ = invalid.processChunk(
             #"<tool_call>{"name":"weather","arguments":{"city":"Paris","limit":"five"}}</tool_call>"#
         )
@@ -547,7 +548,8 @@ struct ToolSchemaValidatorTests {
             "properties": ["code": ["type": "string", "pattern": "^[0-9]+$"]],
         ]
         let uncertain = ToolCallProcessor(
-            format: .json, tools: [tool("submit", parameters: uncertainSchema)])
+            format: .json, tools: [tool("submit", parameters: uncertainSchema)],
+            toolCallPolicy: .init(validation: .strict))
         _ = uncertain.processChunk(
             #"<tool_call>{"name":"submit","arguments":{"code":"abc"}}</tool_call>"#)
         #expect(uncertain.toolCalls.map(\.function.name) == ["submit"])

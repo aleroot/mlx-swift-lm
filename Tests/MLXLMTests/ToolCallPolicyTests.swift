@@ -7,18 +7,51 @@ import Testing
 
 @Suite(.serialized)
 struct ToolCallPolicyTests {
-    @Test("Generation policies have independent value semantics and safe defaults")
+    @Test(
+        "Generation policies have independent value semantics and permissive validation by default")
     func defaultsAndCopies() {
         let defaults = GenerateParameters()
-        #expect(defaults.toolCallPolicy == .init(recovery: .conservative, validation: .strict))
+        #expect(defaults.toolCallPolicy == .init(recovery: .conservative, validation: .permissive))
         var custom = defaults
         custom.toolCallPolicy.recovery = .disabled
-        custom.toolCallPolicy.validation = .permissive
+        custom.toolCallPolicy.validation = .strict
         #expect(defaults.toolCallPolicy == ToolCallPolicy())
-        #expect(custom.toolCallPolicy == .init(recovery: .disabled, validation: .permissive))
+        #expect(custom.toolCallPolicy == .init(recovery: .disabled, validation: .strict))
         #expect(
             GenerateParameters(toolCallPolicy: custom.toolCallPolicy).toolCallPolicy
                 == custom.toolCallPolicy)
+    }
+
+    @Test("Default processing forwards schema violations but still rejects undeclared tools")
+    func defaultProcessing() {
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "read",
+                    "parameters": [
+                        "type": "object", "properties": ["value": ["type": "integer"]],
+                        "required": ["value"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        for arguments: [String: JSONValue] in [["value": .string("six")], [:]] {
+            let call = ToolCall(function: .init(name: "read", arguments: arguments))
+            let json = arguments.isEmpty ? "{}" : #"{"value":"six"}"#
+            for format: ToolCallFormat in [.json, .lfm2] {
+                let processor = ToolCallProcessor(format: format, tools: tools)
+                _ = processor.processChunk(
+                    "<tool_call>{\"name\":\"read\",\"arguments\":\(json)}</tool_call>")
+                processor.processEOS()
+                #expect(processor.toolCalls.first?.function == call.function)
+                #expect(processor.rejectedToolCalls.isEmpty)
+            }
+        }
+        let processor = ToolCallProcessor(format: .json, tools: tools)
+        _ = processor.processChunk(#"<tool_call>{"name":"other","arguments":{}}</tool_call>"#)
+        processor.processEOS()
+        #expect(processor.toolCalls.isEmpty)
+        #expect(processor.rejectedToolCalls.first?.reason == .undeclaredTool)
     }
 
     @Test(

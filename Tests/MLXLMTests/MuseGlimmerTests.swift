@@ -1240,7 +1240,7 @@ struct MuseGlimmerAgenticProtocolTests {
         var decoder = try #require(
             ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
                 tokenizer: tokenizer, tools: boundedTools, stopStrings: [],
-                toolCallPolicy: .init(validation: policy)
+                toolCallPolicy: policy == .strict ? .init(validation: .strict) : .init()
             ))
         let payload =
             "<atem:function_calls><atem:invoke name=\"weather.get\">"

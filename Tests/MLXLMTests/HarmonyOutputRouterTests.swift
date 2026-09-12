@@ -196,7 +196,7 @@ struct HarmonyOutputRouterTests {
                 "<|channel|>", "commentary to=functions.get_weather",
                 "<|message|>", #"{"city":3}"#, "<|call|>",
             ],
-            tools: tools)
+            tools: tools, toolCallPolicy: .init(validation: .strict))
 
         #expect(events.compactMap(\.toolCall).isEmpty)
         let rejection = try #require(events.compactMap(\.rejectedToolCall).first)
@@ -222,7 +222,8 @@ struct HarmonyOutputRouterTests {
                         "<|channel|>", "commentary to=functions.search", "<|message|>",
                         "{\"count\":\"\(text)\"}", "<|call|>",
                     ],
-                    tools: tools, toolCallPolicy: .init(validation: policy))
+                    tools: tools,
+                    toolCallPolicy: policy == .strict ? .init(validation: .strict) : .init())
                 #expect(
                     events.compactMap(\.toolCall).first?.function.arguments["count"] == expected)
                 #expect(events.compactMap(\.rejectedToolCall).count == (expected == nil ? 1 : 0))
@@ -251,7 +252,7 @@ struct HarmonyOutputRouterTests {
                 "<|channel|>", "commentary to=functions.submit",
                 "<|message|>", #"{"code":"not-digits"}"#, "<|call|>",
             ],
-            tools: tools)
+            tools: tools, toolCallPolicy: .init(validation: .strict))
 
         #expect(events.compactMap(\.toolCall).map(\.function.name) == ["submit"])
         #expect(events.compactMap(\.rejectedToolCall).isEmpty)

@@ -97,7 +97,7 @@ public class ToolCallProcessor {
     ///     A nonempty declaration also enables bounded cross-dialect recovery;
     ///     only an exactly declared function name can be promoted by recovery.
     ///   - toolCallPolicy: Recovery and validation rules. Defaults to conservative
-    ///     recovery and strict schema validation; tool-name authorization always applies.
+    ///     recovery and permissive schema validation; tool-name authorization always applies.
     public init(
         format: ToolCallFormat = .json,
         tools: [[String: any Sendable]]? = nil,
