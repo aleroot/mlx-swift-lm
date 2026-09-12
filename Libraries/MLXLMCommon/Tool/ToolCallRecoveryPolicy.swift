@@ -19,8 +19,9 @@ public enum ToolCallRecoveryPolicy: String, Hashable, Sendable, CaseIterable {
     /// `<function=`, `[TOOL_CALLS]`) and appear in committed response text —
     /// never inside reasoning spans (`<think>`/`<thinking>`/`[THINK]`),
     /// Markdown code spans or fences, or ordinary JSON data — and only when
-    /// the call names an exactly declared tool and satisfies its declared
-    /// required arguments.
+    /// the call names an exactly declared tool. Argument normalization and
+    /// schema enforcement are governed independently by
+    /// ``ToolCallValidationPolicy``.
     ///
     /// Explicit protocol attempts that are malformed, incomplete at end of
     /// stream, or undeclared are surfaced as ``RejectedToolCall`` rather than

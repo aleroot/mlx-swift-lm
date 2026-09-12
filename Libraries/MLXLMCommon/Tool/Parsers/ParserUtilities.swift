@@ -163,139 +163,21 @@ func isDeclaredTool(
 /// Convert parameter value based on multiple possible types.
 /// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tool_parsers/minimax_m2.py
 func convertValueWithTypes(_ value: String, types: [String]) -> any Sendable {
-    let lowerValue = value.lowercased()
-
-    // Handle null values
-    if ["null", "none", "nil"].contains(lowerValue) {
-        return NSNull()
-    }
-
-    let normalizedTypes = Set(types.map { $0.lowercased() })
-
-    // Priority: integer > number > boolean > object > array > string
-    let typePriority = [
-        "integer", "int", "number", "float", "boolean", "bool",
-        "object", "array", "string", "str", "text",
-    ]
-
-    for paramType in typePriority {
-        guard normalizedTypes.contains(paramType) else { continue }
-
-        switch paramType {
-        case "string", "str", "text":
-            return value
-
-        case "integer", "int":
-            if let intVal = Int(value) {
-                return intVal
-            }
-
-        case "number", "float":
-            if let floatVal = Double(value) {
-                let intVal = Int(floatVal)
-                return floatVal != Double(intVal) ? floatVal : intVal
-            }
-
-        case "boolean", "bool":
-            let trimmed = lowerValue.trimmingCharacters(in: .whitespaces)
-            if ["true", "1", "yes", "on"].contains(trimmed) {
-                return true
-            } else if ["false", "0", "no", "off"].contains(trimmed) {
-                return false
-            }
-
-        case "object", "array":
-            if let json = tryParseJSON(value) {
-                return json
-            }
-
-        default:
-            continue
-        }
-    }
-
-    // Fallback: try JSON parse, then return as string
-    return tryParseJSON(value) ?? value
+    ToolArgumentNormalization.normalize(.string(value), schema: ["type": types]).sendableValue
 }
 
-/// Convert parameter value based on schema type.
-/// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tool_parsers/qwen3_coder.py
+/// Read a textual parameter using its declared schema; unknown or ambiguous
+/// schemas preserve the original text. Validation is a separate boundary.
 func convertParameterValue(
-    _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?
-) -> any Sendable {
-    guard let paramType = getParameterType(funcName: funcName, paramName: paramName, tools: tools)
-    else {
-        return convertParameterValueUsingDeclaredTypes(
-            value, paramName: paramName, funcName: funcName, tools: tools)
-    }
-
-    let type = paramType.lowercased()
-
-    // String types - return as-is
-    if ["string", "str", "text", "varchar", "char", "enum"].contains(type) {
-        return value
-    }
-
-    // Integer types
-    if type.hasPrefix("int") || type.hasPrefix("uint")
-        || type.hasPrefix("long") || type.hasPrefix("short")
-        || type.hasPrefix("unsigned")
-    {
-        return Int(value) ?? value
-    }
-
-    // Float types
-    if type.hasPrefix("num") || type.hasPrefix("float") {
-        if let floatVal = Double(value) {
-            let intVal = Int(floatVal)
-            return floatVal != Double(intVal) ? floatVal : intVal
-        }
-        return value
-    }
-
-    // Boolean types
-    if ["boolean", "bool", "binary"].contains(type) {
-        return ["true", "1", "yes", "on"].contains(
-            value.lowercased().trimmingCharacters(in: .whitespaces))
-    }
-
-    // Object/Array types - JSON decode
-    if ["object", "array"].contains(type) || type.hasPrefix("dict") || type.hasPrefix("list") {
-        if let json = tryParseJSON(value) {
-            return json
-        }
-    }
-
-    return value
-}
-
-/// Conservative conversion for parameter schemas whose `type` is not a plain
-/// string: union types (`["integer", "null"]`), combinators (`anyOf` /
-/// `oneOf` / `allOf`), and flat-shaped tool declarations that
-/// `getParameterType` cannot see.
-///
-/// The textual wire value is preserved whenever the declared schema admits a
-/// string — or declares no recognizable type at all — so conversion never
-/// invents a type the schema did not ask for. Only when every declared type
-/// is non-string is the value converted, so that downstream schema
-/// validation judges the call the model intended rather than an artifact of
-/// the textual transport.
-private func convertParameterValueUsingDeclaredTypes(
     _ value: String, paramName: String, funcName: String, tools: [[String: any Sendable]]?
 ) -> any Sendable {
     guard let tools,
         let parameters = ToolSchemaValidator.parametersSchema(ofToolNamed: funcName, in: tools),
-        let properties = parameters["properties"] as? [String: any Sendable],
-        let schema = properties[paramName] as? [String: any Sendable]
+        let properties = parameters["properties"] as? [String: any Sendable]
     else { return value }
-
-    // `extractTypesFromSchema` falls back to `["string"]` when the schema
-    // carries no recognizable type information, so both "no declared types"
-    // and "string admitted" leave the wire value unchanged.
-    let types = extractTypesFromSchema(schema)
-    let normalized = Set(types.map { $0.lowercased() })
-    guard normalized.isDisjoint(with: ["string", "str", "text"]) else { return value }
-    return convertValueWithTypes(value, types: types)
+    return ToolArgumentNormalization.normalize(
+        .string(value), schema: properties[paramName] as? [String: any Sendable]
+    ).sendableValue
 }
 
 // MARK: - String Utilities

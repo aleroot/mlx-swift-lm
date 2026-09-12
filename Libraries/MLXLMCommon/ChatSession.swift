@@ -1214,7 +1214,7 @@ public final class ChatSession {
                                     tokenizer: tokenizer,
                                     iterator: iterator,
                                     tools: toolValidationSchemas,
-                                    recoveryPolicy: generateParameters.toolCallRecoveryPolicy)
+                                    toolCallPolicy: generateParameters.toolCallPolicy)
                             )
                         }
 
@@ -1338,8 +1338,7 @@ public final class ChatSession {
                                             tokenizer: tokenizer,
                                             iterator: iterator,
                                             tools: toolValidationSchemas,
-                                            recoveryPolicy: generateParameters
-                                                .toolCallRecoveryPolicy))
+                                            toolCallPolicy: generateParameters.toolCallPolicy))
                                 }
                             }
                         } else {

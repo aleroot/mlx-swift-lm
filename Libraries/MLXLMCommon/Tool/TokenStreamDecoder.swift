@@ -66,11 +66,11 @@ struct StandardTokenStreamDecoder: TokenStreamDecoder {
         format: ToolCallFormat,
         tools: [[String: any Sendable]]?,
         stopStrings: Set<String>,
-        recoveryPolicy: ToolCallRecoveryPolicy = .conservative
+        toolCallPolicy: ToolCallPolicy = .init()
     ) {
         self.detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         self.toolCallProcessor = ToolCallProcessor(
-            format: format, tools: tools, recoveryPolicy: recoveryPolicy)
+            format: format, tools: tools, toolCallPolicy: toolCallPolicy)
         self.stopStringFilter = StopStringFilter(stopStrings: stopStrings)
     }
 

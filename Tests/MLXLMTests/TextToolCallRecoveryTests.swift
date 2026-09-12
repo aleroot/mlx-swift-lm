@@ -96,7 +96,7 @@ struct TextToolCallRecoveryTests {
     @Test("Markerless rehearsals promote only under the permissive policy")
     func markerlessPromotesUnderPermissive() throws {
         let processor = ToolCallProcessor(
-            format: .json, tools: Self.tools, recoveryPolicy: .permissive)
+            format: .json, tools: Self.tools, toolCallPolicy: .init(recovery: .permissive))
         _ = processor.processChunk(Self.markerlessText)
 
         let call = try #require(processor.toolCalls.first)
@@ -111,7 +111,7 @@ struct TextToolCallRecoveryTests {
         let characters = Array(Self.markerlessText)
         for split in 1 ..< characters.count {
             let processor = ToolCallProcessor(
-                format: .json, tools: Self.tools, recoveryPolicy: .permissive)
+                format: .json, tools: Self.tools, toolCallPolicy: .init(recovery: .permissive))
             _ = processor.processChunk(String(characters[..<split]))
             _ = processor.processChunk(String(characters[split...]))
 
@@ -246,7 +246,7 @@ struct TextToolCallRecoveryTests {
     @Test("Markerless names require an exact lexical boundary across chunks")
     func markerlessLexicalBoundary() {
         let processor = ToolCallProcessor(
-            format: .json, tools: Self.tools, recoveryPolicy: .permissive)
+            format: .json, tools: Self.tools, toolCallPolicy: .init(recovery: .permissive))
         let first = processor.processChunk("not")
         let second = processor.processChunk(#"weather[ARGS]{"city":"Paris"}"#)
 
@@ -259,7 +259,7 @@ struct TextToolCallRecoveryTests {
         // Permissive policy so the post-EOS probe exercises markerless
         // promotion; the byte limit itself is policy-independent.
         let processor = ToolCallProcessor(
-            format: .json, tools: Self.tools, recoveryPolicy: .permissive)
+            format: .json, tools: Self.tools, toolCallPolicy: .init(recovery: .permissive))
         // Combining scalars form very few extended grapheme clusters, so this
         // verifies the limit is a byte limit rather than `String.count`.
         let text =
@@ -338,7 +338,7 @@ struct TextToolCallRecoveryTests {
     @Test("Oversized JSON remains fail-closed until EOS")
     func oversizedJSONCannotReenterExecutableContext() {
         let processor = ToolCallProcessor(
-            format: .lfm2, tools: Self.tools, recoveryPolicy: .permissive)
+            format: .lfm2, tools: Self.tools, toolCallPolicy: .init(recovery: .permissive))
         let prefix = "[\"" + String(repeating: "a", count: 65_536)
 
         #expect(processor.processChunk(prefix) == prefix)
@@ -369,7 +369,7 @@ struct TextToolCallRecoveryTests {
     @Test("Recovery policy is honored by the public processor path")
     func disabledPolicyDoesNotRecover() {
         let processor = ToolCallProcessor(
-            format: .json, tools: Self.tools, recoveryPolicy: .disabled)
+            format: .json, tools: Self.tools, toolCallPolicy: .init(recovery: .disabled))
         let text = "<function=weather><parameter=city>Paris</parameter></function>"
 
         #expect(processor.processChunk(text) == text)

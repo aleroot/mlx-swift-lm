@@ -33,6 +33,7 @@ public class ToolCallProcessor {
 
     // MARK: - Properties
 
+    private let validationPolicy: ToolCallValidationPolicy
     private let format: ToolCallFormat
     private let parser: any ToolCallParser
     private let tools: [[String: any Sendable]]?
@@ -95,16 +96,14 @@ public class ToolCallProcessor {
     ///     an empty one, authorizes only the names it declares.
     ///     A nonempty declaration also enables bounded cross-dialect recovery;
     ///     only an exactly declared function name can be promoted by recovery.
-    ///   - recoveryPolicy: Governs cross-dialect recovery. `nil` selects
-    ///     ``ToolCallRecoveryPolicy/conservative``. Recovery only ever runs
-    ///     when a nonempty tool declaration is supplied, and never promotes
-    ///     text inside reasoning spans, Markdown code, ordinary JSON data, or
-    ///     the selected format's own protocol frames.
+    ///   - toolCallPolicy: Recovery and validation rules. Defaults to conservative
+    ///     recovery and strict schema validation; tool-name authorization always applies.
     public init(
         format: ToolCallFormat = .json,
         tools: [[String: any Sendable]]? = nil,
-        recoveryPolicy: ToolCallRecoveryPolicy? = nil
+        toolCallPolicy: ToolCallPolicy = .init()
     ) {
+        self.validationPolicy = toolCallPolicy.validation
         self.format = format
         self.parser = format.createParser()
         self.tools = tools
@@ -114,10 +113,10 @@ public class ToolCallProcessor {
                     (tool["function"] as? [String: any Sendable])?["name"] as? String
                 })
         }
-        self.supportsBareJSONFallback = format == .json
+        self.supportsBareJSONFallback = parser.supportsBareJSON
         self.recoveryScanner = TextToolCallRecoveryScanner(
             primaryFormat: format,
-            policy: recoveryPolicy ?? .conservative,
+            policy: toolCallPolicy.recovery,
             tools: tools,
             allowedToolNames: self.allowedToolNames)
     }
@@ -411,7 +410,7 @@ public class ToolCallProcessor {
                     toolCallBuffer = ""
                     hasExplicitInlineMarker = false
                     let response = rejected ? visibleLeading : visibleLeading + buffered
-                    if !rejected { recordResponse(sanitizingProtocol: buffered) }
+                    if !rejected { recordResponse(buffered) }
                     return response
                 }
 
@@ -451,7 +450,7 @@ public class ToolCallProcessor {
                 toolCallBuffer = ""
                 hasExplicitInlineMarker = false
                 guard !rejected else { return nil }
-                recordResponse(sanitizingProtocol: buffered)
+                recordResponse(buffered)
                 return buffered
             }
 
@@ -955,7 +954,7 @@ public class ToolCallProcessor {
                 combine(rejected ? nil : jsonCandidate, processChunk(trailingToken)))
         }
         let response = (rejected ? "" : jsonCandidate) + trailingToken
-        recordResponse(sanitizingProtocol: response)
+        recordResponse(response)
         return combine(leadingToken, response)
     }
 
@@ -1016,10 +1015,12 @@ public class ToolCallProcessor {
             return false
         }
 
-        if case .invalid(let violations) = ToolSchemaValidator.validate(
-            arguments: call.function.arguments,
-            forToolNamed: call.function.name,
-            in: tools)
+        let call = ToolArgumentNormalization.normalize(call, tools: tools)
+        if validationPolicy == .strict,
+            case .invalid(let violations) = ToolSchemaValidator.validate(
+                arguments: call.function.arguments,
+                forToolNamed: call.function.name,
+                in: tools)
         {
             appendRejectedToolCall(
                 reason: .invalidArguments,

@@ -30,16 +30,20 @@ package struct HarmonyOutputRouter {
     private let allowedToolNames: Set<String>?
     /// The declared tools, kept for argument schema validation.
     private let tools: [[String: any Sendable]]?
+    private let validationPolicy: ToolCallValidationPolicy
     private var hasEmittedToolCall = false
     private var reasoningDetokenizer: NaiveStreamingDetokenizer
     private var responseDetokenizer: NaiveStreamingDetokenizer
     private let tokenizer: any Tokenizer
 
-    package init(tokenizer: any Tokenizer, tools: [[String: any Sendable]]?) {
+    package init(
+        tokenizer: any Tokenizer, tools: [[String: any Sendable]]?,
+        toolCallPolicy: ToolCallPolicy = .init()
+    ) {
         self.init(
             tokenizer: tokenizer,
             allowedToolNames: Self.allowedToolNames(from: tools),
-            tools: tools)
+            tools: tools, toolCallPolicy: toolCallPolicy)
     }
 
     /// Compatibility entry point for package clients that only need the
@@ -51,10 +55,12 @@ package struct HarmonyOutputRouter {
     private init(
         tokenizer: any Tokenizer,
         allowedToolNames: Set<String>?,
-        tools: [[String: any Sendable]]?
+        tools: [[String: any Sendable]]?,
+        toolCallPolicy: ToolCallPolicy = .init()
     ) {
         self.tokenizer = tokenizer
         self.tools = tools
+        self.validationPolicy = toolCallPolicy.validation
         self.allowedToolNames = allowedToolNames
         self.reasoningDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         self.responseDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
@@ -136,7 +142,7 @@ package struct HarmonyOutputRouter {
             // One committed tool call per generation turn.
             return []
         }
-        guard let arguments = strictJSONObject(payload) else {
+        guard var arguments = strictJSONObject(payload) else {
             return [
                 .rejectedToolCall(
                     rejection(.invalidArguments, name: name, rawText: payload))
@@ -148,10 +154,14 @@ package struct HarmonyOutputRouter {
                     rejection(.undeclaredTool, name: name, rawText: payload))
             ]
         }
-        if case .invalid(let violations) = ToolSchemaValidator.validate(
-            arguments: arguments,
-            forToolNamed: name,
-            in: tools)
+        let normalized = ToolArgumentNormalization.normalize(
+            ToolCall(function: .init(name: name, arguments: arguments)), tools: tools)
+        arguments = normalized.function.arguments
+        if validationPolicy == .strict,
+            case .invalid(let violations) = ToolSchemaValidator.validate(
+                arguments: arguments,
+                forToolNamed: name,
+                in: tools)
         {
             return [
                 .rejectedToolCall(

@@ -102,6 +102,8 @@ struct TextToolCallRecoveryScanner: Sendable {
         }
     }
 
+    private let supportsBareJSON: Bool
+    private var jsonPrefixScanner = JSONPrefixScanner()
     private let primaryFormat: ToolCallFormat
     private let policy: ToolCallRecoveryPolicy
     private let tools: [[String: any Sendable]]
@@ -155,48 +157,31 @@ struct TextToolCallRecoveryScanner: Sendable {
         self.allowedToolNamesByLength = allowedToolNames.sorted { $0.count > $1.count }
         self.maximumBufferedByteCount = maximumBufferedByteCount
 
+        let primaryParser = primaryFormat.createParser()
+        self.supportsBareJSON = primaryParser.supportsBareJSON
         var signals: [Signal] = []
-        if Self.primaryOwnsToolCallFrame(primaryFormat) {
-            signals.append(
-                Signal(
-                    text: "<tool_call>",
-                    kind: .nativeFrame(endMarker: "</tool_call>")))
-        } else if policy != .disabled {
-            signals.append(Signal(text: "<tool_call>", kind: .explicit(.toolCallFrame)))
-        }
-        if primaryFormat == .gemma4 {
-            signals.append(
-                Signal(
-                    text: "<|tool_call>",
-                    kind: .nativeFrame(endMarker: "<tool_call|>")))
-        } else if policy != .disabled {
-            signals.append(Signal(text: "<|tool_call>", kind: .explicit(.gemma4)))
-        }
-        if policy != .disabled {
-            signals.append(Signal(text: "<function=", kind: .explicit(.qwenFunction)))
-        }
-        // Reasoning spans are never eligible for recovery, regardless of the
-        // selected dialect. Ordered so longer markers win ties.
-        signals.append(Signal(text: "<thinking>", kind: .reasoning(close: "</thinking>")))
-        signals.append(Signal(text: "<think>", kind: .reasoning(close: "</think>")))
-        signals.append(Signal(text: "[THINK]", kind: .reasoning(close: "[/THINK]")))
-        if primaryFormat != .mistral, policy != .disabled {
-            signals.append(Signal(text: "[TOOL_CALLS]", kind: .explicit(.mistral)))
+        // Native markers win ties. Alternate dialects may never steal a
+        // frame which the selected parser already owns (for example GLM4).
+        if let start = primaryParser.startTag {
+            let kind: Kind =
+                primaryParser.endTag.map { .nativeFrame(endMarker: $0) }
+                ?? .nativeUntilEOS
+            signals.append(Signal(text: start, kind: kind))
         }
         if primaryFormat == .llama3 {
             signals.append(Signal(text: "<|python_tag|>", kind: .nativeInlineJSON))
         }
-
-        let primaryParser = primaryFormat.createParser()
-        if let start = primaryParser.startTag,
-            !signals.contains(where: { $0.text == start })
-        {
-            if let end = primaryParser.endTag {
-                signals.append(Signal(text: start, kind: .nativeFrame(endMarker: end)))
-            } else {
-                signals.append(Signal(text: start, kind: .nativeUntilEOS))
+        if policy != .disabled {
+            for (marker, kind): (String, ExplicitKind) in [
+                ("<tool_call>", .toolCallFrame), ("<|tool_call>", .gemma4),
+                ("<function=", .qwenFunction), ("[TOOL_CALLS]", .mistral),
+            ] where !signals.contains(where: { $0.text == marker }) {
+                signals.append(Signal(text: marker, kind: .explicit(kind)))
             }
         }
+        signals.append(Signal(text: "<thinking>", kind: .reasoning(close: "</thinking>")))
+        signals.append(Signal(text: "<think>", kind: .reasoning(close: "</think>")))
+        signals.append(Signal(text: "[THINK]", kind: .reasoning(close: "[/THINK]")))
 
         // Ordinary JSON values and Markdown code are data: protocol-shaped
         // text inside them must never be promoted. Single-character signals
@@ -317,13 +302,9 @@ struct TextToolCallRecoveryScanner: Sendable {
                 break scanLoop
 
             case .jsonValue:
-                if buffer.utf8.count <= maximumBufferedByteCount,
-                    !chunkMayCompleteJSONValue(chunk, opener: buffer.first)
-                {
-                    break scanLoop
-                }
-                switch jsonValueExtent(in: buffer) {
-                case .complete(let end):
+                switch jsonPrefixScanner.scan(buffer) {
+                case .complete(let byteCount):
+                    let end = buffer.utf8.index(buffer.utf8.startIndex, offsetBy: byteCount)
                     let value = String(buffer[..<end])
                     if value.utf8.count > maximumBufferedByteCount {
                         appendProtectedText(value, to: &output)
@@ -339,7 +320,12 @@ struct TextToolCallRecoveryScanner: Sendable {
                     buffer.removeFirst()
                     context = .response
                     continue
-                case .needMore:
+                case .depthLimit:
+                    appendProtectedText(buffer, to: &output)
+                    buffer.removeAll(keepingCapacity: true)
+                    context = .opaqueUntilEOS
+                    break scanLoop
+                case .incomplete:
                     if buffer.utf8.count > maximumBufferedByteCount {
                         appendProtectedText(buffer, to: &output)
                         buffer.removeAll(keepingCapacity: true)
@@ -468,7 +454,16 @@ struct TextToolCallRecoveryScanner: Sendable {
                     }
 
                 case .opaqueJSONValue:
-                    context = .jsonValue
+                    // A quote after a word or measurement is punctuation,
+                    // including inch marks and German-style closing quotes.
+                    if buffer.first == "\"", let previousSourceCharacter,
+                        previousSourceCharacter.isLetter || previousSourceCharacter.isNumber
+                    {
+                        appendText(String(buffer.removeFirst()), to: &output)
+                    } else {
+                        jsonPrefixScanner = JSONPrefixScanner()
+                        context = .jsonValue
+                    }
 
                 case .codeBacktick:
                     let run = backtickRun(in: buffer)
@@ -584,12 +579,14 @@ struct TextToolCallRecoveryScanner: Sendable {
             // marker delivered immediately before EOS must not leave recovery
             // shielding every subsequent generation.
             context = .response
+            previousSourceCharacter = nil
             return output
         }
 
         defer {
             buffer.removeAll(keepingCapacity: true)
             context = .response
+            previousSourceCharacter = nil
             pendingCandidate = nil
         }
 
@@ -760,23 +757,15 @@ struct TextToolCallRecoveryScanner: Sendable {
         previousSourceCharacter = text.last
     }
 
-    /// Bare top-level JSON remains eligible only when JSON is the selected
-    /// native tool-call format. For every other dialect it is response data and
+    /// Bare top-level JSON is eligible only when the selected parser declares
+    /// it as native call syntax. For other dialects it is response data and
     /// must bypass native parsing, including protocol-shaped strings inside it.
     private mutating func appendJSONData(_ text: String, to output: inout [Output]) {
-        if primaryFormat == .json, text.first == "{" {
+        if supportsBareJSON, text.first == "{" {
             appendText(text, to: &output)
         } else {
             appendProtectedText(text, to: &output)
         }
-    }
-
-    private func chunkMayCompleteJSONValue(_ chunk: String, opener: Character?) -> Bool {
-        guard !chunk.isEmpty else { return true }
-        if opener == "\"" {
-            return chunk.contains("\"") || chunk.contains("\n") || chunk.contains("\r")
-        }
-        return chunk.contains("}") || chunk.contains("]")
     }
 
     /// Release everything except a suffix that may still complete a signal or
@@ -962,105 +951,6 @@ struct TextToolCallRecoveryScanner: Sendable {
             index = runEnd
         }
         return nil
-    }
-
-    // MARK: - JSON data opacity
-
-    private enum ValueExtent {
-        case complete(end: String.Index)
-        case needMore
-        case invalid
-    }
-
-    /// The extent of the JSON value starting at the beginning of `text`.
-    /// Objects, arrays and strings are opaque data; numbers, booleans and null
-    /// contain no interior text and need no shielding.
-    private func jsonValueExtent(in text: String) -> ValueExtent {
-        switch text[text.startIndex] {
-        case "{", "[":
-            return jsonContainerExtent(in: text)
-        case "\"":
-            return jsonStringExtent(in: text)
-        default:
-            return .invalid
-        }
-    }
-
-    private func jsonContainerExtent(in text: String) -> ValueExtent {
-        let start = text.startIndex
-        var index = text.index(after: start)
-        while index < text.endIndex, text[index].isWhitespace {
-            index = text.index(after: index)
-        }
-        guard index < text.endIndex else { return .needMore }
-
-        // Validate the first meaningful character so prose such as `[TOOL...`
-        // or `{not json` is never treated as structured data.
-        let first = text[index]
-        let plausible: Bool
-        if text[start] == "{" {
-            plausible = first == "\"" || first == "}"
-        } else {
-            plausible =
-                first == "\"" || first == "{" || first == "[" || first == "]"
-                || first == "-" || first.isNumber
-                || first == "t" || first == "f" || first == "n"
-        }
-        guard plausible else { return .invalid }
-
-        var depth = 0
-        var inString = false
-        var isEscaped = false
-        var scan = start
-        while scan < text.endIndex {
-            let character = text[scan]
-            if inString {
-                if isEscaped {
-                    isEscaped = false
-                } else if character == "\\" {
-                    isEscaped = true
-                } else if character == "\"" {
-                    inString = false
-                }
-            } else {
-                switch character {
-                case "\"":
-                    inString = true
-                case "{", "[":
-                    depth += 1
-                case "}", "]":
-                    depth -= 1
-                    if depth == 0 {
-                        return .complete(end: text.index(after: scan))
-                    }
-                default:
-                    break
-                }
-            }
-            scan = text.index(after: scan)
-        }
-        return .needMore
-    }
-
-    private func jsonStringExtent(in text: String) -> ValueExtent {
-        var index = text.index(after: text.startIndex)
-        var isEscaped = false
-        while index < text.endIndex {
-            let character = text[index]
-            if isEscaped {
-                isEscaped = false
-            } else if character == "\\" {
-                isEscaped = true
-            } else if character == "\"" {
-                return .complete(end: text.index(after: index))
-            } else if character == "\n" || character == "\r" {
-                // Valid JSON strings never contain a literal newline, so this
-                // quote was prose punctuation rather than structured data.
-                return .invalid
-            }
-            index = text.index(after: index)
-        }
-        return .needMore
     }
 
     // MARK: - Candidate extents
@@ -1377,13 +1267,4 @@ struct TextToolCallRecoveryScanner: Sendable {
             id: callID)
     }
 
-    private static func primaryOwnsToolCallFrame(_ format: ToolCallFormat) -> Bool {
-        switch format {
-        case .json, .xmlFunction, .qwen35, .gptOSS:
-            true
-        case .lfm2, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2, .atem, .mistral,
-            .llama3:
-            false
-        }
-    }
 }

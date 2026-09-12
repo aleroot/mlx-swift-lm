@@ -185,10 +185,8 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
-    /// Governs bounded recovery when a model emits a declared tool call in a
-    /// dialect other than the selected ``ToolCallFormat``. Conservative is the
-    /// production default; set disabled when only the native format may run.
-    public var toolCallRecoveryPolicy: ToolCallRecoveryPolicy
+    /// Recovery and validation rules for generated tool calls.
+    public var toolCallPolicy: ToolCallPolicy
 
     public init(
         maxTokens: Int? = nil,
@@ -210,7 +208,7 @@ public struct GenerateParameters: Sendable {
         frequencyContextSize: Int = 20,
         prefill: PrefillParameters = .init(),
         seed: UInt64? = nil,
-        toolCallRecoveryPolicy: ToolCallRecoveryPolicy = .conservative
+        toolCallPolicy: ToolCallPolicy = .init()
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -231,7 +229,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefill = prefill
         self.seed = seed
-        self.toolCallRecoveryPolicy = toolCallRecoveryPolicy
+        self.toolCallPolicy = toolCallPolicy
     }
 
     @available(
@@ -1708,7 +1706,7 @@ public func generate(
 /// * Important: if the stream is terminated early (e.g. break from the loop) computation will continue
 /// using the model, parameters, KVCache, etc. for some time (typically a few ms).  This is typically OK for
 /// one-shot calls, but for "chat session" type calls consider using
-/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:tools:recoveryPolicy:)``
+/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:tools:toolCallPolicy:)``
 /// so that the end of the generation task can be observed.
 ///
 /// - Parameters:
@@ -1773,7 +1771,7 @@ public func generate(
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
         tools: tools,
-        recoveryPolicy: parameters.toolCallRecoveryPolicy)
+        toolCallPolicy: parameters.toolCallPolicy)
     return stream
 }
 
@@ -1866,7 +1864,7 @@ public func generate(
             stopStrings: context.configuration.effectiveStopStrings,
             format: context.configuration.toolCallFormat ?? .json,
             tools: tools,
-            recoveryPolicy: parameters.toolCallRecoveryPolicy
+            toolCallPolicy: parameters.toolCallPolicy
         )
     )
     return stream
@@ -1906,7 +1904,7 @@ public func generate(
 ///   - iterator: a token iterator conforming to ``TokenIteratorProtocol``
 ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
 ///   - tools: Optional tool schemas used to parse tool-call arguments into their declared types.
-///   - recoveryPolicy: Policy specifying how to recover from malformed tool calls.
+///   - toolCallPolicy: Recovery and validation rules for generated tool calls.
 /// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
 public func generateTask<TOKEN: TokenIteratorProtocol>(
     promptTokenCount: Int,
@@ -1915,7 +1913,7 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil,
-    recoveryPolicy: ToolCallRecoveryPolicy = .conservative
+    toolCallPolicy: ToolCallPolicy = .init()
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1928,7 +1926,7 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
             stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
             tools: tools,
-            recoveryPolicy: recoveryPolicy
+            toolCallPolicy: toolCallPolicy
         )
     )
 }
@@ -1942,7 +1940,7 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil,
-    recoveryPolicy: ToolCallRecoveryPolicy = .conservative
+    toolCallPolicy: ToolCallPolicy = .init()
 ) -> (AsyncStream<Generation>, Task<[Int], Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1956,7 +1954,7 @@ func generateTaskRecordingTokens<TOKEN: TokenIteratorProtocol>(
             stopStrings: modelConfiguration.effectiveStopStrings,
             format: modelConfiguration.toolCallFormat ?? .json,
             tools: tools,
-            recoveryPolicy: recoveryPolicy
+            toolCallPolicy: toolCallPolicy
         )
     )
 }
@@ -2125,7 +2123,7 @@ public func generate(
             stopStrings: context.configuration.effectiveStopStrings,
             format: context.configuration.toolCallFormat ?? .json,
             tools: tools,
-            recoveryPolicy: parameters.toolCallRecoveryPolicy
+            toolCallPolicy: parameters.toolCallPolicy
         )
     )
     return stream
@@ -2823,11 +2821,11 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
     init(
         tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
         tools: [[String: any Sendable]]? = nil,
-        recoveryPolicy: ToolCallRecoveryPolicy = .conservative
+        toolCallPolicy: ToolCallPolicy = .init()
     ) {
         self.decoder = format.makeTokenStreamDecoder(
             tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
-            recoveryPolicy: recoveryPolicy)
+            toolCallPolicy: toolCallPolicy)
     }
 
     var additionalStopTokenIDs: Set<Int> { decoder.additionalStopTokenIDs }

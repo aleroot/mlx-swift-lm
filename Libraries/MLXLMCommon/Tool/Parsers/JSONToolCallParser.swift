@@ -7,9 +7,11 @@ import Foundation
 public struct JSONToolCallParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    public let supportsBareJSON: Bool
     private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
 
-    public init(startTag: String, endTag: String) {
+    public init(startTag: String, endTag: String, supportsBareJSON: Bool = false) {
+        self.supportsBareJSON = supportsBareJSON
         self.startTag = startTag
         self.endTag = endTag
     }
@@ -17,15 +19,15 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         guard let start = startTag, let end = endTag else { return nil }
 
-        // Find the JSON content between tags
-        var text = content
-
-        // Strip tags if present
-        if let startRange = text.range(of: start) {
-            text = String(text[startRange.upperBound...])
+        var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A bare JSON payload may contain literal protocol markers in its
+        // strings. Only wrapper tags outside that payload are delimiters.
+        if !text.hasPrefix("{"), let startRange = text.range(of: start) {
+            text = String(text[startRange.upperBound...]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
         }
-        if let endRange = text.range(of: end) {
-            text = String(text[..<endRange.lowerBound])
+        if text.hasSuffix(end) {
+            text.removeLast(end.count)
         }
 
         return parsePayload(text)

@@ -1217,8 +1217,10 @@ struct MuseGlimmerAgenticProtocolTests {
         #expect(answer == [.response("sunny")])
     }
 
-    @Test("Onyx rejects proven schema violations and counts them")
-    func onyxSchemaViolationIsCounted() throws {
+    @Test(
+        "Onyx applies the selected validation policy and counts rejections",
+        arguments: ToolCallValidationPolicy.allCases)
+    func onyxSchemaViolationIsCounted(policy: ToolCallValidationPolicy) throws {
         let tokenizer = OnyxTestTokenizer()
         let boundedTools: [[String: any Sendable]] = [
             [
@@ -1237,10 +1239,12 @@ struct MuseGlimmerAgenticProtocolTests {
         ]
         var decoder = try #require(
             ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
-                tokenizer: tokenizer, tools: boundedTools, stopStrings: []))
+                tokenizer: tokenizer, tools: boundedTools, stopStrings: [],
+                toolCallPolicy: .init(validation: policy)
+            ))
         let payload =
             "<atem:function_calls><atem:invoke name=\"weather.get\">"
-            + "<atem:parameter name=\"days\">6</atem:parameter>"
+            + "<atem:parameter name=\"days\">6.0</atem:parameter>"
             + "</atem:invoke></atem:function_calls>"
         let tokens = [
             tokenizer.id(" to=weather.get"), tokenizer.message,
@@ -1254,6 +1258,16 @@ struct MuseGlimmerAgenticProtocolTests {
             }
         }
 
+        if policy == .permissive {
+            let calls = events.compactMap { event -> ToolCall? in
+                if case .toolCall(let call) = event { return call }
+                return nil
+            }
+            #expect(calls.count == 1)
+            #expect(calls.first?.function.arguments["days"] == .int(6))
+            #expect(decoder.rejectedToolCallCount == 0)
+            return
+        }
         #expect(!events.contains { if case .toolCall = $0 { true } else { false } })
         let rejection = try #require(
             events.compactMap { event -> RejectedToolCall? in

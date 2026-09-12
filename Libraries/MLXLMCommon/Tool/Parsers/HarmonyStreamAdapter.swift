@@ -17,13 +17,15 @@ struct HarmonyStreamAdapter: TokenStreamDecoder {
     init?(
         tokenizer: any Tokenizer,
         tools: [[String: any Sendable]]?,
-        stopStrings: Set<String>
+        stopStrings: Set<String>,
+        toolCallPolicy: ToolCallPolicy = .init()
     ) {
         guard let parser = HarmonyFrameParser(tokenizer: tokenizer) else {
             return nil
         }
         self.parser = parser
-        self.router = HarmonyOutputRouter(tokenizer: tokenizer, tools: tools)
+        self.router = HarmonyOutputRouter(
+            tokenizer: tokenizer, tools: tools, toolCallPolicy: toolCallPolicy)
         self.stopStringFilter = StopStringFilter(stopStrings: stopStrings)
         self.additionalStopTokenIDs = parser.semanticStopTokenIDs
     }

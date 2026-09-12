@@ -81,7 +81,7 @@ if !toolResults.isEmpty {
 }
 ```
 
-When tool schemas are supplied, `Generation.toolCall` contains only parsed and
+By default, when tool schemas are supplied, `Generation.toolCall` contains only parsed and
 authorized calls that may be considered for dispatch. Tool-call-shaped output
 that is malformed, incomplete, exceeds the parser's bounded safety limit,
 omits a required argument, or names an undeclared function is emitted separately as
@@ -93,10 +93,14 @@ automatically.
 Cross-dialect recovery defaults to `ToolCallRecoveryPolicy.conservative`. It
 accepts only structurally complete calls naming an exactly declared tool and
 keeps syntax inside reasoning spans, Markdown code, and ordinary JSON data
-inert. Set `GenerateParameters.toolCallRecoveryPolicy` to `.disabled` to permit
+inert. Set `GenerateParameters.toolCallPolicy.recovery` to `.disabled` to permit
 only the selected native dialect, or `.permissive` to allow the documented
 end-of-stream outer-close repair. `GenerateCompletionInfo` reports both
 `recoveredToolCallCount` and `rejectedToolCallCount` for production telemetry.
+
+`GenerateParameters.toolCallPolicy.validation` defaults to `.strict`. Use
+`.permissive` only when the application validates arguments itself; declared-tool
+authorization and native parser requirements still apply.
 
 The example buffers accepted calls until the generation finishes. This makes
 dispatch atomic at the turn level: if a later call in the same model output is

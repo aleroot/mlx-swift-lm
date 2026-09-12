@@ -205,6 +205,31 @@ struct HarmonyOutputRouterTests {
         #expect(rejection.detail == "arguments.city must be a string")
     }
 
+    @Test("Harmony normalizes arguments before independently applying validation")
+    func normalizationAndValidationPolicy() throws {
+        let parameters: [String: any Sendable] = [
+            "type": "object", "properties": ["count": ["type": "integer"]],
+        ]
+        let tools: [[String: any Sendable]] = [
+            ["function": ["name": "search", "parameters": parameters] as [String: any Sendable]]
+        ]
+        for policy in ToolCallValidationPolicy.allCases {
+            for (text, expected): (String, JSONValue?) in [
+                ("6", .int(6)), ("six", policy == .strict ? nil : .string("six")),
+            ] {
+                let events = try route(
+                    [
+                        "<|channel|>", "commentary to=functions.search", "<|message|>",
+                        "{\"count\":\"\(text)\"}", "<|call|>",
+                    ],
+                    tools: tools, toolCallPolicy: .init(validation: policy))
+                #expect(
+                    events.compactMap(\.toolCall).first?.function.arguments["count"] == expected)
+                #expect(events.compactMap(\.rejectedToolCall).count == (expected == nil ? 1 : 0))
+            }
+        }
+    }
+
     @Test("unsupported schema assertions cannot reject a Harmony call")
     func unsupportedSchemaAssertionFailsOpen() throws {
         let tools: [[String: any Sendable]] = [
@@ -300,12 +325,16 @@ private func route(_ pieces: [String], allowed: Set<String>) throws -> [HarmonyO
         })
 }
 
-private func route(_ pieces: [String], tools: [[String: any Sendable]]) throws
+private func route(
+    _ pieces: [String], tools: [[String: any Sendable]],
+    toolCallPolicy: ToolCallPolicy = .init()
+) throws
     -> [HarmonyOutputRouter.Event]
 {
     let tokenizer = RouterDeterministicTokenizer(tokens: pieces + routerControlTokens)
     var parser = try #require(HarmonyFrameParser(tokenizer: tokenizer))
-    var router = HarmonyOutputRouter(tokenizer: tokenizer, tools: tools)
+    var router = HarmonyOutputRouter(
+        tokenizer: tokenizer, tools: tools, toolCallPolicy: toolCallPolicy)
     var events: [HarmonyOutputRouter.Event] = []
     for piece in pieces {
         let id = try #require(tokenizer.convertTokenToId(piece))
