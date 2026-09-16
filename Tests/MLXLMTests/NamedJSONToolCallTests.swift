@@ -5,7 +5,7 @@ import Testing
 
 @testable import MLXLMCommon
 
-/// GLM-4-0414's markerless `name\n{json}` dialect (#491).
+/// GLM-4-0414's markerless `name\n{json}` dialect.
 @Suite("Markerless named-JSON tool calls")
 struct NamedJSONToolCallTests {
     private static let tools: [[String: any Sendable]] = [
@@ -26,6 +26,18 @@ struct NamedJSONToolCallTests {
         [
             "type": "function",
             "function": ["name": "get_time"] as [String: any Sendable],
+        ],
+        [
+            "type": "function",
+            "function": [
+                "name": "write_file",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "contents": ["type": "string"] as [String: any Sendable]
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
         ],
     ]
 
@@ -98,6 +110,21 @@ struct NamedJSONToolCallTests {
         let content = "<tool_call>\n" + Self.call + "\n</tool_call>"
         let call = try #require(GLM4ToolCallParser().parse(content: content, tools: nil))
         #expect(call.function == Self.weatherInParis)
+    }
+
+    @Test("Protocol markers inside JSON strings remain unchanged")
+    func parserPreservesProtocolMarkersInStringArguments() throws {
+        let callText =
+            "write_file\n{\"contents\": \"<tool_call>hello</tool_call> world\"}"
+        let inputs = [callText, "<tool_call>\(callText)</tool_call>"]
+
+        for content in inputs {
+            let call = try #require(GLM4ToolCallParser().parse(content: content, tools: nil))
+            #expect(
+                call.function.arguments["contents"]
+                    == .string("<tool_call>hello</tool_call> world"),
+                "\(content)")
+        }
     }
 
     @Test("The parser declines payloads that are not exactly one call")

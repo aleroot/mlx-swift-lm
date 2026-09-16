@@ -19,15 +19,17 @@ public struct GLM4ToolCallParser: ToolCallParser, Sendable {
     public init() {}
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
-        // Strip tags if present
-        var text = content
-        if let start = startTag {
-            text = text.replacingOccurrences(of: start, with: "")
+        // Strip wrapper tags only at the boundaries so literal tag strings in
+        // JSON arguments remain unchanged.
+        var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let start = startTag, text.hasPrefix(start) {
+            text = String(text.dropFirst(start.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if let end = endTag {
-            text = text.replacingOccurrences(of: end, with: "")
+        if let end = endTag, text.hasSuffix(end) {
+            text = String(text.dropLast(end.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Extract function name (everything before first <arg_key>)
         guard let argKeyStart = text.range(of: "<arg_key>") else {
