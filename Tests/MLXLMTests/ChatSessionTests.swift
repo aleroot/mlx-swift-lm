@@ -482,6 +482,11 @@ public class ChatSessionTests: XCTestCase {
         return (text, try XCTUnwrap(completionInfo))
     }
 
+    /// The values a realized cache holds, read out so they can leave the session.
+    private static func cachedValues(_ cache: [KVCache]?) -> [[Float]] {
+        (cache ?? []).flatMap(\.state).map { $0.asType(.float32).asArray(Float.self) }
+    }
+
     private let generationParameters = GenerateParameters(maxTokens: 50)
 
     private let targetLength = 1
@@ -2137,6 +2142,89 @@ public class ChatSessionTests: XCTestCase {
             context, promptCache: snapshot, generateParameters: generationParameters)
         let result = try await restored.respond(to: "hello again")
         XCTAssertGreaterThan(result.count, targetLength, result)
+    }
+
+    func testForkContinuesTheConversationOfItsSource() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: "first")
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+
+        let branch = await session.fork()
+        let branchReply = try await collectGeneration(branch.streamDetails(to: "second"))
+        let sourceReply = try await collectGeneration(session.streamDetails(to: "third"))
+
+        // Both continue from the first prompt and the tokens it generated.
+        XCTAssertEqual(branchReply.info.cachedPromptTokenCount, firstPromptLength + 3)
+        XCTAssertEqual(sourceReply.info.cachedPromptTokenCount, firstPromptLength + 3)
+    }
+
+    func testForkWithHistoryPrefillsOnlyWhatItsCacheDoesNotHold() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let instructions = "shared instructions"
+        let session = ChatSession(
+            model(processor: processor),
+            instructions: instructions,
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: "first")
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+        let sourceState = await session.withCache(Self.cachedValues)
+
+        let fork = await session.fork(history: [])
+        let forkReply = try await collectGeneration(fork.streamDetails(to: "second"))
+        let forkRenderedLength = await lengthIterator.next()
+        let forkPromptLength = try XCTUnwrap(forkRenderedLength)
+
+        // The system marker, the instructions, their end marker and the user marker.
+        let sharedPrefixLength = instructions.unicodeScalars.count + 3
+        XCTAssertEqual(forkReply.info.cachedPromptTokenCount, sharedPrefixLength)
+        XCTAssertEqual(forkReply.info.promptTokenCount, forkPromptLength - sharedPrefixLength)
+
+        // The fork rewrote rows the source holds, and the source did not see it.
+        let stateAfterFork = await session.withCache(Self.cachedValues)
+        XCTAssertEqual(stateAfterFork, sourceState)
+        let sourceReply = try await collectGeneration(session.streamDetails(to: "third"))
+        XCTAssertEqual(sourceReply.info.cachedPromptTokenCount, firstPromptLength + 3)
+    }
+
+    func testForkStartsColdWhenTheTranscriptCarriesMedia() async throws {
+        let (_, continuation) = AsyncStream<Int>.makeStream()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = MediaAwareInputProcessor(tokenizer: tokenizer)
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        let answer = try await session.respond(
+            to: "inspect this",
+            image: .array(MLXArray([Float(0)])))
+
+        // The source's tokens exactly, over a different image.
+        let fork = await session.fork(history: [
+            .user("inspect this", images: [.array(MLXArray([Float(1)]))]),
+            .assistant(answer),
+        ])
+        let reply = try await collectGeneration(fork.streamDetails(to: "describe it"))
+
+        XCTAssertEqual(reply.info.cachedPromptTokenCount, 0)
     }
 
     func testCurrentCacheNilForHistorySessionBeforeGeneration() async throws {
