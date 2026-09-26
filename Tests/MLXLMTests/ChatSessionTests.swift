@@ -262,6 +262,64 @@ public class ChatSessionTests: XCTestCase {
         }
     }
 
+    /// Counts `KVCache.copy()` calls across every cache a model creates.
+    private final class CopyCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        func increment() {
+            lock.withLock { count += 1 }
+        }
+
+        var value: Int {
+            lock.withLock { count }
+        }
+    }
+
+    private final class CopyCountingCache: KVCacheSimple {
+        let copies: CopyCounter
+
+        init(copies: CopyCounter) {
+            self.copies = copies
+            super.init()
+        }
+
+        override func copy() -> any KVCache {
+            copies.increment()
+            return super.copy()
+        }
+    }
+
+    /// Serves `base` over caches that count their copies.
+    private final class CopyCountingLanguageModel: Module, LanguageModel {
+        let base: any LanguageModel
+        let copies: CopyCounter
+
+        init(_ base: any LanguageModel, copies: CopyCounter) {
+            self.base = base
+            self.copies = copies
+            super.init()
+        }
+
+        func prepare(
+            _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+        ) throws -> PrepareResult {
+            try base.prepare(input, cache: cache, state: state, prefill: prefill)
+        }
+
+        func callAsFunction(
+            _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+        ) -> LMOutput {
+            base(input, cache: cache, state: state)
+        }
+
+        func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+            try base.newCache(parameters: parameters).map { _ in
+                CopyCountingCache(copies: copies)
+            }
+        }
+    }
+
     private struct EmptyChatTemplateTokenizer: Tokenizer {
         var bosToken: String? = nil
         var eosToken: String? = nil
@@ -2225,6 +2283,36 @@ public class ChatSessionTests: XCTestCase {
         let reply = try await collectGeneration(fork.streamDetails(to: "describe it"))
 
         XCTAssertEqual(reply.info.cachedPromptTokenCount, 0)
+
+        // A branch keeps the transcript its cache was built from, media included.
+        let branch = await session.fork()
+        let branchReply = try await collectGeneration(branch.streamDetails(to: "describe it"))
+        XCTAssertGreaterThan(branchReply.info.cachedPromptTokenCount, 0)
+    }
+
+    func testForkStartingColdCopiesNoCache() async throws {
+        let (_, continuation) = AsyncStream<Int>.makeStream()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = MediaAwareInputProcessor(tokenizer: tokenizer)
+        let copies = CopyCounter()
+        var context = Self.makeModel(
+            processor: processor,
+            configuration: processor.configuration,
+            tokenizer: processor.tokenizer)
+        context.model = CopyCountingLanguageModel(context.model, copies: copies)
+        let session = ChatSession(context, generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: "first")
+
+        _ = await session.fork(history: [
+            .user("inspect this", images: [.array(MLXArray([Float(0)]))])
+        ])
+        XCTAssertEqual(copies.value, 0)
+
+        // A text transcript reuses the cache, so the same session copies every layer.
+        _ = await session.fork(history: [])
+        let layerCount = await session.withCache { $0?.count ?? 0 }
+        XCTAssertEqual(copies.value, layerCount)
     }
 
     func testCurrentCacheNilForHistorySessionBeforeGeneration() async throws {

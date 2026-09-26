@@ -316,18 +316,19 @@ public final class ChatSession {
             return .kvcache(stored.copy())
         }
 
-        /// This cache paired with `history`, a transcript it was not built from.
+        /// A copy of this cache paired with `history`, a transcript it was not built from.
         ///
         /// Equal tokens prove equal cache contents only for text: a media
         /// placeholder renders the same tokens for different pixels. A
-        /// transcript with media on either side therefore starts cold.
+        /// transcript with media on either side therefore starts cold, and
+        /// nothing is copied.
         func replacingTranscript(with history: [Chat.Message]) -> Cache {
             let carriesMedia = { (messages: [Chat.Message]) in
                 messages.contains {
                     !$0.images.isEmpty || !$0.videos.isEmpty || !$0.audios.isEmpty
                 }
             }
-            guard case .kvcache(var stored) = self,
+            guard case .kvcache(let stored) = self,
                 var conversation = stored.conversation,
                 !carriesMedia(conversation.messages), !carriesMedia(history)
             else {
@@ -335,8 +336,9 @@ public final class ChatSession {
             }
             conversation.messages = history
             conversation.transcriptBuiltCache = false
-            stored.conversation = conversation
-            return .kvcache(stored)
+            var copied = stored.copy()
+            copied.conversation = conversation
+            return .kvcache(copied)
         }
     }
 
@@ -1609,12 +1611,11 @@ public final class ChatSession {
     /// - Returns: a session that owns a copy of this session's cache
     public nonisolated(nonsending) func fork(history: [Chat.Message]? = nil) async -> ChatSession {
         let draftModel = await loadedDraftModel.read { $0 }
-        let copied = await cache.read { cache in
-            SendableBox(cache.copy())
+        let history = SendableBox(history)
+        let forked = await cache.read { cache in
+            SendableBox(history.consume().map(cache.replacingTranscript) ?? cache.copy())
         }.consume()
-        return ChatSession(
-            forking: self, cache: history.map(copied.replacingTranscript) ?? copied,
-            draftModel: draftModel)
+        return ChatSession(forking: self, cache: forked, draftModel: draftModel)
     }
 
     /// Wait for exclusive access to the KVCache.
