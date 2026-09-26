@@ -168,6 +168,47 @@ public class EvalTests: XCTestCase {
         XCTAssertEqual(output.shape, [1, 5, 100])
     }
 
+    func testTokenIteratorReportsChosenAndTopLogProbabilities() throws {
+        let model = makeQualityGateLlamaModel()
+        var iterator = try TokenIterator(
+            input: LMInput(text: .init(tokens: MLXArray([1, 2, 3]))),
+            model: model,
+            parameters: .init(maxTokens: 2, temperature: 0, logProbabilities: 3))
+
+        let token = try XCTUnwrap(iterator.next())
+        let probabilities = try XCTUnwrap(iterator.lastLogProbabilities)
+
+        XCTAssertEqual(probabilities.chosen.token, token)
+        XCTAssertEqual(probabilities.topLogProbabilities.count, 3)
+        XCTAssertEqual(probabilities.topLogProbabilities.first?.token, token)
+        XCTAssertLessThanOrEqual(probabilities.chosen.logProbability, 0)
+        for (first, second) in zip(
+            probabilities.topLogProbabilities,
+            probabilities.topLogProbabilities.dropFirst()
+        ) {
+            XCTAssertGreaterThanOrEqual(first.logProbability, second.logProbability)
+        }
+    }
+
+    func testLogProbabilityReportingPreservesSeededCategoricalSampling() throws {
+        let model = makeQualityGateLlamaModel()
+        let input = LMInput(text: .init(tokens: MLXArray([1, 2, 3])))
+
+        func generate(logProbabilities: Int?) throws -> [Int] {
+            var iterator = try TokenIterator(
+                input: input,
+                model: model,
+                parameters: .init(
+                    maxTokens: 16,
+                    temperature: 0.6,
+                    logProbabilities: logProbabilities,
+                    seed: 42))
+            return Array(iterator)
+        }
+
+        XCTAssertEqual(try generate(logProbabilities: nil), try generate(logProbabilities: 5))
+    }
+
     func testLlamaVarianceNormalizedKVCacheGenerationPath() throws {
         let config = LlamaConfiguration(
             hiddenSize: 64, hiddenLayers: 2, intermediateSize: 128, attentionHeads: 2,

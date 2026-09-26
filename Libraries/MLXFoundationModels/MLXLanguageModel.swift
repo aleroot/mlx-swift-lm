@@ -1276,6 +1276,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         }
                     case .info(let info):
                         result.completionInfo = info
+                    case .probability:
+                        break
                     }
                 }
             } catch {
@@ -1524,6 +1526,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     break
                 case .rejectedToolCall(let rejection):
                     throw RejectedToolCallError(rejection)
+                case .probability:
+                    break
                 }
             }
         }
@@ -1659,6 +1663,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         }
                     case .info(let info):
                         completionInfo = info
+                    case .probability:
+                        break
                     }
                 }
             } catch {

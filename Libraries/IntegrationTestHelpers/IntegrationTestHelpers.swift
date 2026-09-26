@@ -445,6 +445,8 @@ public enum ChatSessionTests {
                 throw RejectedToolCallError(rejection)
             case .info(let completionInfo):
                 info = completionInfo
+            case .probability:
+                break
             }
         }
         print()
@@ -527,6 +529,8 @@ public enum ChatSessionTests {
                 throw RejectedToolCallError(rejection)
             case .info(let info):
                 completion = info
+            case .probability:
+                break
             }
         }
 
@@ -1250,6 +1254,8 @@ public enum ToolCallTests {
                 case .rejectedToolCall(let rejection):
                     throw RejectedToolCallError(rejection)
                 case .info:
+                    break
+                case .probability:
                     break
                 }
             }

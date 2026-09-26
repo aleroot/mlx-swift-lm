@@ -118,6 +118,46 @@ struct SpeculativeDecodingTests {
         #expect(normalTokens == speculativeTokens)
     }
 
+    @Test func `Speculative API falls back to standard decoding for log probabilities`()
+        async throws
+    {
+        let vocabularySize = 100
+        let tokenizer = TestTokenizer(vocabularySize: vocabularySize)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "log-probability-fallback-test"),
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let model = StableTransitionLanguageModel(vocabularySize: vocabularySize)
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: model,
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        let input = LMInput(tokens: MLXArray([92, 85, 2, 95, 55, 7, 94, 42]))
+        let parameters = GenerateParameters(maxTokens: 3, temperature: 0, logProbabilities: 2)
+
+        var reported = [GenerateTokenLogProbabilities]()
+        var completion: GenerateCompletionInfo?
+        for await generation in try generateTokens(
+            input: input, parameters: parameters, context: context,
+            draftModel: StableTransitionLanguageModel(vocabularySize: vocabularySize),
+            numDraftTokens: 2)
+        {
+            if let logProbabilities = generation.logProbabilities {
+                reported.append(logProbabilities)
+            }
+            if let info = generation.info {
+                completion = info
+            }
+        }
+
+        #expect(reported.count == 3)
+        #expect(reported.allSatisfy { $0.topLogProbabilities.count == 2 })
+        #expect(completion?.speculativeDecodingTelemetry == nil)
+    }
+
     @Test(arguments: [2, 8, 48], [false, true])
     func `Speculative decoding Gemma3 smoke test`(
         numDraftTokens: Int,
