@@ -256,14 +256,11 @@ public struct MuseGlimmerConfiguration: Codable, Sendable {
 
 // MARK: - Compiled fusions
 
-// Muse-Glimmer's block norms run 4× per layer × 52 layers for every decoded
-// token. Executed eagerly, each `MuseCenteredRMSNorm` is ~7 tiny kernel
-// launches and per-op dispatch dominates decode time. `compile` collapses the
-// elementwise regions into single kernels while executing the *same
-// operations in the same order and dtypes* as the eager reference, so outputs
-// are bit-for-bit identical (verified against the eager path on random inputs
-// and by end-to-end greedy-token comparison on the 30B checkpoint). This is
-// the same technique — with the same rationale — as `Gemma4Text.swift`.
+// Muse-Glimmer's block norms run 4× per layer × 52 layers per decoded token; eagerly each
+// `MuseCenteredRMSNorm` is ~7 tiny kernel launches and dispatch dominates decode time.
+// `compile` collapses the elementwise regions while running the *same operations in the same
+// order and dtypes* as the eager reference, so outputs are bit-for-bit identical (verified on
+// the eager path and by greedy tokens on the 30B checkpoint). As in `Gemma4Text.swift`.
 
 /// Exact fusion of the `MuseCenteredRMSNorm` body. `eps` arrives as a scalar
 /// fp32 array so the two eps values in play (`rms_norm_eps` for the pre-norms,
@@ -327,17 +324,14 @@ private class MuseRMSNormNoScale: Module, UnaryLayer {
     }
 }
 
-/// RMS norm whose checkpoint scale is centered at zero, so the effective scale
-/// is `1 + weight`.
+/// RMS norm whose checkpoint scale is centered at zero, so the effective scale is
+/// `1 + weight`.
 ///
-/// Not the same as `MLXNN.RMSNorm` (which uses `weight` directly) and not
-/// mean-subtracting despite the name. The fp32 cast ordering follows the
-/// reference exactly — folding `1 + weight` in bf16 instead drifts enough to
-/// change decode choices. `MLXFast.rmsNorm(x, weight: 1 + w_f32, eps:)` is
-/// also *not* equivalent: its multiply association differs and drifts by
-/// 1 bf16 ulp on ~every call (measured). The forward therefore runs the exact
-/// reference arithmetic through `_centeredRMSNorm` / `_addCenteredRMSNorm`,
-/// which only fuse kernel launches.
+/// Not `MLXNN.RMSNorm` (which uses `weight` directly) and not mean-subtracting despite the
+/// name. Neither folding `1 + weight` in bf16 nor `MLXFast.rmsNorm(x, weight: 1 + w_f32,
+/// eps:)` is equivalent: the first drifts enough to change decode choices, the second by
+/// 1 bf16 ulp on ~every call (measured). The forward therefore runs the exact reference
+/// arithmetic through `_centeredRMSNorm` / `_addCenteredRMSNorm`, which only fuse kernels.
 private class MuseCenteredRMSNorm: Module, UnaryLayer {
     @ModuleInfo var weight: MLXArray
     let eps: Float
@@ -1485,12 +1479,10 @@ public struct MuseGlimmerProcessor: UserInputProcessor {
             messages: messages, tools: input.tools, additionalContext: input.additionalContext)
 
         guard !input.images.isEmpty else {
-            // Deliberately no attention mask: a batch-of-one text prompt has
-            // nothing to pad, the language model never reads `LMInput.text.mask`
-            // (its layer masks are built from the KV caches), and a non-nil mask
-            // makes `ChatSession` treat the turn as non-resumable — vetoing
-            // prompt-cache reuse (`carriesAttentionMask`) and forcing a full
-            // re-prefill of the conversation on every agentic turn.
+            // No attention mask: a batch of one has nothing to pad, the language model never
+            // reads `LMInput.text.mask` (its layer masks come from the KV caches), and a
+            // non-nil mask makes `ChatSession` treat the turn as non-resumable, vetoing
+            // prompt-cache reuse and re-prefilling the conversation on every agentic turn.
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             return LMInput(text: .init(tokens: promptArray))
         }

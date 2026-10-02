@@ -1019,11 +1019,9 @@ struct MuseGlimmerImageBudgetTests {
 @Suite("MuseGlimmer text-only prepare")
 struct MuseGlimmerTextOnlyPrepareTests {
 
-    /// A text-only turn must not carry an attention mask: a batch of one has
-    /// nothing to pad, the model never reads `LMInput.text.mask`, and
-    /// `ChatSession` treats a masked input as non-resumable — vetoing prompt
-    /// cache reuse and re-prefilling the whole conversation on every agentic
-    /// turn.
+    /// A text-only turn must not carry an attention mask: a batch of one has nothing to pad, the
+    /// model never reads `LMInput.text.mask`, and `ChatSession` treats a masked input as
+    /// non-resumable, vetoing prompt-cache reuse on every agentic turn.
     @Test("text-only input carries no attention mask")
     func noMaskWithoutImages() async throws {
         let processor = MuseGlimmerProcessor(

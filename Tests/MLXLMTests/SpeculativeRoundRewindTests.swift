@@ -7,13 +7,12 @@ import Testing
 
 @testable import MLXLMCommon
 
-/// Deterministic causal model that keeps a real sliding-window ring.
+/// Deterministic causal model over a real sliding-window ring.
 ///
-/// Logits depend only on the input token (high-margin affine transition), so
-/// batched verification and token-by-token decoding compute the same function;
-/// the K/V writes are real, so speculative rounds run against a genuine
-/// `RotatingKVCache` — including past the wrap, where the ring stops being
-/// trimmable and rejected drafts can only be taken back by a staged round.
+/// Logits depend only on the input token (high-margin affine transition), so batched verification
+/// and token-by-token decoding compute the same function; the K/V writes are real, so rounds run
+/// against a genuine `RotatingKVCache`, including past the wrap where only a staged round can
+/// take back rejected drafts.
 private final class RingTransitionModel: Module, LanguageModel, KVCacheDimensionProvider {
     let vocabularySize: Int
     let windowSize: Int
