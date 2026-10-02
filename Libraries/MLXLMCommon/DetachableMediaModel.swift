@@ -26,13 +26,11 @@ public struct MediaWeightSource: Sendable {
 
 /// A model whose media modules, a vision or audio tower and its projector, load on first use.
 ///
-/// Model factories detach the modules before loading, so a text-only session never reads
-/// their weights. The first input with media calls ``loadMediaModules()``, which reads,
-/// verifies and evaluates them apart from the model and only then attaches them. The
-/// model never holds unevaluated arrays, and loading never touches the language model.
-///
-/// `sanitize(weights:metadata:)` must not depend on whether the modules are attached, and
-/// ``LanguageModel/prepare()`` does not run again after they load.
+/// Factories detach the modules before loading, so a text-only session never reads their weights.
+/// The first input with media calls ``loadMediaModules()``, which reads, verifies and evaluates
+/// them apart from the model and only then attaches them: the model never holds unevaluated
+/// arrays, and the language model is never touched. `sanitize(weights:metadata:)` must not depend
+/// on whether they are attached, and ``LanguageModel/prepare()`` does not run again afterwards.
 public protocol DetachableMediaModel: BaseLanguageModel {
     /// Top-level module keys of the media modules, such as `vision_tower`.
     ///
@@ -108,9 +106,8 @@ extension DetachableMediaModel {
 
 /// Detaches the media modules of `model`, if it has any.
 ///
-/// A free function rather than a cast at the call site: an `async` loader that casts and calls on
-/// the same value cannot prove to region isolation that the model stays disconnected, and it is
-/// the model the loader goes on to return as `sending`.
+/// A free function, not a cast at the call site: an `async` loader that casts and calls on the
+/// model it goes on to return as `sending` fails region isolation.
 package func detachMediaModulesIfSupported(
     of model: any BaseLanguageModel, loadingFrom source: MediaWeightSource
 ) throws {

@@ -1034,12 +1034,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     private var mainCommittedPendingTokenCount = 0
     private var draftCommittedPendingTokenCount = 0
 
-    /// Sticky single-token fallback, entered when neither a staged round nor a
-    /// trim can rewind a speculative round. Generation stays correct — it just
-    /// stops speculating.
-    private var passthrough = false
-    /// Why speculation stopped; `nil` while rounds are still speculative.
-    private(set) var passthroughReason: String? = nil
+    /// Why speculation stopped and the rest of the stream decodes one token at a time, or `nil`
+    /// while rounds are still speculative. Engaged when a cache can neither stage nor trim a
+    /// round: generation stays correct, it just stops speculating.
+    private(set) var passthroughReason: String?
 
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
@@ -1112,12 +1110,10 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             throw KVCacheError(
                 message: "Speculative decoding requires a trimmable draft KV cache.")
         }
-        // The main cache rewinds rejected drafts either by trimming or through a
-        // staged round — which a wrapped sliding-window ring requires, because a
-        // rotating cache stops being trimmable once it wraps. Probe by opening a
-        // round at the width rounds will use and discarding it, exactly as
-        // `MTPSpeculativeTokenIterator` does, so this check cannot drift from
-        // the leaf classification.
+        // The main cache rewinds rejected drafts by trimming, or through a staged round once a
+        // rotating cache has wrapped and stopped being trimmable. Probe with a round at the
+        // width rounds will use, as `MTPSpeculativeTokenIterator` does, so this check cannot
+        // drift from the leaf classification.
         if !canTrimPromptCache(mainCacheStorage.cache) {
             guard
                 let probe = mainCacheStorage.beginRound(
@@ -1219,22 +1215,16 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         guard numDraft > 0 else {
             return
         }
-        guard !passthrough else {
+        guard passthroughReason == nil else {
             plainRound()
             return
         }
 
-        // Rewinding rejected drafts must be possible *before* anything is
-        // written. A staged round presents the verify K/V beside the live
-        // caches and commits only the accepted rows, which stays exact after a
-        // rotating sliding-window cache wraps and can no longer trim. When no
-        // round can be opened (exotic topologies), fall back to trim-based
-        // rewind only while every leaf can still take back the round's width;
-        // otherwise decode without speculation rather than corrupt the cache.
-        //
-        // On the first round after a `.tokens`-returning `prepare`, `y` is the
-        // whole remaining prompt, so the round is as wide as prompt + drafts —
-        // the width must come from `y`, not from `numDraft` alone.
+        // Rewinding must be possible *before* anything is written. A staged round commits only
+        // the accepted rows, so it stays exact after a rotating cache wraps and can no longer
+        // trim; with no round available, fall back to trim only while every leaf can still take
+        // back the width. After a `.tokens`-returning `prepare`, `y` is the whole remaining
+        // prompt, so the width comes from `y` rather than from `numDraft` alone.
         let ySize = y.cacheSequenceLength
         let roundWidth = ySize + numDraft
         // A cache-less model has nothing to stage or rewind: an empty round
@@ -1245,8 +1235,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         if round == nil,
             !mainCache.allSatisfy({ $0.isTrimmable(after: roundWidth) })
         {
-            switchToPassthrough(
-                reason: "main KV cache can neither stage nor trim a speculative round")
+            passthroughReason = "main KV cache can neither stage nor trim a speculative round"
             plainRound()
             return
         }
@@ -1334,11 +1323,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             targetVerified: numDraft + 1
         )
 
-        // Rewind caches for rejected tokens. Committing a staged round keeps
-        // everything `y` carried plus the accepted prefix and the correction/
-        // bonus token, and drops the rejected tail without the live caches
-        // ever holding rejected rows; it also advances the storage's
-        // processed-token timeline by exactly that much.
+        // Rewind caches for rejected tokens. Committing a staged round keeps what `y` carried
+        // plus the accepted prefix and the correction token, drops the rejected tail without the
+        // live caches ever holding it, and advances the processed-token timeline to match.
         if let round {
             mainCacheStorage.commit(round, retaining: ySize + accepted)
         } else {
@@ -1348,11 +1335,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         if draftCacheStorage.trim(draftTrimRequest) < draftTrimRequest,
             !draftCache.isEmpty
         {
-            // A draft cache that cannot rewind (e.g. its own sliding window
-            // wrapped) would desynchronize future proposals. Stop speculating
-            // rather than draft from a corrupted history. Cache-less draft
-            // models are exempt: they have nothing to rewind.
-            switchToPassthrough(reason: "draft KV cache could not rewind rejected drafts")
+            // A draft cache that cannot rewind (its own window wrapped) would desynchronize
+            // future proposals: stop speculating rather than draft from a corrupted history.
+            passthroughReason = "draft KV cache could not rewind rejected drafts"
         }
 
         // Apply dynamic cache quantization after rewind
@@ -1392,18 +1377,6 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         draftCommittedPendingTokenCount = 0
         y = .init(tokens: token)
         kvCachePlan.apply(to: mainCacheStorage)
-    }
-
-    /// Switch to single-token generation for the remainder of the stream.
-    /// Sticky — once flipped, `next()` never returns to speculation.
-    private mutating func switchToPassthrough(reason: String) {
-        if passthroughReason == nil {
-            // One-time only; stdlib `print` is intentional — the iterator is a
-            // low-level component without access to a logger.
-            print("[SpeculativeTokenIterator] passthrough mode: \(reason)")
-            passthroughReason = reason
-        }
-        passthrough = true
     }
 
     mutating public func next() -> Int? {
