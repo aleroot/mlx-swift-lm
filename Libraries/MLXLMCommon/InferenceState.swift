@@ -49,23 +49,11 @@ package func prepareInferenceState(
 ///
 /// All custom checkpoint loaders should finalize through this function so
 /// inference-only optimizations are applied consistently.
-///
-/// Weights matching `deferredWeightPrefixes` are left lazy, see
-/// ``DeferredWeightsProviding``. Everything else is realized here.
 @discardableResult
 package func materializeModelForInference(
-    _ model: BaseLanguageModel,
-    deferredWeightPrefixes: [String] = []
+    _ model: BaseLanguageModel
 ) -> InferenceStatePreparationReport {
     let report = prepareInferenceState(in: model)
-    if deferredWeightPrefixes.isEmpty {
-        eval(model)
-    } else {
-        let materialized = model.parameters().flattened()
-            .compactMap { key, value in
-                isDeferredWeight(key, prefixes: deferredWeightPrefixes) ? nil : value
-            }
-        eval(materialized)
-    }
+    eval(model)
     return report
 }

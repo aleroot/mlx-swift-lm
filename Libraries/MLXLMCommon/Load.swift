@@ -151,17 +151,12 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
 /// loader's behavior for that file.
-/// Whether `key` names a weight under one of `prefixes`.
 ///
-/// Weight names are matched both before `sanitize` (raw checkpoint keys, which may carry an
-/// extra leading scope such as `model.`) and after (module paths), so a prefix matches at
-/// the start of the key or after any `.`.
-func isDeferredWeight(_ key: String, prefixes: [String]) -> Bool {
-    prefixes.contains { key.hasPrefix($0) || key.contains("." + $0) }
-}
-
+/// `weightFilter` decides which tensors to read. A rejected name is never evaluated and never
+/// appears in the result, so its bytes stay in the (memory-mapped) file; see
+/// ``OnDemandMediaEncoders``.
 func loadWeightArrays(
-    urls: [URL], deferredWeightPrefixes: [String] = []
+    urls: [URL], weightFilter: @Sendable (String) -> Bool = { _ in true }
 ) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
@@ -176,7 +171,11 @@ func loadWeightArrays(
         var spansPerFile = [[SafetensorSpan]?]()
         var totalBytes: Int64 = 0
         for url in urls {
-            let spans = try? safetensorSpansInFileOrder(url: url)
+            // Filtered before grouping so the byte-balanced ranges cover only what is read.
+            // `nil` means the header could not be parsed; empty means nothing was selected.
+            let spans = (try? safetensorSpansInFileOrder(url: url))?.filter {
+                weightFilter($0.name)
+            }
             spansPerFile.append(spans)
             totalBytes += spans?.reduce(0) { $0 + $1.byteCount } ?? 0
         }
@@ -185,17 +184,18 @@ func loadWeightArrays(
         let groupBytes = max(minimumBytesPerLoadGroup, totalBytes / Int64(concurrency))
         var items = [WorkItem]()
         for (file, url) in urls.enumerated() {
-            if let spans = spansPerFile[file], !spans.isEmpty {
-                let bytes = spans.reduce(0) { $0 + $1.byteCount }
-                let groupCount = max(1, Int(bytes / groupBytes))
-                for range in contiguousLoadGroups(
-                    byteCounts: spans.map(\.byteCount), groupCount: groupCount)
-                {
-                    items.append(
-                        WorkItem(file: file, url: url, names: spans[range].map(\.name)))
-                }
-            } else {
+            guard let spans = spansPerFile[file] else {
                 items.append(WorkItem(file: file, url: url, names: nil))
+                continue
+            }
+            guard !spans.isEmpty else { continue }
+            let bytes = spans.reduce(0) { $0 + $1.byteCount }
+            let groupCount = max(1, Int(bytes / groupBytes))
+            for range in contiguousLoadGroups(
+                byteCounts: spans.map(\.byteCount), groupCount: groupCount)
+            {
+                items.append(
+                    WorkItem(file: file, url: url, names: spans[range].map(\.name)))
             }
         }
         return items
@@ -216,18 +216,11 @@ func loadWeightArrays(
                     if let array = all[name] { selected[name] = array }
                 }
             } else {
-                selected = all
+                selected = all.filter { key, _ in weightFilter(key) }
             }
 
-            // force this range's I/O here, on this stream, in file-offset order --
-            // except deferred weights, which stay lazy until their first use
-            let toEval =
-                deferredWeightPrefixes.isEmpty
-                ? Array(selected.values)
-                : selected.compactMap { key, value in
-                    isDeferredWeight(key, prefixes: deferredWeightPrefixes) ? nil : value
-                }
-            if !toEval.isEmpty { eval(toEval) }
+            // force this range's I/O here, on this stream, in file-offset order
+            if !selected.isEmpty { eval(Array(selected.values)) }
             state.merge(file: item.file, weights: selected, metadata: metadata)
         } catch {
             state.record(error: error)
@@ -382,7 +375,8 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// The weight files are chosen from `model.safetensors.index.json` when it names files that
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
 /// files it needs by conforming to ``AdditionalWeightFilesProviding``, and a caller can override
-/// the choice with ``ModelConfiguration/weightFileSelection``.
+/// the choice with ``ModelConfiguration/weightFileSelection``. Weights belonging to a detached
+/// ``OnDemandMediaEncoders`` stack are not read at all.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
@@ -393,32 +387,28 @@ public func loadWeights(
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
-    let deferredPrefixes =
-        (model as? any DeferredWeightsProviding)?.deferredWeightPrefixes ?? []
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    (weights, metadata) = try loadWeightArrays(
-        urls: weightURLs, deferredWeightPrefixes: deferredPrefixes)
+
+    // Detached media encoders load on first use, so their tensors are not read here.
+    let skipped: [String] =
+        if let model = model as? any OnDemandMediaEncoders, !model.mediaEncodersAreAttached {
+            model.mediaWeightPrefixes
+        } else {
+            []
+        }
+    (weights, metadata) = try loadWeightArrays(urls: weightURLs) { key in
+        !matchesWeightPrefixes(key, prefixes: skipped)
+    }
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
-    // quantize if needed
-    if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
-            } else {
-                return nil
-            }
-        }
-    }
+    quantizeCheckpointLayers(
+        of: model, weights: weights, quantization: quantization,
+        perLayerQuantization: perLayerQuantization)
 
     // apply the loaded weights
     let parameters = ModuleParameters.unflattened(weights)
@@ -426,7 +416,23 @@ public func loadWeights(
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
-    materializeModelForInference(model, deferredWeightPrefixes: deferredPrefixes)
+    materializeModelForInference(model)
+}
+
+/// Quantize the layers `weights` carries scales for, matching how the checkpoint was saved.
+func quantizeCheckpointLayers(
+    of model: Module, weights: [String: MLXArray],
+    quantization: BaseConfiguration.Quantization?,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?
+) {
+    guard quantization != nil || perLayerQuantization != nil else { return }
+    quantize(model: model) { path, _ in
+        guard weights["\(path).scales"] != nil else { return nil }
+        if let perLayerQuantization {
+            return perLayerQuantization.quantization(layer: path)?.asTuple
+        }
+        return quantization?.asTuple
+    }
 }
 
 /// Async variant of

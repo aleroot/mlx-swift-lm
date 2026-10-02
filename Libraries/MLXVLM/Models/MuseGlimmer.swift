@@ -1105,16 +1105,31 @@ private class MuseGlimmerVisionAdapter: Module, UnaryLayer {
 
 // MARK: - Model
 
+/// Builds the vision stack for `init` and `makeMediaEncoders()`.
+private func makeMuseGlimmerMediaEncoders(_ config: MuseGlimmerConfiguration) -> (
+    tower: MuseGlimmerVisionModel, adapter: MuseGlimmerVisionAdapter, projection: Linear
+) {
+    (
+        MuseGlimmerVisionModel(config.visionConfiguration),
+        MuseGlimmerVisionAdapter(config),
+        Linear(
+            config.projectorHiddenSize, config.textConfiguration.hiddenSize, bias: false)
+    )
+}
+
 public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") private var languageModel: MuseGlimmerLanguageModel
-    @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel
-    @ModuleInfo(key: "vision_adapter") private var visionAdapter: MuseGlimmerVisionAdapter
-    @ModuleInfo(key: "vision_projection") private var visionProjection: Linear
+    @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel?
+    @ModuleInfo(key: "vision_adapter") private var visionAdapter: MuseGlimmerVisionAdapter?
+    @ModuleInfo(key: "vision_projection") private var visionProjection: Linear?
 
     /// Parameterless, so it carries no checkpoint weights.
     @ModuleInfo(key: "perception_emb_norm") private var perceptionEmbNorm: MuseRMSNormNoScale
 
     public let config: MuseGlimmerConfiguration
+
+    /// Set by the model factory, which loads the vision stack on the first image.
+    public var mediaWeightSource: MediaWeightSource?
 
     public var vocabularySize: Int { config.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
@@ -1128,10 +1143,10 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     public init(_ config: MuseGlimmerConfiguration) {
         self.config = config
         self._languageModel.wrappedValue = MuseGlimmerLanguageModel(config.textConfiguration)
-        self._visionTower.wrappedValue = MuseGlimmerVisionModel(config.visionConfiguration)
-        self._visionAdapter.wrappedValue = MuseGlimmerVisionAdapter(config)
-        self._visionProjection.wrappedValue = Linear(
-            config.projectorHiddenSize, config.textConfiguration.hiddenSize, bias: false)
+        let media = makeMuseGlimmerMediaEncoders(config)
+        self._visionTower.wrappedValue = media.tower
+        self._visionAdapter.wrappedValue = media.adapter
+        self._visionProjection.wrappedValue = media.projection
         self._perceptionEmbNorm.wrappedValue = MuseRMSNormNoScale(
             eps: config.textConfiguration.rmsNormEps)
         super.init()
@@ -1141,7 +1156,11 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         try languageModel.newCache(parameters: parameters)
     }
 
-    private func encodeImage(_ pixelValues: MLXArray, grid: [THW]) -> MLXArray {
+    private func encodeImage(_ pixelValues: MLXArray, grid: [THW]) throws -> MLXArray {
+        guard let visionTower, let visionAdapter, let visionProjection else {
+            throw VLMError.processing(
+                "Vision inputs were provided, but the vision tower is detached.")
+        }
         let dtype = visionTower.patchEmbedder.patchEmbedding.weight.dtype
         var features = visionTower(pixelValues.asType(dtype), grid: grid)
         features = visionAdapter(features)
@@ -1169,7 +1188,7 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
 
         // Image features are already normalized by `perception_emb_norm`; they
         // deliberately do not go through `embed_norm`.
-        let imageFeatures = encodeImage(pixelValues, grid: grid).asType(embeddings.dtype)
+        let imageFeatures = try encodeImage(pixelValues, grid: grid).asType(embeddings.dtype)
 
         let imageTokenId = config.imageTokenId
         let videoTokenId = config.videoTokenId
@@ -1195,6 +1214,10 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         _ input: LMInput, cache: [any KVCache], state: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
+        if input.image != nil {
+            try loadMediaEncoders()
+        }
+
         let convertedCache = cache.compactMap { $0 as KVCache }
 
         var tokens = input.text.tokens
@@ -1261,19 +1284,20 @@ extension MuseGlimmer: LoRAModel {
     }
 }
 
-extension MuseGlimmer: DeferredWeightsProviding {
-    /// The vision stack loads lazily by default.
-    ///
-    /// The checkpoint's vision weights are unquantized (~3.7 GB of bf16 in the 4-bit
-    /// repo) and a text-only session never evaluates them, so materializing them at
-    /// load time only pushes the working set past Metal's wired limit on 24 GB
-    /// machines (19.4 GB vs a 19.07 GB `recommendedMaxWorkingSetSize` on an M4 Pro).
-    /// Deferring them cuts the resident model to ~15.7 GB with bit-identical text
-    /// output. The first image or video input evaluates the tower, which reads the
-    /// weights from the memory-mapped checkpoint at that point -- image results are
-    /// unchanged, they just pay the read on first use.
-    public var deferredWeightPrefixes: [String] {
-        ["vision_tower.", "vision_adapter.", "vision_projection."]
+extension MuseGlimmer: OnDemandMediaEncoders {
+    // The vision stack is ~3.7 GB of bf16 that text-only sessions never read. Resident, it
+    // pushes the 4-bit model past the wired limit of a 24 GB Mac.
+    public var mediaEncoderKeys: [String] {
+        ["vision_tower", "vision_adapter", "vision_projection"]
+    }
+
+    public func makeMediaEncoders() -> [String: Module] {
+        let media = makeMuseGlimmerMediaEncoders(config)
+        return [
+            "vision_tower": media.tower,
+            "vision_adapter": media.adapter,
+            "vision_projection": media.projection,
+        ]
     }
 }
 

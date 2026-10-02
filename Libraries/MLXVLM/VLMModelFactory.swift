@@ -399,6 +399,14 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        // Media encoders load on first use, so loading the weights skips them.
+        try detachOnDemandMediaEncoders(
+            of: model,
+            loadingFrom: MediaWeightSource(
+                modelDirectory: modelDirectory,
+                weightFileSelection: configuration.weightFileSelection,
+                perLayerQuantization: baseConfig.perLayerQuantization))
+
         // Load EOS token IDs from config.json, with optional override from generation_config.json
         var eosTokenIds = baseConfig.effectiveEOSTokenIds
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
@@ -504,6 +512,14 @@ public final class VLMModelFactory: GenericModelFactory {
             tokenizer: tokenizer)
     }
 
+}
+
+// The cast runs here rather than in the async loader, where region isolation cannot prove
+// the model stays disconnected.
+private func detachOnDemandMediaEncoders(
+    of model: any LanguageModel, loadingFrom source: MediaWeightSource
+) throws {
+    try (model as? any OnDemandMediaEncoders)?.detachMediaEncoders(loadingFrom: source)
 }
 
 /// Error wrapper that includes the filename for better error messages.
