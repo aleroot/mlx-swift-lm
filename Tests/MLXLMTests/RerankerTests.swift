@@ -568,6 +568,30 @@ struct RerankerTests {
         #expect(scores[0] <= 1)
     }
 
+    @Test(arguments: [DType.bfloat16, .float16, .float32])
+    func jinaCosineSimilarityUsesFloat32Reductions(dtype: DType) {
+        let query = MLXArray([Float(1), 2, 3]).reshaped(1, 3).asType(dtype)
+        let documents = MLXArray([Float(3), 2, 1, -3, -2, -1, 0, 0, 0])
+            .reshaped(3, 3).asType(dtype)
+
+        let output = jinaCosineSimilarity(documents, query)
+        let scores = output.asArray(Float.self)
+
+        #expect(output.dtype == .float32)
+        #expect(abs(scores[0] - 10.0 / 14.0) < 1e-6)
+        #expect(abs(scores[1] + 10.0 / 14.0) < 1e-6)
+        #expect(scores[2] == 0)
+    }
+
+    @Test(arguments: [Float(1e-5), 1e3])
+    func jinaCosineSimilarityAvoidsFloat16UnderflowAndOverflow(scale: Float) {
+        let vector = (MLXArray([Float(1), 2, 3]) * scale).reshaped(1, 3).asType(.float16)
+        let score = jinaCosineSimilarity(vector, vector).item(Float.self)
+
+        #expect(score.isFinite)
+        #expect(abs(score - 1) < 1e-6)
+    }
+
     @Test func causalScoringUsesMicroBatchesAndReturnsNormalizedRelevance() async throws {
         let tokenizer = ByteRerankerTokenizer()
         let model = TestCausalRerankerModel(
