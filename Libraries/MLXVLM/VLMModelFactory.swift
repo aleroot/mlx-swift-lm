@@ -399,8 +399,8 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Media encoders load on first use, so loading the weights skips them.
-        try detachOnDemandMediaEncoders(
+        // Media modules load on first use, so loading the weights skips them.
+        try detachMediaModulesIfSupported(
             of: model,
             loadingFrom: MediaWeightSource(
                 modelDirectory: modelDirectory,
@@ -512,14 +512,6 @@ public final class VLMModelFactory: GenericModelFactory {
             tokenizer: tokenizer)
     }
 
-}
-
-// The cast runs here rather than in the async loader, where region isolation cannot prove
-// the model stays disconnected.
-private func detachOnDemandMediaEncoders(
-    of model: any LanguageModel, loadingFrom source: MediaWeightSource
-) throws {
-    try (model as? any OnDemandMediaEncoders)?.detachMediaEncoders(loadingFrom: source)
 }
 
 /// Error wrapper that includes the filename for better error messages.

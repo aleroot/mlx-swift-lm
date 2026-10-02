@@ -154,7 +154,7 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 ///
 /// `weightFilter` decides which tensors to read. A rejected name is never evaluated and never
 /// appears in the result, so its bytes stay in the (memory-mapped) file; see
-/// ``OnDemandMediaEncoders``.
+/// ``DetachableMediaModel``.
 func loadWeightArrays(
     urls: [URL], weightFilter: @Sendable (String) -> Bool = { _ in true }
 ) throws -> (
@@ -375,8 +375,8 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// The weight files are chosen from `model.safetensors.index.json` when it names files that
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
 /// files it needs by conforming to ``AdditionalWeightFilesProviding``, and a caller can override
-/// the choice with ``ModelConfiguration/weightFileSelection``. Weights belonging to a detached
-/// ``OnDemandMediaEncoders`` stack are not read at all.
+/// the choice with ``ModelConfiguration/weightFileSelection``. The media weights of a detached
+/// ``DetachableMediaModel`` are not read at all.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
@@ -392,9 +392,9 @@ public func loadWeights(
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
 
-    // Detached media encoders load on first use, so their tensors are not read here.
+    // Detached media modules load on first use, so their tensors are not read here.
     let skipped: [String] =
-        if let model = model as? any OnDemandMediaEncoders, !model.mediaEncodersAreAttached {
+        if let model = model as? any DetachableMediaModel, !model.mediaModulesAreAttached {
             model.mediaWeightPrefixes
         } else {
             []

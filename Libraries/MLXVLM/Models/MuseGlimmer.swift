@@ -1105,8 +1105,8 @@ private class MuseGlimmerVisionAdapter: Module, UnaryLayer {
 
 // MARK: - Model
 
-/// Builds the vision stack for `init` and `makeMediaEncoders()`.
-private func makeMuseGlimmerMediaEncoders(_ config: MuseGlimmerConfiguration) -> (
+/// Builds the vision stack for `init` and `makeMediaModules()`.
+private func makeMuseGlimmerMediaModules(_ config: MuseGlimmerConfiguration) -> (
     tower: MuseGlimmerVisionModel, adapter: MuseGlimmerVisionAdapter, projection: Linear
 ) {
     (
@@ -1143,7 +1143,7 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     public init(_ config: MuseGlimmerConfiguration) {
         self.config = config
         self._languageModel.wrappedValue = MuseGlimmerLanguageModel(config.textConfiguration)
-        let media = makeMuseGlimmerMediaEncoders(config)
+        let media = makeMuseGlimmerMediaModules(config)
         self._visionTower.wrappedValue = media.tower
         self._visionAdapter.wrappedValue = media.adapter
         self._visionProjection.wrappedValue = media.projection
@@ -1215,7 +1215,7 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         prefill: PrefillParameters
     ) throws -> PrepareResult {
         if input.image != nil {
-            try loadMediaEncoders()
+            try loadMediaModules()
         }
 
         let convertedCache = cache.compactMap { $0 as KVCache }
@@ -1284,15 +1284,15 @@ extension MuseGlimmer: LoRAModel {
     }
 }
 
-extension MuseGlimmer: OnDemandMediaEncoders {
+extension MuseGlimmer: DetachableMediaModel {
     // The vision stack is ~3.7 GB of bf16 that text-only sessions never read. Resident, it
     // pushes the 4-bit model past the wired limit of a 24 GB Mac.
-    public var mediaEncoderKeys: [String] {
+    public var mediaModuleKeys: [String] {
         ["vision_tower", "vision_adapter", "vision_projection"]
     }
 
-    public func makeMediaEncoders() -> [String: Module] {
-        let media = makeMuseGlimmerMediaEncoders(config)
+    public func makeMediaModules() -> [String: Module] {
+        let media = makeMuseGlimmerMediaModules(config)
         return [
             "vision_tower": media.tower,
             "vision_adapter": media.adapter,

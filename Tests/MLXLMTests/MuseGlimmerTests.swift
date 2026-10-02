@@ -1036,8 +1036,8 @@ struct MuseGlimmerTextOnlyPrepareTests {
     }
 }
 
-@Suite("MuseGlimmer on-demand vision")
-struct MuseGlimmerOnDemandVisionTests {
+@Suite("MuseGlimmer detached vision")
+struct MuseGlimmerDetachedVisionTests {
 
     private static func isVisionKey(_ key: String) -> Bool {
         matchesWeightPrefixes(
@@ -1069,23 +1069,23 @@ struct MuseGlimmerOnDemandVisionTests {
         let model = try MuseGlimmerForwardTests.model()
         let attached = Set(model.parameters().flattened().map(\.0))
         #expect(attached.contains(where: Self.isVisionKey))
-        #expect(model.mediaEncodersAreAttached)
+        #expect(model.mediaModulesAreAttached)
 
-        try model.detachMediaEncoders()
+        try model.detachMediaModules()
 
-        #expect(!model.mediaEncodersAreAttached)
+        #expect(!model.mediaModulesAreAttached)
         let detached = Set(model.parameters().flattened().map(\.0))
         #expect(detached == attached.filter { !Self.isVisionKey($0) })
     }
 
-    @Test("new encoders rebuild the tree the initializer builds")
-    func encodersRebuildTheSameTree() throws {
+    @Test("new media modules rebuild the tree the initializer builds")
+    func newModulesRebuildTheSameTree() throws {
         let model = try MuseGlimmerForwardTests.model()
         let attached = Set(model.parameters().flattened().map(\.0))
-        #expect(Set(model.makeMediaEncoders().keys) == Set(model.mediaEncoderKeys))
+        #expect(Set(model.makeMediaModules().keys) == Set(model.mediaModuleKeys))
 
-        try model.detachMediaEncoders()
-        try model.attach(model.makeMediaEncoders())
+        try model.detachMediaModules()
+        try model.attach(model.makeMediaModules())
 
         #expect(Set(model.parameters().flattened().map(\.0)) == attached)
     }
@@ -1093,7 +1093,7 @@ struct MuseGlimmerOnDemandVisionTests {
     @Test("an image on a model without a vision tower throws")
     func imageWithoutAVisionTowerThrows() throws {
         let model = try MuseGlimmerForwardTests.model()
-        try model.detachMediaEncoders()
+        try model.detachMediaModules()
 
         #expect(throws: VLMError.self) { _ = try Self.imageLogits(model) }
     }
@@ -1104,7 +1104,7 @@ struct MuseGlimmerOnDemandVisionTests {
     @Test("the first image loads the vision stack and matches an eager load")
     func firstImageLoadsTheVisionStack() throws {
         let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MuseGlimmerOnDemand-\(UUID().uuidString)")
+            .appendingPathComponent("MuseGlimmerDetached-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -1120,16 +1120,16 @@ struct MuseGlimmerOnDemandVisionTests {
         let eager = try MuseGlimmerForwardTests.model()
         try loadWeights(modelDirectory: directory, model: eager, quantization: quantization)
 
-        let onDemand = try MuseGlimmerForwardTests.model()
-        try onDemand.detachMediaEncoders(
+        let reloaded = try MuseGlimmerForwardTests.model()
+        try reloaded.detachMediaModules(
             loadingFrom: MediaWeightSource(modelDirectory: directory, quantization: quantization))
-        try loadWeights(modelDirectory: directory, model: onDemand, quantization: quantization)
-        #expect(!onDemand.mediaEncodersAreAttached)
+        try loadWeights(modelDirectory: directory, model: reloaded, quantization: quantization)
+        #expect(!reloaded.mediaModulesAreAttached)
 
-        let logits = try Self.imageLogits(onDemand)
+        let logits = try Self.imageLogits(reloaded)
 
-        #expect(onDemand.mediaEncodersAreAttached)
-        #expect(onDemand.parameters().flattened().contains { $0.0 == "vision_projection.scales" })
+        #expect(reloaded.mediaModulesAreAttached)
+        #expect(reloaded.parameters().flattened().contains { $0.0 == "vision_projection.scales" })
         #expect(arrayEqual(logits, try Self.imageLogits(eager)).item(Bool.self))
     }
 }
