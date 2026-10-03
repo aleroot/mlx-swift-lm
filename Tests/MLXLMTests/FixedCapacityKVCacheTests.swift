@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import XCTest
 
 @testable import MLXLLM
@@ -248,6 +249,97 @@ final class FixedCapacityKVCacheTests: XCTestCase {
                 .invalidTokenShape([1, 2], expectedBatchSize: 1))
         }
         XCTAssertEqual(session.processedTokenCount, 2)
+    }
+
+    func testCompiledDecodeSessionRejectsDecodeAfterFullPrompt() throws {
+        let model = try makeModel()
+        let session = try CompiledDecodeSession(
+            model: model, prompt: MLXArray([1, 2, 3]).reshaped(1, 3), capacity: 3)
+
+        XCTAssertEqual(session.remainingCapacity, 0)
+        XCTAssertThrowsError(try session.step(tokenInput(4))) { error in
+            XCTAssertEqual(
+                error as? CompiledDecodeSessionError, .capacityExceeded(capacity: 3))
+        }
+        XCTAssertEqual(session.cacheOffsets, [3, 3])
+    }
+
+    func testCompiledDecodeSessionEnforcesCapacityWithoutEvaluatingEachStep() throws {
+        let model = try makeModel()
+        let session = try CompiledDecodeSession(
+            model: model, prompt: MLXArray([1, 2, 3, 4]).reshaped(2, 2), capacity: 4)
+
+        let first = try session.step(MLXArray([5, 6]).reshaped(2, 1))
+        let last = try session.step(MLXArray([7, 8]).reshaped(2, 1))
+        XCTAssertEqual(session.processedTokenCount, 4)
+        for _ in 0 ..< 2 {
+            XCTAssertThrowsError(try session.step(MLXArray([9, 10]).reshaped(2, 1))) { error in
+                XCTAssertEqual(
+                    error as? CompiledDecodeSessionError, .capacityExceeded(capacity: 4))
+            }
+        }
+        eval(first, last)
+        XCTAssertEqual(session.cacheOffsets, [4, 4])
+    }
+
+    private func assertSessionTracksWeightUpdates(
+        _ model: any FixedCapacityKVCacheProviding,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let prompt = MLXArray([1, 2, 3]).reshaped(1, 3)
+        let referenceCaches = try model.newCache(parameters: nil)
+        eval(model(prompt, cache: referenceCaches))
+        let session = try CompiledDecodeSession(model: model, prompt: prompt, capacity: 8)
+
+        let token = tokenInput(4)
+        eval(model(token, cache: referenceCaches), try session.step(token))
+        let staleCaches = referenceCaches.map { $0.copy() }
+        let stale = model(token, cache: staleCaches)
+        eval(stale)
+
+        let parameters = model.trainableParameters()
+        XCTAssertFalse(parameters.isEmpty, file: file, line: line)
+        model.update(parameters: parameters.mapValues { $0 + 0.25 })
+        eval(model)
+
+        let reference = model(token, cache: referenceCaches)
+        let compiled = try session.step(token)
+        eval(reference, compiled)
+        XCTAssertFalse(
+            allClose(reference, stale, rtol: 1e-4, atol: 1e-4).item(Bool.self),
+            "weight update must change the reference logits", file: file, line: line)
+        assertAllClose(
+            compiled, reference, "session ignored updated weights", file: file, line: line)
+    }
+
+    func testCompiledDecodeSessionTracksModelWeightUpdates() throws {
+        try assertSessionTracksWeightUpdates(makeModel())
+        try assertSessionTracksWeightUpdates(makeLlamaModel())
+    }
+
+    func testCompiledDecodeSessionTracksLoRAWeightUpdates() throws {
+        let model = try makeModel()
+        _ = try LoRAContainer.from(
+            model: model,
+            configuration: .init(
+                numLayers: hiddenLayers,
+                loraParameters: .init(rank: 4, scale: 1, keys: ["self_attn.q_proj"])))
+        model.train(false)
+        try assertSessionTracksWeightUpdates(model)
+    }
+
+    func testCompiledDecodeSessionReleasesModel() throws {
+        weak var releasedModel: Qwen2Model?
+        do {
+            let model = try makeModel()
+            releasedModel = model
+            let session = try CompiledDecodeSession(
+                model: model, prompt: MLXArray([1, 2]).reshaped(1, 2), capacity: 4)
+            eval(try session.step(tokenInput(3)))
+        }
+        Stream.defaultStream.synchronize()
+        XCTAssertNil(
+            releasedModel, "the compiled closure must not retain an expired session's model")
     }
 
     /// Opt-in regression against the checkpoint from issue #406. Set

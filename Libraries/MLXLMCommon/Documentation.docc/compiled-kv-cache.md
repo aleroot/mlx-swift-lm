@@ -63,4 +63,13 @@ for _ in 1 ..< maxNewTokens {
 token count because a compiled graph cannot raise a Swift error from a
 tensor-valued position without synchronizing it to the CPU. Advanced callers
 can construct ``FixedCapacityKVCache`` directly, but then they own prefill order
-and capacity admission.
+and capacity admission: check `offset + inputTokenCount <= maxTokens` on the host
+before each model invocation, outside the compiled closure. The checks inside
+`update(keys:values:)` cover the chunk length, not the graph-valued write position.
+
+The session declares model weights as compile inputs as well as the cache state,
+so parameter updates are not captured as constants. It retains the model and its
+compiled closure for the session's lifetime. Finish the session before changing
+the module tree (loading, fusing, or unloading adapters, or quantizing), then
+create a new session. A session's existing KV state is not recomputed when weights
+change; use a fresh session to prefill with the updated weights.
