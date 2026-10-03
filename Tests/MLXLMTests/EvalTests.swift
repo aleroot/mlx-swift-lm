@@ -190,23 +190,70 @@ public class EvalTests: XCTestCase {
         }
     }
 
-    func testLogProbabilityReportingPreservesSeededCategoricalSampling() throws {
+    func testLogProbabilitiesMatchProcessedLogitsBeforeSamplingFilters() throws {
+        let model = makeQualityGateLlamaModel()
+        let parameters = GenerateParameters(
+            maxTokens: 3, temperature: 0.6, topK: 1, logProbabilities: 100,
+            repetitionPenalty: 1.3, presencePenalty: 1.2, seed: 42)
+        let prompt = MLXArray([1, 2, 3])
+        var iterator = try TokenIterator(
+            input: LMInput(tokens: prompt), model: model, parameters: parameters)
+        let cache = try model.newCache(parameters: parameters)
+        var processor = parameters.processor()
+        processor?.prompt(prompt)
+        var previous = prompt
+
+        for _ in 0 ..< 3 {
+            let logits = model(previous[.newAxis, .ellipsis], cache: cache)[0..., -1, 0...]
+            let expected = logSoftmax(processor?.process(logits: logits) ?? logits).asArray(
+                Float.self)
+            let token = try XCTUnwrap(iterator.next())
+            let values = try XCTUnwrap(iterator.lastLogProbabilities)
+
+            XCTAssertEqual(values.chosen.token, token)
+            XCTAssertEqual(values.chosen.logProbability, expected[token], accuracy: 2e-5)
+            XCTAssertEqual(Set(values.topLogProbabilities.map(\.token)), Set(0 ..< 100))
+            for candidate in values.topLogProbabilities {
+                XCTAssertEqual(candidate.logProbability, expected[candidate.token], accuracy: 2e-5)
+            }
+            XCTAssertEqual(
+                values.topLogProbabilities.reduce(0) { $0 + exp(Double($1.logProbability)) },
+                1, accuracy: 2e-5)
+
+            previous = MLXArray([token])
+            processor?.didSample(token: previous)
+        }
+    }
+
+    func testLogProbabilityReportingPreservesSeededSampling() throws {
         let model = makeQualityGateLlamaModel()
         let input = LMInput(text: .init(tokens: MLXArray([1, 2, 3])))
 
-        func generate(logProbabilities: Int?) throws -> [Int] {
+        func generate(_ parameters: GenerateParameters, logProbabilities: Int?) throws -> [Int] {
+            var parameters = parameters
+            parameters.logProbabilities = logProbabilities
             var iterator = try TokenIterator(
                 input: input,
                 model: model,
-                parameters: .init(
-                    maxTokens: 16,
-                    temperature: 0.6,
-                    logProbabilities: logProbabilities,
-                    seed: 42))
-            return Array(iterator)
+                parameters: parameters)
+            var tokens: [Int] = []
+            while let token = iterator.next() {
+                tokens.append(token)
+                if logProbabilities == nil { XCTAssertNil(iterator.lastLogProbabilities) }
+            }
+            return tokens
         }
 
-        XCTAssertEqual(try generate(logProbabilities: nil), try generate(logProbabilities: 5))
+        for parameters in [
+            GenerateParameters(maxTokens: 16, temperature: 0, seed: 42),
+            GenerateParameters(maxTokens: 16, temperature: 0.6, seed: 42),
+            GenerateParameters(
+                maxTokens: 16, temperature: 0.6, topP: 0.8, topK: 5, minP: 0.02, seed: 42),
+        ] {
+            XCTAssertEqual(
+                try generate(parameters, logProbabilities: nil),
+                try generate(parameters, logProbabilities: 5))
+        }
     }
 
     func testLlamaVarianceNormalizedKVCacheGenerationPath() throws {

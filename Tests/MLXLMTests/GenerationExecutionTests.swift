@@ -278,7 +278,7 @@ final class GenerationExecutionTests: XCTestCase {
         await fulfillment(of: [finalized], timeout: 0)
     }
 
-    func testGenerationReportsTokenObservability() async {
+    func testGenerationReportsCompletionObservability() async {
         let logProbabilities = GenerateTokenLogProbabilities(
             chosen: .init(token: 42, logProbability: -0.25),
             topLogProbabilities: [
@@ -295,18 +295,15 @@ final class GenerationExecutionTests: XCTestCase {
                 evictedTokenCount: 4,
                 reasoningTokenCount: 1))
 
-        var observedLogProbabilities: [GenerateTokenLogProbabilities] = []
         var completion: GenerateCompletionInfo?
         for await event in stream {
             switch event {
-            case .probability(let values): observedLogProbabilities.append(values)
             case .info(let info): completion = info
             case .chunk, .toolCall, .rejectedToolCall: break
             }
         }
 
         _ = await task.value
-        XCTAssertEqual(observedLogProbabilities, [logProbabilities, logProbabilities])
         XCTAssertEqual(completion?.evictedTokenCount, 4)
         XCTAssertEqual(completion?.reasoningTokenCount, 1)
         XCTAssertEqual(completion?.answerTokenCount, 1)
