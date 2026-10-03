@@ -40,6 +40,8 @@ public enum CompiledDecodeSessionError: Error, LocalizedError, Equatable {
 ///
 /// This session supports text-only, same-length batches. Keep it within the same
 /// serialized model access that owns `model`; it is intentionally not `Sendable`.
+/// Finish the session before replacing modules (for example, loading or fusing
+/// LoRA adapters or quantizing), then create a new session for the updated model.
 public final class CompiledDecodeSession {
     public let capacity: Int
     public let batchSize: Int
@@ -99,7 +101,9 @@ public final class CompiledDecodeSession {
         self.caches = caches
         self.prefillLogits = prefillLogits
         self.processedTokenCount = promptTokenCount
-        self.decode = compile(inputs: caches, outputs: caches) { token in
+        // Weights are inputs too, so updates do not freeze at trace time.
+        let inputs: [any Updatable] = [model] + caches
+        self.decode = compile(inputs: inputs, outputs: caches) { token in
             model(token, cache: caches)
         }
     }

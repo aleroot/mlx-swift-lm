@@ -43,8 +43,9 @@ import MLX
 ///
 /// - Prefer ``CompiledDecodeSession`` over constructing the cache directly. It
 ///   performs eager prefill before tracing and enforces capacity on the host.
-/// - Low-level callers must prefill before the first compiled call and must not
-///   invoke the model once the cache reaches capacity.
+/// - Low-level callers must prefill before the first compiled call and check
+///   that `offset + inputTokenCount <= maxTokens` before each model invocation.
+///   Perform this check outside the compiled closure.
 /// - One write position is tracked, so every row of a batch shares it:
 ///   batch 1, or same-length rows.
 /// - The attention read spans the full capacity with unwritten slots masked out,
@@ -118,6 +119,9 @@ public final class FixedCapacityKVCache: KVCache, Updatable {
             allocate(with: newKeys, values: newValues)
         }
         let writePosition = position!
+
+        // CompiledDecodeSession checks position + n on the host before dispatch.
+        // Reading writePosition.item() here would evaluate a tracer during compile.
 
         // Compile-safe scatter: the write indices are graph values derived from
         // the threaded position. Unlike a dynamic Swift slice, putAlong remains
