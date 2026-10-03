@@ -73,8 +73,8 @@ final class TokenLoopHandlerTests: XCTestCase {
             emit("stop:\(token)") ? .stop : .cancelled
         }
 
-        mutating func onGenerationEnd(emit: (sending String) -> Bool) {
-            _ = emit("end")
+        mutating func onGenerationEnd(emit: (sending String) -> Bool) -> TokenLoopDisposition {
+            emit("end") ? .more : .cancelled
         }
 
         func infoEvent(_ info: GenerateCompletionInfo) -> String {
