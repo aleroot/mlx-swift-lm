@@ -89,7 +89,6 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 }
 
 extension MTPDrafterModel {
-    public func isCompatible(with target: any LanguageModel) -> Bool { true }
     public var maximumBlockSize: Int? { nil }
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }

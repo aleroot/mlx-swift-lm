@@ -29,16 +29,20 @@ public enum Qwen35VLMMTPRegistration {
                     let config = try JSONDecoder.json5().decode(
                         Qwen35MTPTextConfiguration.self, from: data)
                     return Qwen35VLMNextNDraftModel(
-                        config.textConfiguration, preconvertedNorms: true)
+                        config.textConfiguration,
+                        checkpointPolicy: .init(
+                            modelType: config.modelType, preconvertedNorms: true))
                 })
         }
     }
 }
 
 private struct Qwen35MTPTextConfiguration: Decodable {
+    let modelType: String
     let textConfiguration: Qwen35Configuration.TextConfiguration
 
     enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
         case textConfiguration = "text_config"
     }
 }
