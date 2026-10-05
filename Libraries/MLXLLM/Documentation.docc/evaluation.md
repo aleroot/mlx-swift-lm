@@ -30,6 +30,13 @@ the prompt and discard.  Multiple `ChatSession` instances could also be used
 (at the cost of the memory in the `KVCache`) to handle multiple streams of
 context.
 
+## Automatic Prefill Optimization
+
+Chunked text prefill reserves standard KV-cache capacity for the prompt and cached
+prefix, avoiding repeated growth and copies. Subsequent growth is proportional
+and bounded. Cache positions, attention masks, and saved state are unchanged;
+custom, rotating, compressed, and recurrent caches keep their allocation paths.
+
 ## Streaming Output
 
 The previous example produced the entire response in one call.  Often

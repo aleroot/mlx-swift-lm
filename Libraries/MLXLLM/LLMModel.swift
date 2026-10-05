@@ -38,23 +38,27 @@ extension LLMModel {
         guard total > stepSize else { return .tokens(y) }
 
         var processed = 0
-        try withPreparedCache(cache, lengths: y.sequenceLengths) {
-            // asyncEval lets the CPU build chunk N+1's graph while the GPU evaluates
-            // chunk N. Under .remainder the reserved tail is the legacy leftover
-            // (up to a full step) rather than a single token.
-            var state: LMOutput.State? = state
-            processed = try prefill.forEachChunk(
-                total: total, reserving: prefill.chunking == .remainder ? stepSize : 1
-            ) { range in
-                let input = y[.newAxis, range]
-                let output = self(input, cache: cache.isEmpty ? nil : cache, state: state)
-                state = output.state
-                asyncEval(cache)
-            }
-
-            // Single sync after the loop to flush any remaining async work.
-            if processed > 0 {
-                eval(cache)
+        try Task.checkCancellation()
+        try withReservedPromptCache(cache, additionalTokens: y.cacheSequenceLength) {
+            try withPreparedCache(cache, lengths: y.sequenceLengths) {
+                // asyncEval lets the CPU build chunk N+1's graph while the GPU evaluates
+                // chunk N. Under .remainder the reserved tail is the legacy leftover
+                // (up to a full step) rather than a single token.
+                var state: LMOutput.State? = state
+                var submitted = false
+                defer {
+                    // Finish submitted work before returning, including cancellation.
+                    if submitted { eval(cache) }
+                }
+                processed = try prefill.forEachChunk(
+                    total: total, reserving: prefill.chunking == .remainder ? stepSize : 1
+                ) { range in
+                    let input = y[.newAxis, range]
+                    let output = self(input, cache: cache.isEmpty ? nil : cache, state: state)
+                    state = output.state
+                    asyncEval(cache)
+                    submitted = true
+                }
             }
         }
 
