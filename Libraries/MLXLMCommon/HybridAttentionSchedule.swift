@@ -13,10 +13,6 @@ package struct HybridAttentionSchedule: Sendable, Equatable {
 
     package let layerTypes: [String]
 
-    package var firstFullAttentionIndex: Int? {
-        layerTypes.firstIndex(of: Self.fullAttention)
-    }
-
     package init(
         hiddenLayerCount: Int,
         fullAttentionInterval: Int,

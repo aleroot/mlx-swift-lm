@@ -21,7 +21,6 @@ final class Qwen35MTPPredictor: Module {
             repeating: HybridAttentionSchedule.fullAttention, count: mtpArgs.hiddenLayers)
         mtpArgs.layerTypes = layerTypes
         mtpArgs.resolvedLayerTypes = layerTypes
-        mtpArgs.fullAttentionLayerIndex = 0
 
         if args.mtpUseDedicatedEmbeddings {
             _embedTokens.wrappedValue = Embedding(
@@ -87,7 +86,7 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
         self.init(
             configuration,
             checkpointPolicy: .init(
-                layout: configuration.modelType == "qwen3_5_mtp" ? .standalone : .embedded,
+                modelType: configuration.modelType,
                 preconvertedNorms: preconvertedNorms))
     }
 
@@ -107,7 +106,7 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
         self.init(
             configuration.textConfig,
             checkpointPolicy: .init(
-                layout: configuration.modelType == "qwen3_5_mtp" ? .standalone : .embedded,
+                modelType: configuration.modelType,
                 preconvertedNorms: preconvertedNorms))
     }
 
