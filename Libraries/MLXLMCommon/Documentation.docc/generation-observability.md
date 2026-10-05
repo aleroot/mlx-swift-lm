@@ -47,14 +47,19 @@ and tool-call parsers. Text chunks may span multiple tokens. Excluded stop token
 do not produce probability events. The wrapper preserves the base handler's
 stop policy, final output, and completion metadata.
 
+A handler receives each token's values as ``DeferredTokenLogProbabilities``, which
+stay on the GPU until the handler calls ``DeferredTokenLogProbabilities/materialize()``.
+Only handlers that read them, such as ``LogProbabilityTokenLoopHandler``, pay for the
+GPU-to-host copy.
+
 Log probabilities normalize logits after processors and before temperature or
 sampling filters, matching Python MLX-LM. They describe the processed token
 distribution, rather than confidence that an answer is correct. Top candidates
 can include the selected token.
 
-Reporting adds normalization where the sampler does not already need it,
-candidate extraction, and GPU-to-host transfers. Keep it disabled when unused.
-Direct speculative iterators do not provide log probabilities; use ``TokenIterator``
+Reporting adds normalization where the sampler does not already need it and
+candidate extraction to each decode step. Keep it disabled when unused.
+Speculative iterators do not provide log probabilities; use ``TokenIterator``
 for observation.
 
 ``GenerateCompletionInfo`` also reports ``GenerateCompletionInfo/evictedTokenCount``.

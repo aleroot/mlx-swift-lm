@@ -176,7 +176,8 @@ public class EvalTests: XCTestCase {
             parameters: .init(maxTokens: 2, temperature: 0, logProbabilities: 3))
 
         let token = try XCTUnwrap(iterator.next())
-        let probabilities = try XCTUnwrap(iterator.lastLogProbabilities)
+        let deferred = try XCTUnwrap(iterator.lastLogProbabilities)
+        let probabilities = deferred.materialize()
 
         XCTAssertEqual(probabilities.chosen.token, token)
         XCTAssertEqual(probabilities.topLogProbabilities.count, 3)
@@ -188,6 +189,10 @@ public class EvalTests: XCTestCase {
         ) {
             XCTAssertGreaterThanOrEqual(first.logProbability, second.logProbability)
         }
+
+        // Deferred values keep describing their token after the iterator moves on.
+        XCTAssertNotNil(iterator.next())
+        XCTAssertEqual(deferred.materialize(), probabilities)
     }
 
     func testLogProbabilitiesMatchProcessedLogitsBeforeSamplingFilters() throws {
@@ -208,7 +213,7 @@ public class EvalTests: XCTestCase {
             let expected = logSoftmax(processor?.process(logits: logits) ?? logits).asArray(
                 Float.self)
             let token = try XCTUnwrap(iterator.next())
-            let values = try XCTUnwrap(iterator.lastLogProbabilities)
+            let values = try XCTUnwrap(iterator.lastLogProbabilities).materialize()
 
             XCTAssertEqual(values.chosen.token, token)
             XCTAssertEqual(values.chosen.logProbability, expected[token], accuracy: 2e-5)

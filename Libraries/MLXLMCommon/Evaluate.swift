@@ -211,7 +211,7 @@ public struct GenerateParameters: Sendable {
     /// Per-token log-probability reporting. `nil` disables reporting; `0` reports
     /// the selected token only, and a positive value also reports that many top tokens.
     /// Use ``LogProbabilityTokenLoopHandler`` to emit these values through a custom generation loop.
-    /// High-level speculative generation falls back to ``TokenIterator`` when enabled.
+    /// Only ``TokenIterator`` reports them; speculative iterators ignore this setting.
     public var logProbabilities: Int?
 
     /// Optional seed for reproducible sampling. When set, the sampler's RNG
@@ -756,7 +756,7 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     var promptPrefillTime: TimeInterval { get }
     var state: LMOutput.State? { get }
     var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { get }
-    var lastLogProbabilities: GenerateTokenLogProbabilities? { get }
+    var lastLogProbabilities: DeferredTokenLogProbabilities? { get }
     var evictedTokenCount: Int { get }
     var reasoningTokenCount: Int? { get }
 
@@ -774,7 +774,7 @@ protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
 extension TokenIteratorProtocol {
     public var state: LMOutput.State? { nil }
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
-    public var lastLogProbabilities: GenerateTokenLogProbabilities? { nil }
+    public var lastLogProbabilities: DeferredTokenLogProbabilities? { nil }
     public var evictedTokenCount: Int { 0 }
     public var reasoningTokenCount: Int? { nil }
     public mutating func recordEmittedToken(_ token: Int) {}
@@ -798,15 +798,24 @@ private struct LogProbabilityDistribution {
     }
 }
 
-/// GPU results for one sampled token, materialized after the following decode step.
-private struct DeferredTokenLogProbabilities {
+/// Log probabilities for one generated token that are still on the GPU.
+///
+/// ``TokenIterator`` evaluates them with the decode step that samples the token.
+/// Handlers that ignore them skip the GPU-to-host copy. MLX arrays are not
+/// `Sendable`, so call ``materialize()`` on the generation worker and send the result.
+public struct DeferredTokenLogProbabilities {
+    let token: MLXArray
     let chosenLogProbability: MLXArray
     let topTokenIDs: MLXArray?
     let topLogProbabilities: MLXArray?
 
     init(logProbabilities: MLXArray, token: MLXArray, topK: Int) {
+        self.token = token
+        // Cast to the read types in the graph: a cast at read time is new GPU
+        // work that waits behind the decode step already in flight.
         let tokenIndices = token[0..., .newAxis]
         self.chosenLogProbability = takeAlong(logProbabilities, tokenIndices, axis: -1)
+            .asType(.float32)
 
         let count = Swift.min(Swift.max(topK, 0), logProbabilities.dim(-1))
         guard count > 0 else {
@@ -826,20 +835,22 @@ private struct DeferredTokenLogProbabilities {
         let unorderedLogProbabilities = takeAlong(
             logProbabilities, unorderedTokenIDs, axis: -1)
         let order = argSort(-unorderedLogProbabilities, axis: -1)
-        self.topTokenIDs = takeAlong(unorderedTokenIDs, order, axis: -1)
+        self.topTokenIDs = takeAlong(unorderedTokenIDs, order, axis: -1).asType(.int32)
         self.topLogProbabilities = takeAlong(unorderedLogProbabilities, order, axis: -1)
+            .asType(.float32)
     }
 
     var arrays: [MLXArray] {
         [chosenLogProbability, topTokenIDs, topLogProbabilities].compactMap { $0 }
     }
 
-    func materialize(token: Int) -> GenerateTokenLogProbabilities {
+    /// Copies the values from the GPU into a `Sendable` value.
+    public func materialize() -> GenerateTokenLogProbabilities {
         let materializedTopLogProbabilities: [GenerateTokenLogProbability]
         if let topTokenIDs, let topLogProbabilityValues = topLogProbabilities {
             materializedTopLogProbabilities = zip(
-                topTokenIDs.asType(.int32).asArray(Int32.self),
-                topLogProbabilityValues.asType(.float32).asArray(Float.self)
+                topTokenIDs.asArray(Int32.self),
+                topLogProbabilityValues.asArray(Float.self)
             )
             .map { token, logProbability in
                 GenerateTokenLogProbability(token: Int(token), logProbability: logProbability)
@@ -850,8 +861,8 @@ private struct DeferredTokenLogProbabilities {
 
         return GenerateTokenLogProbabilities(
             chosen: .init(
-                token: token,
-                logProbability: chosenLogProbability.asType(.float32).item(Float.self)),
+                token: token.item(Int.self),
+                logProbability: chosenLogProbability.item(Float.self)),
             topLogProbabilities: materializedTopLogProbabilities)
     }
 }
@@ -901,7 +912,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     private var deferredLogProbabilities: DeferredTokenLogProbabilities?
 
     /// Log probabilities for the token returned by the most recent ``next()`` call.
-    public private(set) var lastLogProbabilities: GenerateTokenLogProbabilities?
+    public private(set) var lastLogProbabilities: DeferredTokenLogProbabilities?
 
     public var tokenCount = 0
     public let maxTokens: Int?
@@ -1169,9 +1180,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
             tokenCount += 1
 
-            let emitted = previousY.tokens.item(Int.self)
-            lastLogProbabilities = previousLogProbabilities?.materialize(token: emitted)
-            return emitted
+            lastLogProbabilities = previousLogProbabilities
+            return previousY.tokens.item(Int.self)
         }
     }
 
@@ -2096,13 +2106,6 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
-    if parameters.logProbabilities != nil {
-        return try generate(
-            input: input, cache: cache, state: state,
-            parameters: parameters, context: context, components: components,
-            wiredMemoryTicket: wiredMemoryTicket, tools: tools)
-    }
-
     let iterator = try SpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2299,13 +2302,6 @@ public func generateTokens(
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
-    if parameters.logProbabilities != nil {
-        return try generateTokens(
-            input: input, cache: cache, state: state,
-            parameters: parameters, context: context, components: components,
-            wiredMemoryTicket: wiredMemoryTicket)
-    }
-
     let iterator = try SpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2371,12 +2367,6 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
-    if parameters.logProbabilities != nil {
-        return try generate(
-            input: input, cache: cache, parameters: parameters, context: context,
-            components: components, wiredMemoryTicket: wiredMemoryTicket, tools: tools)
-    }
-
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2427,12 +2417,6 @@ public func generateTokens(
     components: GenerationComponents = .init(),
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
-    if parameters.logProbabilities != nil {
-        return try generateTokens(
-            input: input, cache: cache, parameters: parameters, context: context,
-            components: components, wiredMemoryTicket: wiredMemoryTicket)
-    }
-
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: context.model,

@@ -1,7 +1,10 @@
 // Copyright © 2026 Apple Inc.
 
-import MLXLMCommon
+import MLX
+import MLXNN
 import XCTest
+
+@testable import MLXLMCommon
 
 final class TokenLoopHandlerTests: XCTestCase {
     private struct Iterator: TokenIteratorProtocol {
@@ -11,9 +14,9 @@ final class TokenLoopHandlerTests: XCTestCase {
         var maxTokens: Int? { tokens.count }
         var promptPrefillTime: Double { 0 }
 
-        var lastLogProbabilities: GenerateTokenLogProbabilities? {
+        var lastLogProbabilities: DeferredTokenLogProbabilities? {
             guard reportsLogProbabilities, tokenCount > 0 else { return nil }
-            return .init(chosen: .init(token: tokens[tokenCount - 1], logProbability: -0.5))
+            return uniformLogProbabilities(token: tokens[tokenCount - 1])
         }
 
         mutating func next() -> Int? {
@@ -57,14 +60,14 @@ final class TokenLoopHandlerTests: XCTestCase {
         var receivesStopTokens: Bool { true }
 
         mutating func onToken(
-            _ token: Int, logProbabilities: GenerateTokenLogProbabilities?,
+            _ token: Int, logProbabilities: DeferredTokenLogProbabilities?,
             emit: (sending String) -> Bool
         ) -> TokenLoopDisposition {
             emit("token:\(token)") ? .more : .cancelled
         }
 
         mutating func onStopToken(
-            _ token: Int, logProbabilities: GenerateTokenLogProbabilities?,
+            _ token: Int, logProbabilities: DeferredTokenLogProbabilities?,
             emit: (sending String) -> Bool
         ) -> TokenLoopDisposition {
             emit("stop:\(token)") ? .stop : .cancelled
@@ -92,6 +95,8 @@ final class TokenLoopHandlerTests: XCTestCase {
             for await event in stream {
                 switch event {
                 case .probability(let value):
+                    XCTAssertEqual(
+                        Double(value.chosen.logProbability), -log(Double(256)), accuracy: 1e-5)
                     events.append("probability:\(value.chosen.token)")
                 case .generation(.token(let token)):
                     events.append("token:\(token)")
@@ -174,7 +179,7 @@ final class TokenLoopHandlerTests: XCTestCase {
 
     func testTerminatedProbabilityEmissionStopsTheWrappedHandler() {
         var handler = LogProbabilityTokenLoopHandler(BoundaryHandler())
-        let values = GenerateTokenLogProbabilities(chosen: .init(token: 65, logProbability: -0.5))
+        let values = uniformLogProbabilities(token: 65)
         var emissions = 0
         let emit: (sending LogProbabilityGeneration<String>) -> Bool = { _ in
             emissions += 1
@@ -193,4 +198,11 @@ final class TokenLoopHandlerTests: XCTestCase {
         }
         XCTAssertEqual(emissions, 2)
     }
+}
+
+/// Log probabilities of `token` under a uniform distribution over byte tokens.
+private func uniformLogProbabilities(token: Int) -> DeferredTokenLogProbabilities {
+    DeferredTokenLogProbabilities(
+        logProbabilities: logSoftmax(MLXArray.zeros([1, 256])),
+        token: MLXArray([Int32(token)]), topK: 0)
 }

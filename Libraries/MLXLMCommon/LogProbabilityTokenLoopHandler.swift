@@ -14,6 +14,7 @@ public enum LogProbabilityGeneration<Output: Sendable>: Sendable {
 /// Enable reporting with ``GenerateParameters/logProbabilities`` when constructing
 /// a ``TokenIterator``. Text chunks can span several tokens; probability events
 /// follow the token sequence, including tokens consumed by tool or reasoning parsers.
+/// This handler materializes the values, so only streams that use it copy them from the GPU.
 public struct LogProbabilityTokenLoopHandler<Base: TokenLoopHandler>: TokenLoopHandler {
     public typealias Output = LogProbabilityGeneration<Base.Output>
 
@@ -28,10 +29,10 @@ public struct LogProbabilityTokenLoopHandler<Base: TokenLoopHandler>: TokenLoopH
 
     public mutating func onToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending Output) -> Bool
     ) -> TokenLoopDisposition {
-        if let logProbabilities, !emit(.probability(logProbabilities)) {
+        if let logProbabilities, !emit(.probability(logProbabilities.materialize())) {
             return .cancelled
         }
         return base.onToken(token, logProbabilities: logProbabilities) {
@@ -41,10 +42,10 @@ public struct LogProbabilityTokenLoopHandler<Base: TokenLoopHandler>: TokenLoopH
 
     public mutating func onStopToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending Output) -> Bool
     ) -> TokenLoopDisposition {
-        if let logProbabilities, !emit(.probability(logProbabilities)) {
+        if let logProbabilities, !emit(.probability(logProbabilities.materialize())) {
             return .cancelled
         }
         return base.onStopToken(token, logProbabilities: logProbabilities) {

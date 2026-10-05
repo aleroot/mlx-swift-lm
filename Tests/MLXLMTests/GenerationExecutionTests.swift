@@ -27,7 +27,6 @@ final class GenerationExecutionTests: XCTestCase {
         var maxTokens: Int? = 1
         var tokenCount = 0
         var promptPrefillTime: TimeInterval { 0 }
-        var lastLogProbabilities: GenerateTokenLogProbabilities?
         var evictedTokenCount = 0
         var reasoningTokenCount: Int?
         var onNext: @Sendable () -> Void = {}
@@ -279,19 +278,12 @@ final class GenerationExecutionTests: XCTestCase {
     }
 
     func testGenerationReportsCompletionObservability() async {
-        let logProbabilities = GenerateTokenLogProbabilities(
-            chosen: .init(token: 42, logProbability: -0.25),
-            topLogProbabilities: [
-                .init(token: 42, logProbability: -0.25),
-                .init(token: 7, logProbability: -1.5),
-            ])
         let (stream, task) = generateTaskRecordingTokens(
             promptTokenCount: 3,
             modelConfiguration: .init(id: "test"),
             tokenizer: TestTokenizer(),
             iterator: Iterator(
                 maxTokens: 2,
-                lastLogProbabilities: logProbabilities,
                 evictedTokenCount: 4,
                 reasoningTokenCount: 1))
 

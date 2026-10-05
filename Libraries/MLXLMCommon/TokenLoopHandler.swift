@@ -32,9 +32,12 @@ public protocol TokenLoopHandler: SendableMetatype {
     var receivesStopTokens: Bool { get }
 
     /// Return `.stop` for semantic generation stops, or `.cancelled` for consumer termination.
+    ///
+    /// `logProbabilities` stays on the GPU until you call
+    /// ``DeferredTokenLogProbabilities/materialize()``.
     mutating func onToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending Output) -> Bool
     ) -> TokenLoopDisposition
 
@@ -42,7 +45,7 @@ public protocol TokenLoopHandler: SendableMetatype {
     /// and a stop token was hit.
     mutating func onStopToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending Output) -> Bool
     ) -> TokenLoopDisposition
 
@@ -82,7 +85,7 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
 
     public mutating func onToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending Generation) -> Bool
     ) -> TokenLoopDisposition {
         process(token, emit: emit)
@@ -90,7 +93,7 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
 
     public mutating func onStopToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending Generation) -> Bool
     ) -> TokenLoopDisposition {
         guard decoder.receivesStopTokens else { return .more }
@@ -187,7 +190,7 @@ public struct RawTokenLoopHandler: TokenLoopHandler {
 
     public mutating func onToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending TokenGeneration) -> Bool
     ) -> TokenLoopDisposition {
         if !emit(.token(token)) {
@@ -198,7 +201,7 @@ public struct RawTokenLoopHandler: TokenLoopHandler {
 
     public mutating func onStopToken(
         _ token: Int,
-        logProbabilities: GenerateTokenLogProbabilities?,
+        logProbabilities: DeferredTokenLogProbabilities?,
         emit: (sending TokenGeneration) -> Bool
     ) -> TokenLoopDisposition {
         if !emit(.token(token)) {
