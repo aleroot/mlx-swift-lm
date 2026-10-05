@@ -6,6 +6,10 @@ import MLXNN
 
 /// Abstract form of a model that processes language.
 public protocol BaseLanguageModel: Module {
+    /// Normalize tensor names, values, and layer settings before loading the checkpoint.
+    /// The default implementation calls ``sanitize(weights:metadata:)``.
+    func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint
+
     /// Optionally preprocess the weights and modify / remove values as needed.
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
 
@@ -46,6 +50,12 @@ public protocol ModelConversionMetadataProvider {
 }
 
 extension BaseLanguageModel {
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = checkpoint
+        checkpoint.weights = sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
     }

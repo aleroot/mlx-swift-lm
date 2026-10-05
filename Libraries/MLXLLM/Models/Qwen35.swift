@@ -1165,6 +1165,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            checkpoint, layout: .text, tiedWordEmbeddings: configuration.tieWordEmbeddings)
+        checkpoint.weights = sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
@@ -1175,7 +1182,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // layout is the reliable signal on its own.
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        var weights = weights.filter { !$0.key.contains("mtp.") }
+        var weights = Qwen35CheckpointPolicy.targetWeights(weights)
 
         weights = filterLMHeadWeights(
             from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
@@ -1273,24 +1280,19 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         try languageModel.prepare()
     }
 
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            checkpoint, layout: .wrappedText,
+            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
+        checkpoint.weights = sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var sanitized = [String: MLXArray]()
-        for (key, value) in weights {
-            if key.hasPrefix("vision_tower") || key.hasPrefix("model.visual") {
-                continue
-            }
-
-            var key = key
-            if key.hasPrefix("model.language_model") {
-                key = key.replacingOccurrences(
-                    of: "model.language_model", with: "language_model.model")
-            } else if !key.hasPrefix("language_model.") {
-                key = "language_model." + key
-            }
-            sanitized[key] = value
-        }
-
-        return languageModel.sanitize(weights: sanitized)
+        let checkpoint = try? Qwen35CheckpointPolicy.prepareTarget(
+            .init(weights: weights), layout: .wrappedText,
+            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
+        return languageModel.sanitize(weights: checkpoint?.weights ?? weights)
     }
 }
 
