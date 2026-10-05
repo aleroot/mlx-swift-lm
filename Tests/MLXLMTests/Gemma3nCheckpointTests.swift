@@ -51,12 +51,19 @@ struct Gemma3nCheckpointTests {
     @Test
     func wrapperAliasesFailBeforeUpdatingTheModel() throws {
         let model = Gemma3nTextModel(config: try configuration())
+        let weights = [
+            "model.language_model.norm.weight": MLXArray(1),
+            "language_model.norm.weight": MLXArray(2),
+        ]
         #expect(throws: ModelCheckpoint.MappingError.self) {
-            try model.prepareCheckpoint(
-                .init(weights: [
-                    "model.language_model.norm.weight": MLXArray(1),
-                    "language_model.norm.weight": MLXArray(2),
-                ]))
+            try model.prepareCheckpoint(.init(weights: weights))
+        }
+        let baseModel: any BaseLanguageModel = model
+        #expect(throws: ModelCheckpoint.MappingError.self) {
+            try baseModel.sanitize(weights: weights)
+        }
+        #expect(throws: ModelCheckpoint.MappingError.self) {
+            try baseModel.sanitize(weights: weights, metadata: [:])
         }
     }
 

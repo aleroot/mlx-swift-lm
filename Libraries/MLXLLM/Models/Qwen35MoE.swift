@@ -37,11 +37,11 @@ public struct Qwen35Configuration: Codable, Sendable {
 
 public class Qwen35MoEModel: Qwen35Model {
 
-    override public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let checkpoint = try? Qwen35CheckpointPolicy.prepareTarget(
+    override public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             .init(weights: weights), layout: .wrappedText,
             tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
-        var newWeights = checkpoint?.weights ?? weights
+        var newWeights = checkpoint.weights
 
         for l in 0 ..< languageModel.configuration.hiddenLayers {
             let prefix = "language_model.model.layers.\(l).mlp"

@@ -277,15 +277,14 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             numExperts: configuration.numExperts)
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        sanitize(weights: weights, metadata: [:])
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try sanitize(weights: weights, metadata: [:])
     }
 
-    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
         MLXArray]
     {
-        // The throwing loader reports invalid layouts; legacy sanitizers preserve them for validation.
-        (try? prepareCheckpoint(.init(weights: weights, metadata: metadata)))?.weights ?? weights
+        try prepareCheckpoint(.init(weights: weights, metadata: metadata)).weights
     }
 
 }

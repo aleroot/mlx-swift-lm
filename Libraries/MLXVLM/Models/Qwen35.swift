@@ -1409,21 +1409,22 @@ public class Qwen35: Module, VLMModel {
         var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             checkpoint, layout: .vision,
             tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
-        checkpoint.weights = sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
         return checkpoint
     }
 
-    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
         MLXArray]
     {
         if metadata["format"]?.lowercased() == "mlx" {
             // Converted checkpoints can keep the MTP head; the drafter loads it, not this model.
             return Qwen35CheckpointPolicy.targetWeights(weights)
         }
-        return sanitize(weights: weights)
+        return try sanitize(weights: weights)
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
         // Whether the checkpoint stores RMSNorm weights in the raw (un-shifted)
         // convention that needs the `+1` offset. Mirrors the MLXLLM Qwen35 gate
         // so the VLM and text paths agree: a pre-converted MLX checkpoint
@@ -1440,10 +1441,10 @@ public class Qwen35: Module, VLMModel {
         // layout is the reliable signal on its own.
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        let checkpoint = try? Qwen35CheckpointPolicy.prepareTarget(
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             .init(weights: weights), layout: .vision,
             tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
-        let weights = checkpoint?.weights ?? weights
+        let weights = checkpoint.weights
 
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count)

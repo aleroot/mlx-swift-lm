@@ -34,7 +34,7 @@ func testQwen35MTPDraftSanitizeKeepsAndShiftsMTPNorms() throws {
         from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
     let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
 
-    let sanitized = drafter.sanitize(weights: [
+    let sanitized = try drafter.sanitize(weights: [
         "mtp.norm.weight": MLXArray.zeros([16]),
         "mtp.pre_fc_norm_embedding.weight": MLXArray.zeros([16]),
         "mtp.layers.0.self_attn.q_proj.weight": MLXArray.zeros([32, 16]),
@@ -57,6 +57,29 @@ func testQwen35MTPDraftSanitizeKeepsAndShiftsMTPNorms() throws {
     #expect(allClose(pre, MLXArray.ones([16]), rtol: 0, atol: 0).item(Bool.self))
 }
 
+@Test(arguments: [false, true])
+func testQwen35MTPDraftSanitizeRejectsCompetingComponents(vision: Bool) throws {
+    let data = Data(qwen35TextConfigJSON(mtpLayers: 1).utf8)
+    let drafter: any BaseLanguageModel
+    if vision {
+        drafter = MLXVLM.Qwen35VLMNextNDraftModel(
+            try JSONDecoder().decode(MLXVLM.Qwen35Configuration.TextConfiguration.self, from: data))
+    } else {
+        drafter = MLXLLM.Qwen35MTPDraftModel(
+            try JSONDecoder().decode(MLXLLM.Qwen35TextConfiguration.self, from: data))
+    }
+    let weights = [
+        "mtp.norm.weight": MLXArray.zeros([16]),
+        "language_model.mtp.norm.weight": MLXArray.ones([16]),
+    ]
+    #expect(throws: CheckpointComponent.SelectionError.self) {
+        try drafter.sanitize(weights: weights)
+    }
+    #expect(throws: CheckpointComponent.SelectionError.self) {
+        try drafter.sanitize(weights: weights, metadata: [:])
+    }
+}
+
 @Test
 func testQwen35StandaloneMTPDoesNotDoubleShiftConvertedNorms() throws {
     let cfg = try JSONDecoder().decode(
@@ -65,7 +88,7 @@ func testQwen35StandaloneMTPDoesNotDoubleShiftConvertedNorms() throws {
     let drafter = MLXLLM.Qwen35MTPDraftModel(cfg, preconvertedNorms: true)
 
     let weight = MLXArray.zeros([16])
-    let sanitized = drafter.sanitize(weights: ["mtp.norm.weight": weight])
+    let sanitized = try drafter.sanitize(weights: ["mtp.norm.weight": weight])
     let norm = try #require(sanitized["mtp.norm.weight"])
     eval(norm)
     #expect(allClose(norm, weight, rtol: 0, atol: 0).item(Bool.self))
@@ -87,7 +110,7 @@ func testQwen35MTPDraftSanitizeStacksPerExpertMoEWeights() throws {
         "mtp.layers.0.mlp.experts.1.down_proj.weight": MLXArray.ones([16, 16]),
     ]
 
-    let sanitized = drafter.sanitize(weights: weights)
+    let sanitized = try drafter.sanitize(weights: weights)
 
     #expect(sanitized["mtp.layers.0.mlp.experts.0.gate_proj.weight"] == nil)
     #expect(sanitized["mtp.layers.0.mlp.switch_mlp.gate_proj.weight"]?.shape == [2, 16, 16])
@@ -104,7 +127,7 @@ func testQwen35MTPDraftInstantiatesDedicatedEmbeddingWhenConfigured() throws {
     let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
 
     #expect(drafter.mtp.embedTokens != nil)
-    let sanitized = drafter.sanitize(weights: [
+    let sanitized = try drafter.sanitize(weights: [
         "mtp.embed_tokens.weight": MLXArray.zeros([16, 16]),
         "model.embed_tokens.weight": MLXArray.ones([16, 16]),
     ])

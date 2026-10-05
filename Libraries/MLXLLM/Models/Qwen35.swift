@@ -1168,7 +1168,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
         var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             checkpoint, layout: .text, tiedWordEmbeddings: configuration.tieWordEmbeddings)
-        checkpoint.weights = sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
         return checkpoint
     }
 
@@ -1284,15 +1285,16 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             checkpoint, layout: .wrappedText,
             tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
-        checkpoint.weights = sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
         return checkpoint
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let checkpoint = try? Qwen35CheckpointPolicy.prepareTarget(
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             .init(weights: weights), layout: .wrappedText,
             tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
-        return languageModel.sanitize(weights: checkpoint?.weights ?? weights)
+        return languageModel.sanitize(weights: checkpoint.weights)
     }
 }
 

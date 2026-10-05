@@ -2,11 +2,27 @@
 
 import Foundation
 import MLX
+import MLXNN
 import Testing
 
 @testable import MLXLMCommon
 
 struct ModelCheckpointTests {
+    @Test
+    func legacySanitizationErrorsReachCheckpointPreparation() {
+        final class FailingModel: Module, BaseLanguageModel {
+            enum Failure: Error { case sanitization }
+
+            func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+                throw Failure.sanitization
+            }
+        }
+        let model: any BaseLanguageModel = FailingModel()
+        #expect(throws: FailingModel.Failure.self) {
+            try model.prepareCheckpoint(.init(weights: [:]))
+        }
+    }
+
     @Test
     func nameMappingsPreservePrecisionAndSourceMetadata() throws {
         let checkpoint = ModelCheckpoint(

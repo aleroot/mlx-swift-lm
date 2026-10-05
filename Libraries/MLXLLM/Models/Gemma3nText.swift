@@ -970,8 +970,8 @@ public class Gemma3nTextModel: Module, LLMModel {
         return checkpoint
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        (try? prepareCheckpoint(.init(weights: weights)).weights) ?? weights
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try prepareCheckpoint(.init(weights: weights)).weights
     }
 
     private func trimVocabulary(weights: [String: MLXArray]) -> [String: MLXArray] {
