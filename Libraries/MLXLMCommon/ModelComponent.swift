@@ -58,13 +58,17 @@ extension ModelComponentsProviding {
 /// A model component that loads the first time it is used. See ``OnDemandComponent``.
 ///
 /// It lives outside the model's module tree, so loading it does not change the model. It reads,
-/// verifies and evaluates the component under a lock, and publishes it only after that.
-/// Concurrent first uses share one load. A published component does not change.
+/// verifies and evaluates the component under a load lock, and publishes it only after that.
+/// Concurrent first uses share one load. A published component does not change. State queries
+/// such as ``AnyOnDemandComponent/isLoaded`` never wait for a load in progress.
 public class AnyOnDemandComponent: @unchecked Sendable {
     public let component: ModelComponent
 
     let make: @Sendable () -> Module
-    private let lock = NSLock()
+    /// Guards `state`. Never held while the checkpoint is read.
+    private let stateLock = NSLock()
+    /// Serializes loads, so concurrent first uses share one load.
+    private let loadLock = NSLock()
     private var state = State.unavailable
 
     private enum State {
@@ -80,14 +84,14 @@ public class AnyOnDemandComponent: @unchecked Sendable {
 
     /// Whether the component has loaded.
     public var isLoaded: Bool {
-        lock.withLock {
+        stateLock.withLock {
             if case .loaded = state { true } else { false }
         }
     }
 
     /// Whether a source is set and the component has not loaded yet.
     var isPending: Bool {
-        lock.withLock {
+        stateLock.withLock {
             if case .pending = state { true } else { false }
         }
     }
@@ -104,13 +108,13 @@ public class AnyOnDemandComponent: @unchecked Sendable {
 
     /// Where to load the component from, or `nil` if it does not load on demand.
     func setSource(_ source: Source?) {
-        lock.withLock { state = source.map(State.pending) ?? .unavailable }
+        stateLock.withLock { state = source.map(State.pending) ?? .unavailable }
     }
 
     /// A failed load leaves the component pending, and the next call tries again.
     func loadModule() throws -> Module {
-        try lock.withLock {
-            switch state {
+        try loadLock.withLock {
+            switch stateLock.withLock({ state }) {
             case .loaded(let module):
                 return module
             case .unavailable:
@@ -119,7 +123,7 @@ public class AnyOnDemandComponent: @unchecked Sendable {
                 let module = make()
                 try applyCheckpoint(source.checkpoint(), to: module)
                 eval(module)
-                state = .loaded(module)
+                stateLock.withLock { state = .loaded(module) }
                 return module
             }
         }

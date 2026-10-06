@@ -17,9 +17,8 @@ import MLXNN
 //   - Full-attention layers get *no* positional encoding (`layer_rope_theta` is
 //     0 for them), while sliding layers use theta 500000.
 //   - Attention output is gated: `output * sigmoid(gate_proj(x))`.
-//   - Attention applies `qk_scale_factor` (3.87) *in addition to* the usual
-//     `1/sqrt(head_dim)` softmax scale (folded into the SDPA scale here; the
-//     reference multiplies it into the queries — same expression).
+//   - Queries are multiplied by `qk_scale_factor` (3.87) in fp32 before RoPE, *in
+//     addition to* the usual `1/sqrt(head_dim)` softmax scale, as in Python MLX-VLM.
 //   - The ViT does window attention by permuting tokens into contiguous windows
 //     and running chunked SDPA — no banded mask is ever materialized.
 
@@ -449,11 +448,11 @@ private class MuseGlimmerTextAttention: Module {
         var keys = keyProj(x).reshaped(batch, length, kvHeads, headDimensions)
         var values = valueProj(x).reshaped(batch, length, kvHeads, headDimensions)
 
-        // `qkScaleFactor` is folded into the SDPA softmax scale rather than
-        // multiplied into the bf16 queries: same expression, but it skips one
-        // elementwise kernel per layer and applies the factor in the kernel's
-        // fp32 accumulation. Greedy-token identical to the reference ordering.
-        queries = qkNorm(queries).transposed(0, 2, 1, 3)
+        // Scale queries in fp32 before RoPE, as Python MLX-VLM does. Folding the factor into
+        // the SDPA scale is the same expression but rounds differently in bf16.
+        queries = qkNorm(queries)
+        queries = (queries.asType(.float32) * qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
         keys = qkNorm(keys).transposed(0, 2, 1, 3)
         values = values.transposed(0, 2, 1, 3)
 
@@ -468,7 +467,7 @@ private class MuseGlimmerTextAttention: Module {
             keys: keys,
             values: values,
             cache: cache,
-            scale: scale * qkScaleFactor,
+            scale: scale,
             mask: mask
         )
         output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)

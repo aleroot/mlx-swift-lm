@@ -70,7 +70,14 @@ private final class Captioner: Module, BaseLanguageModel, ModelComponentsProvidi
     /// Names of the tensors the loader passed to ``prepareCheckpoint(_:)``.
     var loadedNames = Set<String>()
 
+    /// When set, `prepareCheckpoint` signals `entered` and then waits for `release`.
+    var prepareGate: (entered: DispatchSemaphore, release: DispatchSemaphore)?
+
     func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        if let prepareGate {
+            prepareGate.entered.signal()
+            prepareGate.release.wait()
+        }
         loadedNames = Set(checkpoint.weights.keys)
         var checkpoint = checkpoint
         checkpoint.weights = dropModelScope(checkpoint.weights)
@@ -196,6 +203,55 @@ final class ModelComponentTests: XCTestCase {
         XCTAssertFalse(label.contains("cooperative"), label)
         XCTAssertTrue(
             pendingOnDemandComponents(of: model, among: ModelComponent.needed(by: image)).isEmpty)
+    }
+
+    /// A state query during a load returns at once. `ModelContainer.generate` asks for pending
+    /// components while it holds the container, so a wait here would block text requests too.
+    func testStateQueriesDoNotWaitForALoadInProgress() async throws {
+        let checkpoint = try writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+        let model = Captioner()
+        try await loadWeights(
+            modelDirectory: checkpoint.directory, model: model, quantization: quantization)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        model.prepareGate = (entered, release)
+
+        let vision = model.vision
+        let load = Task { try await vision.loadInBackground() }
+        let entry = await wait(for: entered, seconds: 5)
+        XCTAssertEqual(entry, .success)
+
+        let container = SerialAccessContainer(model)
+        let inspected = DispatchSemaphore(value: 0)
+        let inspection = Task {
+            let pending = await container.read { model in
+                pendingOnDemandComponents(of: model, among: [.vision]).map(\.component)
+            }
+            inspected.signal()
+            return (pending, vision.isLoaded)
+        }
+        let answered = await wait(for: inspected, seconds: 5)
+        XCTAssertEqual(answered, .success, "state query waited for the load")
+
+        release.signal()
+        let (pending, loadedDuringInspection) = await inspection.value
+        XCTAssertEqual(pending, [.vision])
+        XCTAssertFalse(loadedDuringInspection)
+        try await load.value
+        XCTAssertTrue(vision.isLoaded)
+        XCTAssertTrue(pendingOnDemandComponents(of: model, among: [.vision]).isEmpty)
+    }
+
+    private func wait(for semaphore: DispatchSemaphore, seconds: Double) async
+        -> DispatchTimeoutResult
+    {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: semaphore.wait(timeout: .now() + seconds))
+            }
+        }
     }
 
     func testExcludedOrImmediateComponentsDoNotLoadOnDemand() throws {
