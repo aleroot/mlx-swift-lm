@@ -1043,6 +1043,9 @@ public final class ChatSession {
                             processing: processing,
                             tools: tools, additionalContext: additionalContext)
                         let preparedInput = try await processor.prepare(input: userInput)
+                        try await loadOnDemandComponents(
+                            pendingOnDemandComponents(
+                                of: model, among: ModelComponent.needed(by: preparedInput)))
                         var input = preparedInput
                         pendingMessages.removeAll()
 

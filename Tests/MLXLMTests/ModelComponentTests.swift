@@ -27,13 +27,26 @@ private final class CaptionerVision: Module {
     @ModuleInfo var connector = Projection()
 }
 
+/// The dispatch queue that last built `CaptionerVision`.
+private let loadQueueLabel = Mutexish<String>("")
+
+private final class Mutexish<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+    init(_ value: Value) { self.value = value }
+    func withLock<R>(_ body: (inout Value) -> R) -> R { lock.withLock { body(&value) } }
+}
+
 /// A text model with a vision tower, and a vision projection nested in a module it shares.
 private final class Captioner: Module, BaseLanguageModel, ModelComponentsProviding {
     @ModuleInfo(key: "language_model") var language: Linear
     @ModuleInfo(key: "vision_tower") var tower: Linear?
     @ModuleInfo var connector: Connector
 
-    let vision = OnDemandComponent(.vision) { CaptionerVision() }
+    let vision = OnDemandComponent<CaptionerVision>(.vision) {
+        loadQueueLabel.withLock { $0 = String(cString: __dispatch_queue_get_label(nil)) }
+        return CaptionerVision()
+    }
     var onDemandComponents: [AnyOnDemandComponent] { [vision] }
 
     override init() {
@@ -156,6 +169,33 @@ final class ModelComponentTests: XCTestCase {
 
         XCTAssertEqual(
             loads.modules, [ObjectIdentifier(try vision.load())])
+    }
+
+    /// Async callers load before prefill on a GCD queue, never on a Swift concurrency thread.
+    func testMediaInputLoadsPendingComponentsOffTheConcurrencyPool() async throws {
+        let checkpoint = try writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+        let model = Captioner()
+        try await loadWeights(
+            modelDirectory: checkpoint.directory, model: model, quantization: quantization)
+        let text = LMInput(tokens: MLXArray([1, 2] as [Int32]))
+        let image = LMInput(
+            text: text.text, image: .init(pixels: MLXArray.zeros([1, 3, 2, 2])))
+
+        XCTAssertEqual(ModelComponent.needed(by: text), [])
+        XCTAssertEqual(ModelComponent.needed(by: image), [.vision])
+        let pending = pendingOnDemandComponents(
+            of: model, among: ModelComponent.needed(by: image))
+        XCTAssertEqual(pending.map(\.component), [.vision])
+
+        try await loadOnDemandComponents(pending)
+
+        XCTAssertTrue(model.vision.isLoaded)
+        let label = loadQueueLabel.withLock { $0 }
+        XCTAssertTrue(label.hasPrefix("com.apple.root."), label)
+        XCTAssertFalse(label.contains("cooperative"), label)
+        XCTAssertTrue(
+            pendingOnDemandComponents(of: model, among: ModelComponent.needed(by: image)).isEmpty)
     }
 
     func testExcludedOrImmediateComponentsDoNotLoadOnDemand() throws {

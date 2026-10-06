@@ -85,6 +85,23 @@ public class AnyOnDemandComponent: @unchecked Sendable {
         }
     }
 
+    /// Whether a source is set and the component has not loaded yet.
+    var isPending: Bool {
+        lock.withLock {
+            if case .pending = state { true } else { false }
+        }
+    }
+
+    /// Load on a GCD queue. Loading blocks on file I/O, and Swift concurrency threads must not.
+    func loadInBackground() async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(with: Result { _ = try self.loadModule() })
+            }
+        }
+    }
+
     /// Where to load the component from, or `nil` if it does not load on demand.
     func setSource(_ source: Source?) {
         lock.withLock { state = source.map(State.pending) ?? .unavailable }
@@ -160,6 +177,28 @@ public enum OnDemandComponentError: LocalizedError {
         case .unavailable(let component):
             "The model was loaded without its \(component) component."
         }
+    }
+}
+
+extension ModelComponent {
+    /// The components that `input`'s media need.
+    static func needed(by input: LMInput) -> Set<ModelComponent> {
+        input.image != nil || input.video != nil ? [.vision] : []
+    }
+}
+
+/// The on-demand components of `model` among `needed` that have not loaded yet.
+func pendingOnDemandComponents(of model: BaseLanguageModel, among needed: Set<ModelComponent>)
+    -> [AnyOnDemandComponent]
+{
+    guard !needed.isEmpty, let model = model as? any ModelComponentsProviding else { return [] }
+    return model.onDemandComponents.filter { needed.contains($0.component) && $0.isPending }
+}
+
+/// Load `components` before prefill, off the Swift concurrency thread pool.
+func loadOnDemandComponents(_ components: [AnyOnDemandComponent]) async throws {
+    for component in components {
+        try await component.loadInBackground()
     }
 }
 
