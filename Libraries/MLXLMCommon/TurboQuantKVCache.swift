@@ -1609,19 +1609,20 @@ public class TurboQuantKVCache: BaseKVCache {
         new.offset = offset
         new.keyMSECodec = keyMSECodec
         new.valueMSECodec = valueMSECodec
-        // A full-range slice is a new array object, so a write to either cache
-        // rebinds only its own arrays.
-        new.affKeyW = affKeyW?[.ellipsis]
-        new.affKeyScales = affKeyScales?[.ellipsis]
-        new.affKeyBiases = affKeyBiases?[.ellipsis]
-        new.rawKeys = rawKeys?[.ellipsis]
-        new.rawValues = rawValues?[.ellipsis]
-        new.rawAllocSteps = rawAllocSteps
-        new.keyPackedMSE = keyPackedMSE?[.ellipsis]
-        new.keyNorms = keyNorms?[.ellipsis]
-        new.valPackedMSE = valPackedMSE?[.ellipsis]
-        new.valNorms = valNorms?[.ellipsis]
-        new.compressedAllocSteps = compressedAllocSteps
+        // Like `state`, keep only the positions this cache holds. A slice is a new array
+        // object, so a write to either cache rebinds only its own arrays.
+        func held(_ array: MLXArray?) -> MLXArray? { array?[0..., 0..., ..<offset] }
+        new.affKeyW = held(affKeyW)
+        new.affKeyScales = held(affKeyScales)
+        new.affKeyBiases = held(affKeyBiases)
+        new.rawKeys = held(rawKeys)
+        new.rawValues = held(rawValues)
+        new.rawAllocSteps = new.rawKeys?.dim(2) ?? 0
+        new.keyPackedMSE = held(keyPackedMSE)
+        new.keyNorms = held(keyNorms)
+        new.valPackedMSE = held(valPackedMSE)
+        new.valNorms = held(valNorms)
+        new.compressedAllocSteps = new.valPackedMSE?.dim(2) ?? 0
         new.keyCalibScale = keyCalibScale?[.ellipsis]
         new.isCompressed = isCompressed
         return new

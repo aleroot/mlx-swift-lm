@@ -591,6 +591,8 @@ public final class ChatSession {
     ) {
         self.model = model
         self.instructions = instructions
+        // Each response uses the cache on another thread, and a fork shares its arrays.
+        eval(cache)
         self.cache = .init(
             .kvcache(
                 .init(
@@ -658,6 +660,8 @@ public final class ChatSession {
     ) {
         self.model = ModelContainer(context: model)
         self.instructions = instructions
+        // Each response uses the cache on another thread, and a fork shares its arrays.
+        eval(cache)
         self.cache = .init(
             .kvcache(
                 .init(
@@ -746,11 +750,12 @@ public final class ChatSession {
     }
 
     /// A session configured like `source` that starts from `cache`.
-    private init(forking source: ChatSession, cache: Cache, draftModel: ModelContainer?) {
+    private init(forking source: ChatSession, cache: Cache) {
         self.model = source.model
         self.instructions = source.instructions
         self.cache = .init(cache)
-        self.loadedDraftModel = .init(draftModel)
+        // The same configuration loads the same draft model, so the sessions share it.
+        self.loadedDraftModel = source.loadedDraftModel
         self.processing = source.processing
         self.generateParameters = source.generateParameters
         self.components = source.components
@@ -1197,6 +1202,11 @@ public final class ChatSession {
 
                                 if !(mainTrimIsAligned && draftTrimIsAligned) {
                                     decision = .rebuild
+                                } else if !currentConversation.transcriptBuiltCache {
+                                    // A fork shares its source's arrays. A copy keeps only
+                                    // the prefix, so the next write does not copy the rest.
+                                    kvCache = kvCache.copy()
+                                    draftKVCache = draftKVCache?.copy()
                                 }
                             }
 
@@ -1583,13 +1593,14 @@ public final class ChatSession {
 
     /// Create a session that starts from a copy of this session's cache.
     ///
-    /// The two sessions share no mutable state, so each continues without affecting the
-    /// other. Copying is cheap: they share the cache's arrays until one of them writes.
+    /// Each session continues without affecting the other. Copying is cheap: they share the
+    /// cache's arrays until one of them writes. Once either loads the draft model for
+    /// speculative decoding, both use it.
     ///
     /// Without `history`, the new session continues this conversation, which branches it.
-    /// With `history`, it holds that conversation instead, and its first response prefills
-    /// only the prompt tokens this cache does not already hold. Conversations that share
-    /// instructions and tools therefore prefill them once:
+    /// With `history`, it holds that conversation instead. Its first response keeps only the
+    /// part of the cache that its prompt starts with, and prefills the rest of the prompt.
+    /// Conversations that share instructions and tools therefore prefill them once:
     ///
     /// ```swift
     /// let session = ChatSession(model, instructions: instructions, tools: tools)
@@ -1610,12 +1621,11 @@ public final class ChatSession {
     ///   this one
     /// - Returns: a session that owns a copy of this session's cache
     public nonisolated(nonsending) func fork(history: [Chat.Message]? = nil) async -> ChatSession {
-        let draftModel = await loadedDraftModel.read { $0 }
         let history = SendableBox(history)
         let forked = await cache.read { cache in
             SendableBox(history.consume().map(cache.replacingTranscript) ?? cache.copy())
         }.consume()
-        return ChatSession(forking: self, cache: forked, draftModel: draftModel)
+        return ChatSession(forking: self, cache: forked)
     }
 
     /// Wait for exclusive access to the KVCache.

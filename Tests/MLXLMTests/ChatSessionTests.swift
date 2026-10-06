@@ -2315,6 +2315,63 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(copies.value, layerCount)
     }
 
+    func testForkWithHistoryKeepsOnlyTheSharedPrefixOnceItResponds() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        // Plain caches on every layer, so no sliding window drops the shared prefix.
+        var context = Self.makeModel(processor: processor)
+        context.model = CopyCountingLanguageModel(context.model, copies: CopyCounter())
+        let session = ChatSession(
+            context,
+            instructions: "shared instructions",
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: String(repeating: "a long document ", count: 64))
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+
+        let fork = await session.fork(history: [])
+        let reply = try await collectGeneration(fork.streamDetails(to: "hi"))
+        XCTAssertEqual(reply.info.cachedPromptTokenCount, "shared instructions".count + 3)
+
+        // The fork holds the shared prefix and room to grow, not the document.
+        let capacities =
+            await fork.withCache { cache in
+                (cache ?? []).compactMap { ($0 as? KVCacheSimple)?.keys?.dim(2) }
+            } ?? []
+        XCTAssertFalse(capacities.isEmpty)
+        for capacity in capacities {
+            XCTAssertLessThan(capacity, firstPromptLength)
+        }
+    }
+
+    func testForkSharesTheDraftModelItsSourceHasNotLoaded() async throws {
+        let loadCounter = DraftModelLoadCounter()
+        let session = ChatSession(
+            model(),
+            speculativeDecoding: SpeculativeDecodingConfig(
+                draftModelBytes: 0,
+                numDraftTokens: 2
+            ) {
+                await loadCounter.increment()
+                return ModelContainer(context: Self.makeModel())
+            },
+            generateParameters: GenerateParameters(maxTokens: 4, temperature: 0.0)
+        )
+
+        let fork = await session.fork()
+        _ = try await session.respond(to: "hello")
+        _ = try await fork.respond(to: "hello")
+
+        let loadCount = await loadCounter.value
+        XCTAssertEqual(loadCount, 1)
+    }
+
     func testCurrentCacheNilForHistorySessionBeforeGeneration() async throws {
         // .history state should behave like .empty: no cache until first generation
         let history: [Chat.Message] = [.user("hello"), .assistant("hi")]
