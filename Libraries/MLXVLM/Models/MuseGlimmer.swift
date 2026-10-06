@@ -253,6 +253,58 @@ public struct MuseGlimmerConfiguration: Codable, Sendable {
     }
 }
 
+// MARK: - Compiled fusions
+
+// Muse-Glimmer's block norms run 4× per layer × 52 layers for every decoded
+// token. Executed eagerly, each `MuseCenteredRMSNorm` is ~7 tiny kernel
+// launches and per-op dispatch dominates decode time. `compile` collapses the
+// elementwise regions into single kernels while executing the *same
+// operations in the same order and dtypes* as the eager reference, so outputs
+// are bit-for-bit identical (verified against the eager path on random inputs
+// and by end-to-end greedy-token comparison on the 30B checkpoint). This is
+// the same technique — with the same rationale — as `Gemma4Text.swift`.
+
+/// Exact fusion of the `MuseCenteredRMSNorm` body. `eps` arrives as a scalar
+/// fp32 array so the two eps values in play (`rms_norm_eps` for the pre-norms,
+/// `post_norm_eps` for the post-norms) share one compiled function.
+private let _centeredRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { x, weight, eps in
+        let dtype = x.dtype
+        let f = x.asType(.float32)
+        let variance = mean(f * f, axis: -1, keepDims: true)
+        var out = f * rsqrt(variance + eps)
+        out = out * (1.0 + weight.asType(.float32))
+        return out.asType(dtype)
+    }
+
+/// `residual + centeredRMSNorm(x)` — the post-attention / post-MLP pattern in
+/// `MuseGlimmerDecoderLayer`. Args: `[residual, x, weight, eps]`.
+private let _addCenteredRMSNorm: @Sendable ([MLXArray]) -> [MLXArray] =
+    compile(shapeless: true) { args in
+        let (residual, x, weight, eps) = (args[0], args[1], args[2], args[3])
+        let dtype = x.dtype
+        let f = x.asType(.float32)
+        let variance = mean(f * f, axis: -1, keepDims: true)
+        var out = f * rsqrt(variance + eps)
+        out = out * (1.0 + weight.asType(.float32))
+        return [residual + out.asType(dtype)]
+    }
+
+/// `output * sigmoid(gate)` — the attention output gate.
+private let _sigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { output, gate in
+        output * sigmoid(gate)
+    }
+
+/// Hides a constant `MLXArray` from `Module` parameter reflection. The block
+/// norms keep their `eps` as a prebuilt scalar array for the compiled calls;
+/// storing it as a bare `MLXArray` property would make weight verification
+/// expect a matching checkpoint key.
+private final class ConstantBox {
+    let value: MLXArray
+    init(_ value: MLXArray) { self.value = value }
+}
+
 // MARK: - Norms
 
 /// RMS norm with no learnable scale — `mx.fast.rms_norm(x, None, eps)`.
@@ -280,24 +332,30 @@ private class MuseRMSNormNoScale: Module, UnaryLayer {
 /// Not the same as `MLXNN.RMSNorm` (which uses `weight` directly) and not
 /// mean-subtracting despite the name. The fp32 cast ordering follows the
 /// reference exactly — folding `1 + weight` in bf16 instead drifts enough to
-/// change decode choices.
+/// change decode choices. `MLXFast.rmsNorm(x, weight: 1 + w_f32, eps:)` is
+/// also *not* equivalent: its multiply association differs and drifts by
+/// 1 bf16 ulp on ~every call (measured). The forward therefore runs the exact
+/// reference arithmetic through `_centeredRMSNorm` / `_addCenteredRMSNorm`,
+/// which only fuse kernel launches.
 private class MuseCenteredRMSNorm: Module, UnaryLayer {
     @ModuleInfo var weight: MLXArray
     let eps: Float
+    private let epsArray: ConstantBox
 
     init(dimensions: Int, eps: Float) {
         self._weight.wrappedValue = MLXArray.zeros([dimensions])
         self.eps = eps
+        self.epsArray = ConstantBox(MLXArray(eps))
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let dtype = x.dtype
-        let f = x.asType(.float32)
-        let variance = mean(f * f, axis: -1, keepDims: true)
-        var out = f * rsqrt(variance + eps)
-        out = out * (1.0 + weight.asType(.float32))
-        return out.asType(dtype)
+        _centeredRMSNorm(x, weight, epsArray.value)
+    }
+
+    /// `residual + self(x)` as one compiled graph.
+    func addedTo(_ residual: MLXArray, _ x: MLXArray) -> MLXArray {
+        _addCenteredRMSNorm([residual, x, weight, epsArray.value])[0]
     }
 }
 
@@ -318,7 +376,8 @@ private class MuseGlimmerTextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        // Compiled `silu(gate) * up` — identical arithmetic, one kernel.
+        downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -416,7 +475,7 @@ private class MuseGlimmerTextAttention: Module {
         output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
 
         // Gate is computed from the layer input, not the attention output.
-        output = output * sigmoid(gateProj(x))
+        output = _sigmoidGate(output, gateProj(x))
         return outputProj(output)
     }
 }
@@ -457,11 +516,9 @@ private class MuseGlimmerDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
     ) -> MLXArray {
-        var h =
-            x
-            + postAttentionLayerNorm(
-                selfAttention(inputLayerNorm(x), mask: mask, cache: cache))
-        h = h + postFeedforwardLayerNorm(mlp(preFeedforwardLayerNorm(h)))
+        var h = postAttentionLayerNorm.addedTo(
+            x, selfAttention(inputLayerNorm(x), mask: mask, cache: cache))
+        h = postFeedforwardLayerNorm.addedTo(h, mlp(preFeedforwardLayerNorm(h)))
         return h
     }
 }
