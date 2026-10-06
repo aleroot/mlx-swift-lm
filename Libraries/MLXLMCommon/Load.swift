@@ -166,15 +166,20 @@ func loadWeightArrays(urls: [URL]) throws -> (
 func loadModelCheckpoint(urls: [URL], excludedNamespaces: [String] = []) throws
     -> ModelCheckpoint
 {
+    let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
+    return try loadModelCheckpoint(urls: urls) { exclusions.mapName($0) != nil }
+}
+
+/// Only tensors whose names pass `isRead` are read.
+func loadModelCheckpoint(urls: [URL], isRead: @escaping @Sendable (String) -> Bool) throws
+    -> ModelCheckpoint
+{
     struct WorkItem {
         let file: Int
         let url: URL
         /// tensors this item evaluates; nil evaluates every tensor in the file that is read
         let names: [String]?
     }
-
-    let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
-    let isRead: @Sendable (String) -> Bool = { exclusions.mapName($0) != nil }
 
     let items: [WorkItem] = {
         var spansPerFile = [[SafetensorSpan]?]()
@@ -384,53 +389,56 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// the choice with ``ModelConfiguration/weightFileSelection``.
 ///
 /// The model loads without the `excludedComponents` it supports, see
-/// ``ExcludableComponentsProviding``. Tensors of excluded components and of the model's
-/// ``BaseLanguageModel/excludedCheckpointNamespaces`` are not read.
+/// ``ModelComponentsProviding``. Its on-demand components load the first time an input
+/// needs them, unless `componentLoading` is ``ComponentLoading/immediate``. Tensors of components
+/// that do not load now and of the model's ``BaseLanguageModel/excludedCheckpointNamespaces`` are
+/// not read.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic,
-    excludedComponents: Set<ModelComponent> = []
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
 ) throws {
-    let excludedNamespaces =
-        try removeExcludedComponents(excludedComponents, from: model)
-        + model.excludedCheckpointNamespaces
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    var checkpoint = try loadModelCheckpoint(
-        urls: weightURLs, excludedNamespaces: excludedNamespaces)
-    checkpoint.perLayerQuantization =
+    let perLayerQuantization =
         perLayerQuantization
         ?? quantization.map { .init(quantization: $0, perLayerQuantization: [:]) }
+    let excludedNamespaces =
+        try prepareComponents(
+            of: model, urls: weightURLs, excluded: excludedComponents,
+            loading: componentLoading, perLayerQuantization: perLayerQuantization)
+        + model.excludedCheckpointNamespaces
+    var checkpoint = try loadModelCheckpoint(
+        urls: weightURLs, excludedNamespaces: excludedNamespaces)
+    checkpoint.perLayerQuantization = perLayerQuantization
     checkpoint = try model.prepareCheckpoint(checkpoint)
-    let weights = checkpoint.weights
-
-    // quantize if needed
-    if let perLayerQuantization = checkpoint.perLayerQuantization {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                return perLayerQuantization.quantization(layer: path)?.asTuple
-            } else {
-                return nil
-            }
-        }
-    }
-
-    // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
+    try applyCheckpoint(checkpoint, to: model)
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
     materializeModelForInference(model)
 }
 
+/// Quantize the layers `checkpoint` has scales for, then update `module` with strict validation.
+func applyCheckpoint(_ checkpoint: ModelCheckpoint, to module: Module) throws {
+    let weights = checkpoint.weights
+    if let perLayerQuantization = checkpoint.perLayerQuantization {
+        quantize(model: module) { path, _ in
+            guard weights["\(path).scales"] != nil else { return nil }
+            return perLayerQuantization.quantization(layer: path)?.asTuple
+        }
+    }
+    try module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+}
+
 /// Async variant of
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:)-9v5eb``.
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:componentLoading:)-858j8``.
 ///
 /// Loading blocks its thread on file I/O and fans out with `DispatchQueue.concurrentPerform`.
 /// Swift concurrency's cooperative threads must never block, so this overload runs the load
@@ -441,7 +449,8 @@ public func loadWeights(
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     weightFileSelection: WeightFileSelection = .automatic,
-    excludedComponents: Set<ModelComponent> = []
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
 ) async throws {
     let model = SendableBox(model)
     try await withCheckedThrowingContinuation {
@@ -454,7 +463,8 @@ public func loadWeights(
                         quantization: quantization,
                         perLayerQuantization: perLayerQuantization,
                         weightFileSelection: weightFileSelection,
-                        excludedComponents: excludedComponents)
+                        excludedComponents: excludedComponents,
+                        componentLoading: componentLoading)
                 })
         }
     }

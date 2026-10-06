@@ -79,19 +79,31 @@ use scales; `mtp.*` uses offsets unless its own file declares `format=mlx` or th
 caller sets `preconvertedNorms`. Metadata from a target shard does not classify
 a separate MTP shard. Conflicting norm declarations fail before model update.
 
-## Loading Without A Component
+## Components That Load On First Use
 
-``ModelConfiguration/excludedComponents`` loads a model without parts it can do
-without, such as ``ModelComponent/vision`` for text-only use. A model opts in
-through ``ExcludableComponentsProviding``. For each component, it lists
-``CheckpointComponent`` values whose destination is an optional module and whose
-namespaces cover every serialized name of that module. The loader sets those
-modules to `nil` before it reads the checkpoint, and it does not read their
-tensors. Models that do not opt in load every component.
+Some models have large parts that many sessions never use, such as the vision
+encoder of a VLM. Loading them is lazy, like `MLXArray` evaluation: nothing is
+read until an input needs it, and apps need no configuration.
 
-All of this happens inside ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:)-9v5eb``.
-After loading, the model does not change. To use an excluded component, load the
-model again. An input that needs a missing component fails with an error.
+A model declares its parts through ``ModelComponentsProviding``. For each
+``ModelComponent``, it lists ``CheckpointComponent`` values whose destination is
+an optional module and whose namespaces cover every serialized name of that
+module. It lists the parts that can load later as ``OnDemandComponent`` values,
+which live outside the module tree.
+
+Before reading the checkpoint, the loader removes the modules of each on-demand
+component and does not read its tensors. The first input that needs the
+component reads only its namespaces. Then the component goes through the same
+``BaseLanguageModel/prepareCheckpoint(_:)``, quantization, and strict validation
+as the model, and is evaluated. All of this happens under a lock, and the
+component is published only after that. The model's module tree does not change
+after the load, so sessions that share the model stay safe. Concurrent first uses
+share one load. The checkpoint files must stay readable until then.
+
+Model conversion loads with ``ComponentLoading/immediate`` because it saves every
+weight. It rebuilds modules that an earlier on-demand load removed. List a
+component in ``ModelConfiguration/excludedComponents`` to never load it. Inputs
+that need it then fail with an error.
 
 ``BaseLanguageModel/excludedCheckpointNamespaces`` is the same read filter for
 namespaces that a model never loads. An embedded Qwen MTP drafter excludes the

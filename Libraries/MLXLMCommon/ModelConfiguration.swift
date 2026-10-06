@@ -129,10 +129,12 @@ public struct ModelConfiguration: Sendable {
     /// that case before reaching for it.
     public var weightFileSelection: WeightFileSelection = .automatic
 
-    /// Components to load the model without, such as ``ModelComponent/vision`` for text-only use.
+    /// Components to never load, such as ``ModelComponent/vision`` for text-only use.
     ///
-    /// Their weights are never read. Models that cannot load without a component load it anyway;
-    /// see ``ExcludableComponentsProviding``. Load the model again to use an excluded component.
+    /// Their weights are never read, and inputs that need them fail. You do not need this to
+    /// save memory: on-demand components, such as the vision encoder of some VLMs, already load
+    /// the first time an input needs them. Models that cannot load
+    /// without a component load it anyway; see ``ModelComponentsProviding``.
     public var excludedComponents: Set<ModelComponent> = []
 
     /// Overrides the ``MessageGenerator`` the model would otherwise supply.

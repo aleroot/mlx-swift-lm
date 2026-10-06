@@ -17,11 +17,24 @@ private final class Connector: Module {
     }
 }
 
+/// The vision modules of ``Captioner``, at the paths they have in the model.
+private final class CaptionerVision: Module {
+    final class Projection: Module {
+        @ModuleInfo var projection = Linear(64, 64, bias: false)
+    }
+
+    @ModuleInfo(key: "vision_tower") var tower = Linear(64, 64, bias: false)
+    @ModuleInfo var connector = Projection()
+}
+
 /// A text model with a vision tower, and a vision projection nested in a module it shares.
-private final class Captioner: Module, BaseLanguageModel, ExcludableComponentsProviding {
+private final class Captioner: Module, BaseLanguageModel, ModelComponentsProviding {
     @ModuleInfo(key: "language_model") var language: Linear
     @ModuleInfo(key: "vision_tower") var tower: Linear?
     @ModuleInfo var connector: Connector
+
+    let vision = OnDemandComponent(.vision) { CaptionerVision() }
+    var onDemandComponents: [AnyOnDemandComponent] { [vision] }
 
     override init() {
         _language.wrappedValue = Linear(64, 64, bias: false)
@@ -29,7 +42,7 @@ private final class Captioner: Module, BaseLanguageModel, ExcludableComponentsPr
         _connector.wrappedValue = Connector()
     }
 
-    var excludableComponents: [ModelComponent: [CheckpointComponent]] {
+    var modelComponents: [ModelComponent: [CheckpointComponent]] {
         [
             .vision: [
                 CheckpointComponent(
@@ -70,10 +83,10 @@ private func dropModelScope(_ weights: [String: MLXArray]) -> [String: MLXArray]
 }
 
 /// Declares a component whose module is not optional.
-private final class MisdeclaredCaptioner: Module, BaseLanguageModel, ExcludableComponentsProviding {
+private final class MisdeclaredCaptioner: Module, BaseLanguageModel, ModelComponentsProviding {
     @ModuleInfo(key: "language_model") var language = Linear(64, 64, bias: false)
 
-    var excludableComponents: [ModelComponent: [CheckpointComponent]] {
+    var modelComponents: [ModelComponent: [CheckpointComponent]] {
         [.vision: [.init(name: "language", namespaces: [], destination: "language_model")]]
     }
 }
@@ -99,13 +112,109 @@ final class ModelComponentTests: XCTestCase {
         try assertParameters(of: model, match: checkpoint.text)
     }
 
-    func testEveryComponentLoadsByDefault() throws {
+    func testOnDemandComponentLoadsOnFirstUseByDefaultWithoutChangingTheModel() throws {
         let checkpoint = try writeCheckpoint()
         defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
 
         let model = Captioner()
         try loadWeights(
             modelDirectory: checkpoint.directory, model: model, quantization: quantization)
+
+        XCTAssertEqual(model.loadedNames, Set(raw(checkpoint.text).keys))
+        XCTAssertNil(model.tower)
+        XCTAssertFalse(model.vision.isLoaded)
+        let parameters = model.parameters().flattened().map(\.0)
+
+        let vision = try model.vision.load()
+
+        XCTAssertTrue(model.vision.isLoaded)
+        XCTAssertTrue(vision.connector.projection is QuantizedLinear)
+        try assertParameters(of: vision, match: checkpoint.visual)
+        XCTAssertTrue(try model.vision.load() === vision)
+        XCTAssertNil(model.tower)
+        XCTAssertEqual(model.parameters().flattened().map(\.0), parameters)
+    }
+
+    func testConcurrentFirstUsesLoadOnce() throws {
+        let checkpoint = try writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+        let model = Captioner()
+        try loadWeights(
+            modelDirectory: checkpoint.directory, model: model, quantization: quantization,
+            componentLoading: .onFirstUse)
+
+        final class Loads: @unchecked Sendable {
+            let lock = NSLock()
+            var modules = Set<ObjectIdentifier?>()
+        }
+        let loads = Loads()
+        let vision = model.vision
+        DispatchQueue.concurrentPerform(iterations: 8) { _ in
+            let module = try? vision.load()
+            loads.lock.withLock { _ = loads.modules.insert(module.map(ObjectIdentifier.init)) }
+        }
+
+        XCTAssertEqual(
+            loads.modules, [ObjectIdentifier(try vision.load())])
+    }
+
+    func testExcludedOrImmediateComponentsDoNotLoadOnDemand() throws {
+        let checkpoint = try writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+
+        let excluded = Captioner()
+        try loadWeights(
+            modelDirectory: checkpoint.directory, model: excluded, quantization: quantization,
+            excludedComponents: [.vision], componentLoading: .onFirstUse)
+        let immediate = Captioner()
+        try loadWeights(
+            modelDirectory: checkpoint.directory, model: immediate, quantization: quantization,
+            componentLoading: .immediate)
+
+        XCTAssertNil(excluded.tower)
+        XCTAssertNotNil(immediate.tower)
+        for model in [excluded, immediate] {
+            XCTAssertThrowsError(try model.vision.load()) { error in
+                guard case OnDemandComponentError.unavailable(.vision) = error else {
+                    return XCTFail("expected unavailable, got \(error)")
+                }
+            }
+        }
+    }
+
+    /// Lazy and immediate loads of one model instance agree with fresh loads.
+    func testReloadingSwitchesBetweenLazyAndImmediate() throws {
+        let checkpoint = try writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+        let model = Captioner()
+        func load(_ loading: ComponentLoading) throws {
+            try loadWeights(
+                modelDirectory: checkpoint.directory, model: model, quantization: quantization,
+                componentLoading: loading)
+        }
+
+        try load(.onFirstUse)
+        try load(.onFirstUse)
+        XCTAssertNil(model.tower)
+
+        try load(.immediate)
+        XCTAssertFalse(model.vision.isLoaded)
+        try assertParameters(
+            of: model, match: checkpoint.text.merging(checkpoint.visual) { a, _ in a })
+
+        try load(.onFirstUse)
+        XCTAssertNil(model.tower)
+        try assertParameters(of: try model.vision.load(), match: checkpoint.visual)
+    }
+
+    func testImmediateLoadingLoadsEveryComponent() throws {
+        let checkpoint = try writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+
+        let model = Captioner()
+        try loadWeights(
+            modelDirectory: checkpoint.directory, model: model, quantization: quantization,
+            componentLoading: .immediate)
 
         XCTAssertNotNil(model.tower)
         XCTAssertTrue(model.connector.projection is QuantizedLinear)
@@ -126,13 +235,15 @@ final class ModelComponentTests: XCTestCase {
         let model = Captioner()
         try loadWeights(
             modelDirectory: checkpoint.directory, model: model, quantization: quantization,
-            excludedComponents: [ModelComponent("audio")])
+            excludedComponents: [ModelComponent("audio")], componentLoading: .immediate)
         XCTAssertNotNil(model.tower)
     }
 
     func testComponentDestinationMustBeAnOptionalModule() {
         XCTAssertThrowsError(
-            try removeExcludedComponents([.vision], from: MisdeclaredCaptioner())
+            try prepareComponents(
+                of: MisdeclaredCaptioner(), urls: [], excluded: [.vision], loading: .onFirstUse,
+                perLayerQuantization: nil)
         ) { error in
             XCTAssertTrue(error is UpdateError, "\(error)")
         }

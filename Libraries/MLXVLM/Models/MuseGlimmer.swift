@@ -1099,6 +1099,21 @@ private class MuseGlimmerVisionAdapter: Module, UnaryLayer {
 
 // MARK: - Model
 
+/// The vision stack, with the parameter paths it has in ``MuseGlimmer``.
+private final class MuseGlimmerVision: Module {
+    @ModuleInfo(key: "vision_tower") var tower: MuseGlimmerVisionModel
+    @ModuleInfo(key: "vision_adapter") var adapter: MuseGlimmerVisionAdapter
+    @ModuleInfo(key: "vision_projection") var projection: Linear
+
+    init(_ config: MuseGlimmerConfiguration) {
+        _tower.wrappedValue = MuseGlimmerVisionModel(config.visionConfiguration)
+        _adapter.wrappedValue = MuseGlimmerVisionAdapter(config)
+        _projection.wrappedValue = Linear(
+            config.projectorHiddenSize, config.textConfiguration.hiddenSize, bias: false)
+        super.init()
+    }
+}
+
 public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") private var languageModel: MuseGlimmerLanguageModel
     @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel?
@@ -1109,6 +1124,9 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "perception_emb_norm") private var perceptionEmbNorm: MuseRMSNormNoScale
 
     public let config: MuseGlimmerConfiguration
+
+    /// Loads the vision stack on the first image when the factory loads the model without it.
+    private let onDemandVision: OnDemandComponent<MuseGlimmerVision>
 
     public var vocabularySize: Int { config.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
@@ -1122,10 +1140,11 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     public init(_ config: MuseGlimmerConfiguration) {
         self.config = config
         self._languageModel.wrappedValue = MuseGlimmerLanguageModel(config.textConfiguration)
-        self._visionTower.wrappedValue = MuseGlimmerVisionModel(config.visionConfiguration)
-        self._visionAdapter.wrappedValue = MuseGlimmerVisionAdapter(config)
-        self._visionProjection.wrappedValue = Linear(
-            config.projectorHiddenSize, config.textConfiguration.hiddenSize, bias: false)
+        let vision = MuseGlimmerVision(config)
+        self._visionTower.wrappedValue = vision.tower
+        self._visionAdapter.wrappedValue = vision.adapter
+        self._visionProjection.wrappedValue = vision.projection
+        self.onDemandVision = OnDemandComponent(.vision) { MuseGlimmerVision(config) }
         self._perceptionEmbNorm.wrappedValue = MuseRMSNormNoScale(
             eps: config.textConfiguration.rmsNormEps)
         super.init()
@@ -1135,15 +1154,21 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         try languageModel.newCache(parameters: parameters)
     }
 
-    private func encodeImage(_ pixelValues: MLXArray, grid: [THW]) throws -> MLXArray {
-        guard let visionTower, let visionAdapter, let visionProjection else {
-            throw VLMError.processing(
-                "Vision inputs were provided, but the model was loaded without vision.")
+    /// The model's own vision modules after a full load, otherwise the ones loaded on first use.
+    private func vision() throws -> (MuseGlimmerVisionModel, MuseGlimmerVisionAdapter, Linear) {
+        if let visionTower, let visionAdapter, let visionProjection {
+            return (visionTower, visionAdapter, visionProjection)
         }
-        let dtype = visionTower.patchEmbedder.patchEmbedding.weight.dtype
-        var features = visionTower(pixelValues.asType(dtype), grid: grid)
-        features = visionAdapter(features)
-        features = visionProjection(features)
+        let vision = try onDemandVision.load()
+        return (vision.tower, vision.adapter, vision.projection)
+    }
+
+    private func encodeImage(_ pixelValues: MLXArray, grid: [THW]) throws -> MLXArray {
+        let (tower, adapter, projection) = try vision()
+        let dtype = tower.patchEmbedder.patchEmbedding.weight.dtype
+        var features = tower(pixelValues.asType(dtype), grid: grid)
+        features = adapter(features)
+        features = projection(features)
         return perceptionEmbNorm(features)
     }
 
@@ -1258,10 +1283,10 @@ extension MuseGlimmer: LoRAModel {
     }
 }
 
-extension MuseGlimmer: ExcludableComponentsProviding {
+extension MuseGlimmer: ModelComponentsProviding {
     // The bf16 vision stack is ~3.7 GB. With it, the 4-bit model exceeds the wired limit of a
     // 24 GB Mac.
-    public var excludableComponents: [ModelComponent: [CheckpointComponent]] {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
         let modules = ["vision_tower", "vision_adapter", "vision_projection"]
         return [
             .vision: modules.map {
@@ -1269,6 +1294,8 @@ extension MuseGlimmer: ExcludableComponentsProviding {
             }
         ]
     }
+
+    public var onDemandComponents: [AnyOnDemandComponent] { [onDemandVision] }
 }
 
 // MARK: - Processor

@@ -1034,8 +1034,8 @@ struct MuseGlimmerTextOnlyPrepareTests {
     }
 }
 
-@Suite("MuseGlimmer without vision")
-struct MuseGlimmerWithoutVisionTests {
+@Suite("MuseGlimmer on-demand vision")
+struct MuseGlimmerOnDemandVisionTests {
 
     /// One image token over a 2x2 patch grid.
     private static func imageInput() -> LMInput {
@@ -1061,16 +1061,15 @@ struct MuseGlimmerWithoutVisionTests {
         return output.logits
     }
 
-    /// The checkpoint mirrors `Muse-Glimmer-30B-4bit`: the tower is bf16 while the adapter and
-    /// the projection are quantized. `transformers` exports scope the vision modules in `model.`.
-    @Test(
-        "loading without vision skips its weights and keeps text output", arguments: [false, true])
-    func loadsWithoutVision(transformersLayout: Bool) throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MuseGlimmerWithoutVision-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+    private static let quantization = BaseConfiguration.Quantization(groupSize: 32, bits: 4)
 
+    /// Writes a checkpoint that mirrors `Muse-Glimmer-30B-4bit`: the tower is bf16 while the
+    /// adapter and the projection are quantized. `transformers` exports scope the vision modules
+    /// in `model.`.
+    private static func writeCheckpoint(transformersLayout: Bool = false) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseGlimmerOnDemandVision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let source = try MuseGlimmerForwardTests.model()
         quantize(
             model: source, groupSize: 32, bits: 4,
@@ -1080,25 +1079,82 @@ struct MuseGlimmerWithoutVisionTests {
             let scoped = transformersLayout && key.hasPrefix("vision_")
             arrays[scoped ? "model.\(key)" : key] = value
         }
+        if transformersLayout {
+            // `sanitize` drops these; the first image must too.
+            arrays["model.vision_tower.rotary_emb.inv_freq"] = MLXArray.zeros([4])
+        }
         try save(arrays: arrays, url: directory.appendingPathComponent("model.safetensors"))
+        return directory
+    }
 
-        let quantization = BaseConfiguration.Quantization(groupSize: 32, bits: 4)
-        let full = try MuseGlimmerForwardTests.model()
-        try loadWeights(modelDirectory: directory, model: full, quantization: quantization)
-        let textOnly = try MuseGlimmerForwardTests.model()
+    private static func load(
+        _ directory: URL, excluding excluded: Set<ModelComponent> = [],
+        _ loading: ComponentLoading
+    ) throws -> MuseGlimmer {
+        let model = try MuseGlimmerForwardTests.model()
         try loadWeights(
-            modelDirectory: directory, model: textOnly, quantization: quantization,
-            excludedComponents: [.vision])
+            modelDirectory: directory, model: model, quantization: quantization,
+            excludedComponents: excluded, componentLoading: loading)
+        return model
+    }
+
+    @Test(
+        "vision loads on the first image and matches a full load", arguments: [false, true])
+    func visionLoadsOnFirstImage(transformersLayout: Bool) throws {
+        let directory = try Self.writeCheckpoint(transformersLayout: transformersLayout)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let full = try Self.load(directory, .immediate)
+        let onDemand = try Self.load(directory, .onFirstUse)
+        let excluded = try Self.load(directory, excluding: [.vision], .onFirstUse)
 
         let names = Set(full.parameters().flattened().map(\.0))
+        let textNames = names.filter { !$0.hasPrefix("vision_") }
         #expect(names.contains("vision_projection.scales"))
+        #expect(Set(onDemand.parameters().flattened().map(\.0)) == textNames)
+
+        let textLogits = try Self.logits(full, Self.textInput())
+        #expect(arrayEqual(try Self.logits(onDemand, Self.textInput()), textLogits).item(Bool.self))
+        #expect(arrayEqual(try Self.logits(excluded, Self.textInput()), textLogits).item(Bool.self))
+
+        let imageLogits = try Self.logits(full, Self.imageInput())
         #expect(
-            Set(textOnly.parameters().flattened().map(\.0))
-                == names.filter { !$0.hasPrefix("vision_") })
-        let textLogits = try Self.logits(textOnly, Self.textInput())
-        #expect(arrayEqual(textLogits, try Self.logits(full, Self.textInput())).item(Bool.self))
-        _ = try Self.logits(full, Self.imageInput())
-        #expect(throws: VLMError.self) { _ = try Self.logits(textOnly, Self.imageInput()) }
+            arrayEqual(try Self.logits(onDemand, Self.imageInput()), imageLogits).item(Bool.self))
+        #expect(Set(onDemand.parameters().flattened().map(\.0)) == textNames)
+        #expect(throws: OnDemandComponentError.self) {
+            _ = try Self.logits(excluded, Self.imageInput())
+        }
+    }
+
+    /// Apps load with a plain configuration and still get images.
+    @Test("the model factory defers vision without any configuration")
+    func factoryDefersVision() async throws {
+        let directory = try Self.writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var config =
+            try JSONSerialization.jsonObject(
+                with: Data(MuseGlimmerForwardTests.tinyJSON.utf8)) as! [String: Any]
+        config["quantization"] = ["group_size": 32, "bits": 4]
+        try JSONSerialization.data(withJSONObject: config).write(
+            to: directory.appendingPathComponent("config.json"))
+        try Data(#"{"processor_class": "MuseGlimmerProcessor"}"#.utf8).write(
+            to: directory.appendingPathComponent("preprocessor_config.json"))
+
+        let context = try await VLMModelFactory.shared.load(
+            from: directory, using: MuseGlimmerStubTokenizerLoader())
+        let model = try #require(context.model as? MuseGlimmer)
+
+        #expect(!model.parameters().flattened().contains { $0.0.hasPrefix("vision_") })
+        let full = try Self.load(directory, .immediate)
+        #expect(
+            arrayEqual(
+                try Self.logits(model, Self.imageInput()), try Self.logits(full, Self.imageInput())
+            ).item(Bool.self))
+    }
+}
+
+private struct MuseGlimmerStubTokenizerLoader: TokenizerLoader {
+    func load(from directory: URL) async throws -> any Tokenizer {
+        MuseGlimmerStubTokenizer()
     }
 }
 
