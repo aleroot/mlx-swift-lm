@@ -79,6 +79,26 @@ use scales; `mtp.*` uses offsets unless its own file declares `format=mlx` or th
 caller sets `preconvertedNorms`. Metadata from a target shard does not classify
 a separate MTP shard. Conflicting norm declarations fail before model update.
 
+## Loading Without A Component
+
+``ModelConfiguration/excludedComponents`` loads a model without parts it can do
+without, such as ``ModelComponent/vision`` for text-only use. A model opts in
+through ``ExcludableComponentsProviding``. For each component, it lists
+``CheckpointComponent`` values whose destination is an optional module and whose
+namespaces cover every serialized name of that module. The loader sets those
+modules to `nil` before it reads the checkpoint, and it does not read their
+tensors. Models that do not opt in load every component.
+
+All of this happens inside ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:)-9v5eb``.
+After loading, the model does not change. To use an excluded component, load the
+model again. An input that needs a missing component fails with an error.
+
+``BaseLanguageModel/excludedCheckpointNamespaces`` is the same read filter for
+namespaces that a model never loads. An embedded Qwen MTP drafter excludes the
+target namespaces that its component selection drops, so it reads only its own
+tensors from a shared checkpoint. A file whose tensors are all excluded still
+supplies its metadata.
+
 ## Finding The Source Of Truth
 
 The model factories and registries are the authoritative compatibility list.

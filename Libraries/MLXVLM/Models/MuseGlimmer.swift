@@ -1101,9 +1101,9 @@ private class MuseGlimmerVisionAdapter: Module, UnaryLayer {
 
 public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") private var languageModel: MuseGlimmerLanguageModel
-    @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel
-    @ModuleInfo(key: "vision_adapter") private var visionAdapter: MuseGlimmerVisionAdapter
-    @ModuleInfo(key: "vision_projection") private var visionProjection: Linear
+    @ModuleInfo(key: "vision_tower") private var visionTower: MuseGlimmerVisionModel?
+    @ModuleInfo(key: "vision_adapter") private var visionAdapter: MuseGlimmerVisionAdapter?
+    @ModuleInfo(key: "vision_projection") private var visionProjection: Linear?
 
     /// Parameterless, so it carries no checkpoint weights.
     @ModuleInfo(key: "perception_emb_norm") private var perceptionEmbNorm: MuseRMSNormNoScale
@@ -1135,7 +1135,11 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         try languageModel.newCache(parameters: parameters)
     }
 
-    private func encodeImage(_ pixelValues: MLXArray, grid: [THW]) -> MLXArray {
+    private func encodeImage(_ pixelValues: MLXArray, grid: [THW]) throws -> MLXArray {
+        guard let visionTower, let visionAdapter, let visionProjection else {
+            throw VLMError.processing(
+                "Vision inputs were provided, but the model was loaded without vision.")
+        }
         let dtype = visionTower.patchEmbedder.patchEmbedding.weight.dtype
         var features = visionTower(pixelValues.asType(dtype), grid: grid)
         features = visionAdapter(features)
@@ -1163,7 +1167,7 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
 
         // Image features are already normalized by `perception_emb_norm`; they
         // deliberately do not go through `embed_norm`.
-        let imageFeatures = encodeImage(pixelValues, grid: grid).asType(embeddings.dtype)
+        let imageFeatures = try encodeImage(pixelValues, grid: grid).asType(embeddings.dtype)
 
         let imageTokenId = config.imageTokenId
         let videoTokenId = config.videoTokenId
@@ -1251,6 +1255,19 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
 extension MuseGlimmer: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+extension MuseGlimmer: ExcludableComponentsProviding {
+    // The bf16 vision stack is ~3.7 GB. With it, the 4-bit model exceeds the wired limit of a
+    // 24 GB Mac.
+    public var excludableComponents: [ModelComponent: [CheckpointComponent]] {
+        let modules = ["vision_tower", "vision_adapter", "vision_projection"]
+        return [
+            .vision: modules.map {
+                CheckpointComponent(name: $0, namespaces: [$0, "model.\($0)"], destination: $0)
+            }
+        ]
     }
 }
 

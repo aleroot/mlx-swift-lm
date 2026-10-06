@@ -161,19 +161,26 @@ func loadWeightArrays(urls: [URL]) throws -> (
     return (checkpoint.weights, checkpoint.metadata)
 }
 
-func loadModelCheckpoint(urls: [URL]) throws -> ModelCheckpoint {
+/// Tensors under `excludedNamespaces` are never read. A file that holds only excluded tensors
+/// still supplies its metadata.
+func loadModelCheckpoint(urls: [URL], excludedNamespaces: [String] = []) throws
+    -> ModelCheckpoint
+{
     struct WorkItem {
         let file: Int
         let url: URL
-        /// tensors this item evaluates; nil evaluates the whole file
+        /// tensors this item evaluates; nil evaluates every tensor in the file that is read
         let names: [String]?
     }
+
+    let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
+    let isRead: @Sendable (String) -> Bool = { exclusions.mapName($0) != nil }
 
     let items: [WorkItem] = {
         var spansPerFile = [[SafetensorSpan]?]()
         var totalBytes: Int64 = 0
         for url in urls {
-            let spans = try? safetensorSpansInFileOrder(url: url)
+            let spans = (try? safetensorSpansInFileOrder(url: url))?.filter { isRead($0.name) }
             spansPerFile.append(spans)
             totalBytes += spans?.reduce(0) { $0 + $1.byteCount } ?? 0
         }
@@ -192,7 +199,9 @@ func loadModelCheckpoint(urls: [URL]) throws -> ModelCheckpoint {
                         WorkItem(file: file, url: url, names: spans[range].map(\.name)))
                 }
             } else {
-                items.append(WorkItem(file: file, url: url, names: nil))
+                // An empty list reads only the metadata of a file with nothing to read.
+                let names: [String]? = spansPerFile[file] == nil ? nil : []
+                items.append(WorkItem(file: file, url: url, names: names))
             }
         }
         return items
@@ -213,7 +222,7 @@ func loadModelCheckpoint(urls: [URL]) throws -> ModelCheckpoint {
                     if let array = all[name] { selected[name] = array }
                 }
             } else {
-                selected = all
+                selected = all.filter { isRead($0.key) }
             }
 
             // force this range's I/O here, on this stream, in file-offset order
@@ -373,18 +382,27 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
 /// files it needs by conforming to ``AdditionalWeightFilesProviding``, and a caller can override
 /// the choice with ``ModelConfiguration/weightFileSelection``.
+///
+/// The model loads without the `excludedComponents` it supports, see
+/// ``ExcludableComponentsProviding``. Tensors of excluded components and of the model's
+/// ``BaseLanguageModel/excludedCheckpointNamespaces`` are not read.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = []
 ) throws {
+    let excludedNamespaces =
+        try removeExcludedComponents(excludedComponents, from: model)
+        + model.excludedCheckpointNamespaces
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    var checkpoint = try loadModelCheckpoint(urls: weightURLs)
+    var checkpoint = try loadModelCheckpoint(
+        urls: weightURLs, excludedNamespaces: excludedNamespaces)
     checkpoint.perLayerQuantization =
         perLayerQuantization
         ?? quantization.map { .init(quantization: $0, perLayerQuantization: [:]) }
@@ -412,7 +430,7 @@ public func loadWeights(
 }
 
 /// Async variant of
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7``.
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:)-9v5eb``.
 ///
 /// Loading blocks its thread on file I/O and fans out with `DispatchQueue.concurrentPerform`.
 /// Swift concurrency's cooperative threads must never block, so this overload runs the load
@@ -422,7 +440,8 @@ public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = []
 ) async throws {
     let model = SendableBox(model)
     try await withCheckedThrowingContinuation {
@@ -434,7 +453,8 @@ public func loadWeights(
                         modelDirectory: modelDirectory, model: model.consume(),
                         quantization: quantization,
                         perLayerQuantization: perLayerQuantization,
-                        weightFileSelection: weightFileSelection)
+                        weightFileSelection: weightFileSelection,
+                        excludedComponents: excludedComponents)
                 })
         }
     }

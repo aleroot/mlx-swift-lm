@@ -3,6 +3,7 @@
 import CoreImage
 import Foundation
 import MLX
+import MLXNN
 import Testing
 
 @testable import MLXLMCommon
@@ -1030,6 +1031,74 @@ struct MuseGlimmerTextOnlyPrepareTests {
         let input = try await processor.prepare(input: UserInput(prompt: "hello"))
         #expect(input.text.mask == nil)
         #expect(input.text.tokens.shape == [1, 4])
+    }
+}
+
+@Suite("MuseGlimmer without vision")
+struct MuseGlimmerWithoutVisionTests {
+
+    /// One image token over a 2x2 patch grid.
+    private static func imageInput() -> LMInput {
+        LMInput(
+            text: .init(tokens: MLXArray([1, 2, 7, 3, 4] as [Int32]).expandedDimensions(axis: 0)),
+            image: .init(
+                pixels: MLXArray.zeros([4, 2 * 3 * 14 * 14], dtype: .float32),
+                frames: [THW(1, 2, 2)]))
+    }
+
+    private static func textInput() -> LMInput {
+        LMInput(
+            text: .init(tokens: MLXArray([1, 2, 5, 3, 4] as [Int32]).expandedDimensions(axis: 0)))
+    }
+
+    private static func logits(_ model: MuseGlimmer, _ input: LMInput) throws -> MLXArray {
+        let result = try model.prepare(
+            input, cache: try model.newCache(parameters: nil), state: nil,
+            prefill: PrefillParameters())
+        guard case .logits(let output) = result else {
+            throw VLMError.processing("expected logits")
+        }
+        return output.logits
+    }
+
+    /// The checkpoint mirrors `Muse-Glimmer-30B-4bit`: the tower is bf16 while the adapter and
+    /// the projection are quantized. `transformers` exports scope the vision modules in `model.`.
+    @Test(
+        "loading without vision skips its weights and keeps text output", arguments: [false, true])
+    func loadsWithoutVision(transformersLayout: Bool) throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseGlimmerWithoutVision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let source = try MuseGlimmerForwardTests.model()
+        quantize(
+            model: source, groupSize: 32, bits: 4,
+            filter: { path, _ in path.hasPrefix("vision_adapter") || path == "vision_projection" })
+        var arrays = [String: MLXArray]()
+        for (key, value) in source.parameters().flattened() {
+            let scoped = transformersLayout && key.hasPrefix("vision_")
+            arrays[scoped ? "model.\(key)" : key] = value
+        }
+        try save(arrays: arrays, url: directory.appendingPathComponent("model.safetensors"))
+
+        let quantization = BaseConfiguration.Quantization(groupSize: 32, bits: 4)
+        let full = try MuseGlimmerForwardTests.model()
+        try loadWeights(modelDirectory: directory, model: full, quantization: quantization)
+        let textOnly = try MuseGlimmerForwardTests.model()
+        try loadWeights(
+            modelDirectory: directory, model: textOnly, quantization: quantization,
+            excludedComponents: [.vision])
+
+        let names = Set(full.parameters().flattened().map(\.0))
+        #expect(names.contains("vision_projection.scales"))
+        #expect(
+            Set(textOnly.parameters().flattened().map(\.0))
+                == names.filter { !$0.hasPrefix("vision_") })
+        let textLogits = try Self.logits(textOnly, Self.textInput())
+        #expect(arrayEqual(textLogits, try Self.logits(full, Self.textInput())).item(Bool.self))
+        _ = try Self.logits(full, Self.imageInput())
+        #expect(throws: VLMError.self) { _ = try Self.logits(textOnly, Self.imageInput()) }
     }
 }
 
