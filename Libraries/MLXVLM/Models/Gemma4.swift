@@ -1530,7 +1530,7 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
 
 // MARK: - Vision
 
-private final class Gemma4ClippableLinear: Module, UnaryLayer {
+final class Gemma4ClippableLinear: Module, UnaryLayer {
     let useClipping: Bool
 
     @ModuleInfo(key: "linear") var linear: Linear
@@ -1566,7 +1566,7 @@ private final class Gemma4ClippableLinear: Module, UnaryLayer {
     }
 }
 
-private final class Gemma4VisionRMSNorm: Module, UnaryLayer {
+final class Gemma4VisionRMSNorm: Module, UnaryLayer {
     let eps: Float
     @ModuleInfo var weight: MLXArray
 
@@ -1584,7 +1584,7 @@ private final class Gemma4VisionRMSNorm: Module, UnaryLayer {
     }
 }
 
-private final class Gemma4VisionRMSNormNoScale: Module, UnaryLayer {
+final class Gemma4VisionRMSNormNoScale: Module, UnaryLayer {
     let eps: Float
 
     init(eps: Float = 1e-6) {
@@ -1599,7 +1599,7 @@ private final class Gemma4VisionRMSNormNoScale: Module, UnaryLayer {
     }
 }
 
-private final class Gemma4VisionAttention: Module {
+final class Gemma4VisionAttention: Module {
     let numHeads: Int
     let numKVHeads: Int
     let headDim: Int
@@ -1689,7 +1689,7 @@ private final class Gemma4VisionAttention: Module {
     }
 }
 
-private final class Gemma4VisionMLP: Module, UnaryLayer {
+final class Gemma4VisionMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Gemma4ClippableLinear
     @ModuleInfo(key: "up_proj") var upProj: Gemma4ClippableLinear
     @ModuleInfo(key: "down_proj") var downProj: Gemma4ClippableLinear
@@ -1718,7 +1718,7 @@ private final class Gemma4VisionMLP: Module, UnaryLayer {
     }
 }
 
-private final class Gemma4VisionTransformerBlock: Module {
+final class Gemma4VisionTransformerBlock: Module {
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma4VisionAttention
     @ModuleInfo var mlp: Gemma4VisionMLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma4RMSNormZeroShift
@@ -1751,7 +1751,7 @@ private final class Gemma4VisionTransformerBlock: Module {
     }
 }
 
-private final class Gemma4VisionPatchEmbedder: Module {
+final class Gemma4VisionPatchEmbedder: Module {
     let patchSize: Int
     let hiddenSize: Int
     let positionEmbeddingSize: Int
@@ -1803,7 +1803,7 @@ private final class Gemma4VisionPatchEmbedder: Module {
     }
 }
 
-private final class Gemma4VisionPooler: Module {
+final class Gemma4VisionPooler: Module {
     let hiddenSize: Int
     let rootHiddenSize: Float
 
@@ -1847,7 +1847,7 @@ private final class Gemma4VisionPooler: Module {
     }
 }
 
-private final class Gemma4VisionTransformerModel: Module {
+final class Gemma4VisionTransformerModel: Module {
     @ModuleInfo(key: "layers") var layers: [Gemma4VisionTransformerBlock]
 
     init(config: Gemma4VisionConfiguration) {
@@ -1867,7 +1867,13 @@ private final class Gemma4VisionTransformerModel: Module {
     }
 }
 
-private final class Gemma4VisionModel: Module {
+/// The Gemma 4 vision tower: patch embedding, axial-RoPE encoder, and spatial pooling
+/// to `numPatches / poolingKernelSize^2` soft tokens per image.
+///
+/// Public so client modules can run the tower without a generation head — for example
+/// multimodal embedding models such as EmbeddingGemma 2, which embed images into the
+/// text space. Configure it with ``Gemma4VisionConfiguration``.
+public final class Gemma4VisionModel: Module {
     let config: Gemma4VisionConfiguration
     let patchSize: Int
     let poolingKernelSize: Int
@@ -1878,7 +1884,7 @@ private final class Gemma4VisionModel: Module {
     @ModuleInfo(key: "std_bias") var standardizationBias: MLXArray?
     @ModuleInfo(key: "std_scale") var standardizationScale: MLXArray?
 
-    init(config: Gemma4VisionConfiguration) {
+    public init(config: Gemma4VisionConfiguration) {
         self.config = config
         self.patchSize = config.patchSize
         self.poolingKernelSize = config.poolingKernelSize
@@ -1910,7 +1916,7 @@ private final class Gemma4VisionModel: Module {
     /// slice padded canvases down to each image's true size first), so
     /// attention is dense and the pooled output length falls out of the
     /// patch grid: numPatches / poolingKernelSize².
-    func callAsFunction(_ pixelValues: MLXArray) -> MLXArray {
+    public func callAsFunction(_ pixelValues: MLXArray) -> MLXArray {
         let pixels =
             if pixelValues.ndim == 3 {
                 expandedDimensions(pixelValues, axis: 0)
@@ -1937,18 +1943,21 @@ private final class Gemma4VisionModel: Module {
     }
 }
 
-private final class Gemma4MultimodalEmbedder: Module, UnaryLayer {
+/// Projects one modality encoder's soft tokens into the text model's embedding space
+/// (`embed_vision` / `embed_audio` in Gemma 4 checkpoints, `embed_vision` in
+/// EmbeddingGemma 2).
+public final class Gemma4MultimodalEmbedder: Module, UnaryLayer {
     @ModuleInfo(key: "embedding_projection") var embeddingProjection: Linear
     @ModuleInfo(key: "embedding_pre_projection_norm") var embeddingPreProjectionNorm:
         Gemma4RMSNormNoScale
 
-    init(embeddingDim: Int, textHiddenSize: Int, eps: Float) {
+    public init(embeddingDim: Int, textHiddenSize: Int, eps: Float) {
         self._embeddingProjection.wrappedValue = Linear(embeddingDim, textHiddenSize, bias: false)
         self._embeddingPreProjectionNorm.wrappedValue = Gemma4RMSNormNoScale(eps: eps)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
         embeddingProjection(embeddingPreProjectionNorm(x))
     }
 }
