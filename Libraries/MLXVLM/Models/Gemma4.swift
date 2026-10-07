@@ -551,6 +551,66 @@ public struct Gemma4VisionConfiguration: Codable, Sendable {
     }
 }
 
+/// Configuration of the Gemma 4 audio encoder (`model_type: gemma4_audio`).
+public struct Gemma4AudioConfiguration: Codable, Sendable {
+    public let hiddenSize: Int
+    public let hiddenLayers: Int
+    public let attentionHeads: Int
+    public let rmsNormEps: Float
+    public let outputProjectionDimensions: Int
+    public let subsamplingConvChannels: [Int]
+    public let convKernelSize: Int
+    public let attentionChunkSize: Int
+    public let attentionContextLeft: Int
+    public let attentionContextRight: Int
+    public let attentionLogitCap: Float
+    public let residualWeight: Float
+    public let gradientClipping: Float
+    public let useClippedLinears: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case hiddenSize = "hidden_size"
+        case hiddenLayers = "num_hidden_layers"
+        case attentionHeads = "num_attention_heads"
+        case rmsNormEps = "rms_norm_eps"
+        case outputProjectionDimensions = "output_proj_dims"
+        case subsamplingConvChannels = "subsampling_conv_channels"
+        case convKernelSize = "conv_kernel_size"
+        case attentionChunkSize = "attention_chunk_size"
+        case attentionContextLeft = "attention_context_left"
+        case attentionContextRight = "attention_context_right"
+        case attentionLogitCap = "attention_logit_cap"
+        case residualWeight = "residual_weight"
+        case gradientClipping = "gradient_clipping"
+        case useClippedLinears = "use_clipped_linears"
+    }
+
+    public init(from decoder: any Swift.Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        hiddenSize = try c.decodeIfPresent(Int.self, forKey: .hiddenSize) ?? 1024
+        hiddenLayers = try c.decodeIfPresent(Int.self, forKey: .hiddenLayers) ?? 12
+        attentionHeads = try c.decodeIfPresent(Int.self, forKey: .attentionHeads) ?? 8
+        rmsNormEps = try c.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1e-6
+        outputProjectionDimensions =
+            try c.decodeIfPresent(Int.self, forKey: .outputProjectionDimensions) ?? 1536
+        subsamplingConvChannels =
+            try c.decodeIfPresent([Int].self, forKey: .subsamplingConvChannels) ?? [128, 32]
+        convKernelSize = try c.decodeIfPresent(Int.self, forKey: .convKernelSize) ?? 5
+        attentionChunkSize = try c.decodeIfPresent(Int.self, forKey: .attentionChunkSize) ?? 12
+        attentionContextLeft =
+            try c.decodeIfPresent(Int.self, forKey: .attentionContextLeft) ?? 13
+        attentionContextRight =
+            try c.decodeIfPresent(Int.self, forKey: .attentionContextRight) ?? 0
+        attentionLogitCap =
+            try c.decodeIfPresent(Float.self, forKey: .attentionLogitCap) ?? 50
+        residualWeight = try c.decodeIfPresent(Float.self, forKey: .residualWeight) ?? 0.5
+        gradientClipping =
+            try c.decodeIfPresent(Float.self, forKey: .gradientClipping) ?? 1e10
+        useClippedLinears =
+            try c.decodeIfPresent(Bool.self, forKey: .useClippedLinears) ?? true
+    }
+}
+
 public struct Gemma4Configuration: Codable, Sendable {
     public let textConfiguration: Gemma4TextConfiguration
     public let visionConfiguration: Gemma4VisionConfiguration
@@ -1962,6 +2022,408 @@ public final class Gemma4MultimodalEmbedder: Module, UnaryLayer {
     }
 }
 
+// MARK: - Audio Encoder
+
+/// The Gemma 4 audio encoder, from the Universal Speech Model family: a
+/// conformer-style stack of feed-forward blocks, chunked local attention with
+/// a relative position bias, and causal light convolutions.
+///
+/// Inputs are unpadded log-mel spectrograms, `[T, featureSize]` or
+/// `[B, T, featureSize]`; the output is `[B, T', outputProjectionDimensions]`,
+/// where two stride-2 subsampling convolutions reduce `T` to about a quarter.
+public final class Gemma4AudioModel: Module {
+
+    public let config: Gemma4AudioConfiguration
+
+    @ModuleInfo(key: "subsample_conv_projection") private var subsampleConvProjection:
+        Gemma4AudioSubsampleConvProjection
+    @ModuleInfo(key: "layers") private var layers: [Gemma4AudioEncoderLayer]
+    @ModuleInfo(key: "output_proj") private var outputProjection: Linear
+
+    public init(config: Gemma4AudioConfiguration) {
+        self.config = config
+        self._subsampleConvProjection.wrappedValue = Gemma4AudioSubsampleConvProjection(config)
+        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { _ in
+            Gemma4AudioEncoderLayer(config)
+        }
+        self._outputProjection.wrappedValue = Linear(
+            config.hiddenSize, config.outputProjectionDimensions, bias: true)
+        super.init()
+    }
+
+    /// Encodes log-mel frames into soft tokens.
+    public func callAsFunction(_ inputFeatures: MLXArray) -> MLXArray {
+        let frames =
+            inputFeatures.ndim == 2
+            ? inputFeatures.expandedDimensions(axis: 0)
+            : inputFeatures
+        var hidden = subsampleConvProjection(frames)
+        // The reference keeps the sinusoids in the activation dtype.
+        let positions = Self.relativePositionalEmbeddings(config).asType(hidden.dtype)
+        let mask = Gemma4AudioAttention.visibleKeys(length: hidden.dim(1), config: config)
+        for layer in layers {
+            hidden = layer(hidden, positions: positions, mask: mask)
+        }
+        return outputProjection(hidden)
+    }
+
+    /// `[sin | cos]` rows for the relative distances `contextSize / 2` down
+    /// to `0`, as the reference `Gemma4AudioRelPositionalEncoding` builds them.
+    private static func relativePositionalEmbeddings(_ config: Gemma4AudioConfiguration)
+        -> MLXArray
+    {
+        let halfSize = config.hiddenSize / 2
+        let contextSize =
+            config.attentionChunkSize + config.attentionContextLeft - 1
+            + config.attentionContextRight
+        let logIncrement = log(10_000.0) / Double(max(halfSize - 1, 1))
+        let inverseTimescales = MLXArray(
+            (0 ..< halfSize).map { Float(exp(Double($0) * -logIncrement)) })
+        let distances = MLXArray(Array((0 ... contextSize / 2).reversed()))
+        let angles = distances.expandedDimensions(axis: -1) * inverseTimescales
+        return concatenated([sin(angles), cos(angles)], axis: -1)
+    }
+}
+
+/// Two stride-2 convolutions with channel norms that subsample the mel
+/// frames, followed by a linear projection into the encoder's hidden size.
+final class Gemma4AudioSubsampleConvProjection: Module {
+
+    @ModuleInfo(key: "layer0") private var layer0: Gemma4AudioSubsampleConvLayer
+    @ModuleInfo(key: "layer1") private var layer1: Gemma4AudioSubsampleConvLayer
+    @ModuleInfo(key: "input_proj_linear") private var inputProjection: Linear
+
+    init(_ config: Gemma4AudioConfiguration) {
+        let channels = config.subsamplingConvChannels
+        self._layer0.wrappedValue = Gemma4AudioSubsampleConvLayer(
+            inputChannels: 1, outputChannels: channels[0], config: config)
+        self._layer1.wrappedValue = Gemma4AudioSubsampleConvLayer(
+            inputChannels: channels[0], outputChannels: channels[1], config: config)
+        // The reference flattens [mel bins / 4, channels] after its
+        // channel-first permute; channels-last convolutions flatten to the
+        // same layout.
+        self._inputProjection.wrappedValue = Linear(
+            (channels[0] / 4) * channels[1], config.hiddenSize, bias: false)
+        super.init()
+    }
+
+    func callAsFunction(_ frames: MLXArray) -> MLXArray {
+        // One input channel, so the first convolution mixes time and
+        // frequency.
+        let hidden = layer1(layer0(frames.expandedDimensions(axis: -1)))
+        return inputProjection(hidden.reshaped(hidden.dim(0), hidden.dim(1), -1))
+    }
+}
+
+/// One stride-2 `3x3` convolution with a channel norm and ReLU.
+final class Gemma4AudioSubsampleConvLayer: Module {
+
+    @ModuleInfo(key: "conv") private var convolution: Conv2d
+    @ModuleInfo(key: "norm") private var norm: Gemma4AudioChannelNorm
+
+    init(inputChannels: Int, outputChannels: Int, config: Gemma4AudioConfiguration) {
+        self._convolution.wrappedValue = Conv2d(
+            inputChannels: inputChannels,
+            outputChannels: outputChannels,
+            kernelSize: 3,
+            stride: 2,
+            padding: 1,
+            bias: false)
+        self._norm.wrappedValue = Gemma4AudioChannelNorm(
+            dimensions: outputChannels, eps: config.rmsNormEps)
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        relu(norm(convolution(x.asType(convolution.weight.dtype))))
+    }
+}
+
+/// LayerNorm over the last axis with a scale and no bias.
+final class Gemma4AudioChannelNorm: Module {
+
+    @ModuleInfo var weight: MLXArray
+    private let eps: Float
+
+    init(dimensions: Int, eps: Float) {
+        self._weight.wrappedValue = MLXArray.ones([dimensions])
+        self.eps = eps
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        MLXFast.layerNorm(x, weight: weight, bias: nil, eps: eps)
+    }
+}
+
+/// Chunked local attention with a relative position bias and a logit soft cap.
+///
+/// Each chunk of queries reads a window of `contextSize` keys around it; the
+/// bias adds the sinusoidal distance terms after the reference's blocked
+/// relative shift, and ``visibleKeys(length:config:)`` limits each query to
+/// its sliding window inside the sequence.
+final class Gemma4AudioAttention: Module {
+
+    @ModuleInfo(key: "q_proj") private var queryProjection: Gemma4ClippableLinear
+    @ModuleInfo(key: "k_proj") private var keyProjection: Gemma4ClippableLinear
+    @ModuleInfo(key: "v_proj") private var valueProjection: Gemma4ClippableLinear
+    @ModuleInfo(key: "post") private var outputProjection: Gemma4ClippableLinear
+    @ModuleInfo(key: "relative_k_proj") private var relativeKeyProjection: Linear
+    @ModuleInfo(key: "per_dim_scale") private var perDimensionScale: MLXArray
+
+    private let heads: Int
+    private let headDim: Int
+    private let chunkSize: Int
+    private let contextSize: Int
+    private let pastHorizon: Int
+    private let futureHorizon: Int
+    private let queryScale: Float
+    private let keyScale: Float
+    private let softCap: Float
+
+    init(_ config: Gemma4AudioConfiguration) {
+        self.heads = config.attentionHeads
+        self.headDim = config.hiddenSize / config.attentionHeads
+        self.chunkSize = config.attentionChunkSize
+        self.pastHorizon = config.attentionContextLeft - 1
+        self.futureHorizon = config.attentionContextRight
+        self.contextSize = config.attentionChunkSize + pastHorizon + futureHorizon
+        // Query and key norms replace the 1/sqrt(headDim) scale.
+        self.queryScale = pow(Float(headDim), -0.5) / log(2)
+        self.keyScale = log(1 + exp(Float(1))) / log(2)
+        self.softCap = config.attentionLogitCap
+        self._queryProjection.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize, outFeatures: config.hiddenSize,
+            useClipping: config.useClippedLinears)
+        self._keyProjection.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize, outFeatures: config.hiddenSize,
+            useClipping: config.useClippedLinears)
+        self._valueProjection.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize, outFeatures: config.hiddenSize,
+            useClipping: config.useClippedLinears)
+        self._outputProjection.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize, outFeatures: config.hiddenSize,
+            useClipping: config.useClippedLinears)
+        self._relativeKeyProjection.wrappedValue = Linear(
+            config.hiddenSize, config.hiddenSize, bias: false)
+        self._perDimensionScale.wrappedValue = MLXArray.zeros([headDim])
+        super.init()
+    }
+
+    /// Keys each query can see, `[blocks, chunk, context]`: the reference's
+    /// sliding window, without the padding outside the sequence.
+    static func visibleKeys(length: Int, config: Gemma4AudioConfiguration) -> MLXArray {
+        let chunk = config.attentionChunkSize
+        let past = config.attentionContextLeft - 1
+        let future = config.attentionContextRight
+        let blocks = (length + chunk - 1) / chunk
+        let row = MLXArray(0 ..< chunk).reshaped(1, chunk, 1)
+        let column = MLXArray(0 ..< chunk + past + future).reshaped(1, 1, -1)
+        let key = MLXArray(0 ..< blocks).reshaped(blocks, 1, 1) * chunk - past + column
+        let distance = row + past - column
+        let window =
+            ((distance .>= 0) .&& (distance .< past))
+            .|| ((distance .< 0) .&& (distance .> -future))
+        return window .&& (key .>= 0) .&& (key .< length)
+    }
+
+    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let blockCount = (length + chunkSize - 1) / chunkSize
+
+        // Queries learn a per-dimension scale; values stay unscaled.
+        let scale = MLXArray(queryScale) * softplus(perDimensionScale.asType(.float32))
+        let queries = queryBlocks(
+            queryProjection(x).asType(.float32).reshaped(batch, length, heads, headDim) * scale,
+            padTo: blockCount * chunkSize)
+        let keys = contextBlocks(
+            keyProjection(x).asType(.float32).reshaped(batch, length, heads, headDim)
+                * MLXArray(keyScale),
+            blockCount: blockCount)
+        let values = contextBlocks(
+            valueProjection(x).asType(.float32).reshaped(batch, length, heads, headDim),
+            blockCount: blockCount)
+        let relativeKeys = relativeKeyProjection(positions)
+            .reshaped(-1, heads, headDim).transposed(1, 2, 0)
+
+        var scores = matmul(queries, keys.transposed(0, 1, 2, 4, 3))
+        scores =
+            scores
+            + relativeShift(
+                matmul(queries.reshaped(batch, heads, -1, headDim), relativeKeys)
+                    .reshaped(batch, heads, blockCount, chunkSize, -1))
+        scores = tanh(scores / MLXArray(softCap)) * MLXArray(softCap)
+        scores = MLX.where(mask, scores, MLXArray(Self.hiddenLogit))
+
+        let weighted = softmax(scores, axis: -1)
+        let attended = matmul(weighted, values)
+            .transposed(0, 2, 3, 1, 4)
+            .reshaped(batch, blockCount * chunkSize, -1)[0..., 0 ..< length, 0...]
+        return outputProjection(attended.asType(x.dtype))
+    }
+
+    /// Non-overlapping query blocks: `[B, H, blocks, chunk, D]`.
+    private func queryBlocks(_ x: MLXArray, padTo: Int) -> MLXArray {
+        MLX.padded(x, widths: [0, .init((0, padTo - x.dim(1))), 0, 0])
+            .reshaped(x.dim(0), -1, chunkSize, heads, headDim)
+            .transposed(0, 3, 1, 2, 4)
+    }
+
+    /// Overlapping key and value context windows, strided by the chunk size:
+    /// `[B, H, blocks, context, D]`.
+    private func contextBlocks(_ x: MLXArray, blockCount: Int) -> MLXArray {
+        let padded = MLX.padded(
+            x, widths: [0, .init((pastHorizon, futureHorizon + chunkSize - 1)), 0, 0])
+        let starts = MLXArray(Array(stride(from: 0, to: blockCount * chunkSize, by: chunkSize)))
+            .expandedDimensions(axis: -1)
+        let offsets = MLXArray(0 ..< contextSize)
+        let indices = (starts + offsets).flattened().asType(.int32)
+        return padded.take(indices, axis: 1)
+            .reshaped(x.dim(0), blockCount, contextSize, heads, headDim)
+            .transposed(0, 3, 1, 2, 4)
+    }
+
+    /// Relative position shift for blocked attention (reference `_rel_shift`).
+    private func relativeShift(_ x: MLXArray) -> MLXArray {
+        let (batch, headCount, blockCount, rows) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
+        let flattened = MLX.padded(
+            x, widths: [0, 0, 0, 0, .init((0, contextSize + 1 - x.dim(4)))]
+        ).reshaped(batch, headCount, blockCount, rows * (contextSize + 1))
+        return flattened[0..., 0..., 0..., 0 ..< rows * contextSize]
+            .reshaped(batch, headCount, blockCount, rows, contextSize)
+    }
+
+    /// `softplus` with PyTorch's overflow threshold.
+    private func softplus(_ x: MLXArray) -> MLXArray {
+        MLX.where(x .> 20, x, log(1 + exp(x)))
+    }
+
+    /// The reference's `attention_invalid_logits_value`.
+    private static let hiddenLogit: Float = -1e9
+}
+
+/// A gated feed-forward block whose output joins the residual at half weight.
+final class Gemma4AudioFeedForward: Module {
+
+    @ModuleInfo(key: "ffw_layer_1") private var expand: Gemma4ClippableLinear
+    @ModuleInfo(key: "ffw_layer_2") private var contract: Gemma4ClippableLinear
+    @ModuleInfo(key: "pre_layer_norm") private var preNorm: Gemma4VisionRMSNorm
+    @ModuleInfo(key: "post_layer_norm") private var postNorm: Gemma4VisionRMSNorm
+
+    private let clippingLimit: Float
+    private let residualWeight: Float
+
+    init(_ config: Gemma4AudioConfiguration) {
+        self._expand.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize, outFeatures: config.hiddenSize * 4,
+            useClipping: config.useClippedLinears)
+        self._contract.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize * 4, outFeatures: config.hiddenSize,
+            useClipping: config.useClippedLinears)
+        self._preNorm.wrappedValue = Gemma4VisionRMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._postNorm.wrappedValue = Gemma4VisionRMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.clippingLimit = config.gradientClipping
+        self.residualWeight = config.residualWeight
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var hidden = clip(x, min: -clippingLimit, max: clippingLimit)
+        hidden = preNorm(hidden)
+        hidden = contract(silu(expand(hidden)))
+        hidden = clip(hidden, min: -clippingLimit, max: clippingLimit)
+        return postNorm(hidden) * MLXArray(residualWeight) + x
+    }
+}
+
+/// A causal depthwise convolution between two gated linears.
+final class Gemma4AudioLightConv1d: Module {
+
+    @ModuleInfo(key: "linear_start") private var linearStart: Gemma4ClippableLinear
+    @ModuleInfo(key: "linear_end") private var linearEnd: Gemma4ClippableLinear
+    @ModuleInfo(key: "depthwise_conv1d") private var depthwiseConvolution: Conv1d
+    @ModuleInfo(key: "pre_layer_norm") private var preNorm: Gemma4VisionRMSNorm
+    @ModuleInfo(key: "conv_norm") private var convNorm: Gemma4VisionRMSNorm
+
+    private let clippingLimit: Float
+    private let leftPad: Int
+
+    init(_ config: Gemma4AudioConfiguration) {
+        self._linearStart.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize, outFeatures: config.hiddenSize * 2,
+            useClipping: config.useClippedLinears)
+        self._linearEnd.wrappedValue = Gemma4ClippableLinear(
+            inFeatures: config.hiddenSize, outFeatures: config.hiddenSize,
+            useClipping: config.useClippedLinears)
+        self._depthwiseConvolution.wrappedValue = Conv1d(
+            inputChannels: config.hiddenSize,
+            outputChannels: config.hiddenSize,
+            kernelSize: config.convKernelSize,
+            groups: config.hiddenSize,
+            bias: false)
+        self._preNorm.wrappedValue = Gemma4VisionRMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._convNorm.wrappedValue = Gemma4VisionRMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.clippingLimit = config.gradientClipping
+        self.leftPad = config.convKernelSize - 1
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var hidden = linearStart(preNorm(x))
+        let half = hidden.dim(2) / 2
+        let gated = hidden[0..., 0..., 0 ..< half] * sigmoid(hidden[0..., 0..., half...])
+        hidden = depthwiseConvolution(MLX.padded(gated, widths: [0, .init((leftPad, 0)), 0]))
+        hidden = clip(hidden, min: -clippingLimit, max: clippingLimit)
+        return linearEnd(silu(convNorm(hidden))) + x
+    }
+}
+
+/// One conformer block: two feed-forward sub-blocks around attention and a
+/// light convolution, closing on the output norm.
+final class Gemma4AudioEncoderLayer: Module {
+
+    @ModuleInfo(key: "feed_forward1") private var feedForward1: Gemma4AudioFeedForward
+    @ModuleInfo(key: "feed_forward2") private var feedForward2: Gemma4AudioFeedForward
+    @ModuleInfo(key: "self_attn") private var selfAttention: Gemma4AudioAttention
+    @ModuleInfo(key: "lconv1d") private var lightConvolution: Gemma4AudioLightConv1d
+    @ModuleInfo(key: "norm_pre_attn") private var preAttentionNorm: Gemma4VisionRMSNorm
+    @ModuleInfo(key: "norm_post_attn") private var postAttentionNorm: Gemma4VisionRMSNorm
+    @ModuleInfo(key: "norm_out") private var outputNorm: Gemma4VisionRMSNorm
+
+    private let clippingLimit: Float
+
+    init(_ config: Gemma4AudioConfiguration) {
+        self._feedForward1.wrappedValue = Gemma4AudioFeedForward(config)
+        self._feedForward2.wrappedValue = Gemma4AudioFeedForward(config)
+        self._selfAttention.wrappedValue = Gemma4AudioAttention(config)
+        self._lightConvolution.wrappedValue = Gemma4AudioLightConv1d(config)
+        self._preAttentionNorm.wrappedValue = Gemma4VisionRMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._postAttentionNorm.wrappedValue = Gemma4VisionRMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._outputNorm.wrappedValue = Gemma4VisionRMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.clippingLimit = config.gradientClipping
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray) -> MLXArray {
+        var hidden = feedForward1(x)
+        let residual = hidden
+        hidden = clip(hidden, min: -clippingLimit, max: clippingLimit)
+        hidden = selfAttention(preAttentionNorm(hidden), positions: positions, mask: mask)
+        hidden = clip(hidden, min: -clippingLimit, max: clippingLimit)
+        hidden = postAttentionNorm(hidden) + residual
+        hidden = lightConvolution(hidden)
+        hidden = feedForward2(hidden)
+        return outputNorm(clip(hidden, min: -clippingLimit, max: clippingLimit))
+    }
+}
+
 // MARK: - Model
 
 public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
@@ -3000,7 +3462,11 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     ///
     /// Note the config's `size` entry is deliberately ignored, as in the
     /// Python reference — models ship a vestigial 224x224 there.
-    public func aspectPreservingTargetSize(for imageSize: CGSize) -> CGSize {
+    ///
+    /// - Parameter budget: Soft tokens to fit, such as a video frame's smaller
+    ///   budget; defaults to `maxSoftTokens`.
+    public func aspectPreservingTargetSize(for imageSize: CGSize, budget: Int? = nil) -> CGSize {
+        let maxSoftTokens = budget ?? self.maxSoftTokens
         let kernelArea = poolingKernelSize * poolingKernelSize
         let maxPatches = maxSoftTokens * kernelArea
         let sideMultiple = poolingKernelSize * patchSize

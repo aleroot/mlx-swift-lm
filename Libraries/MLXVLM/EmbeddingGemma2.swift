@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import AVFoundation
 import CoreImage
 import Foundation
 import MLX
@@ -11,7 +12,7 @@ import MLXNN
 /// Configuration of `google/embeddinggemma-2` (`model_type: embedding_gemma2`).
 ///
 /// Decodes the checkpoint's `config.json` directly, including the nested `text_config`
-/// and the optional `vision_config`. The audio encoder is never loaded.
+/// and the optional `vision_config` and `audio_config`.
 public struct EmbeddingGemma2Configuration: Codable, Sendable {
 
     /// Context window from the model card. `max_position_embeddings` is the RoPE table
@@ -26,12 +27,22 @@ public struct EmbeddingGemma2Configuration: Codable, Sendable {
         public let isGlobal: Bool
     }
 
-    /// The vision encoder layout and the tokens that mark images in a sequence.
+    /// The vision encoder layout and the tokens that mark images and video frames in a
+    /// sequence. Video frames share the image begin and end markers.
     public struct Vision: Sendable {
         public let encoder: Gemma4VisionConfiguration
         public let imageTokenID: Int
+        public let videoTokenID: Int?
         public let beginImageTokenID: Int
         public let endImageTokenID: Int
+    }
+
+    /// The audio encoder layout and the tokens that mark audio in a sequence.
+    public struct Audio: Sendable {
+        public let encoder: Gemma4AudioConfiguration
+        public let audioTokenID: Int
+        public let beginAudioTokenID: Int
+        public let endAudioTokenID: Int
     }
 
     public let hiddenSize: Int
@@ -49,6 +60,12 @@ public struct EmbeddingGemma2Configuration: Codable, Sendable {
     public let layerTypes: [String]
     public let attention: [Attention]
     public private(set) var vision: Vision?
+    public private(set) var audio: Audio?
+
+    /// The image, video and audio placeholders that soft tokens replace.
+    public var softTokenIDs: [Int] {
+        [vision?.imageTokenID, vision?.videoTokenID, audio?.audioTokenID].compactMap { $0 }
+    }
 
     private struct LayerOverride: Codable {
         let headDim: Int?
@@ -108,9 +125,15 @@ public struct EmbeddingGemma2Configuration: Codable, Sendable {
     private enum RootKeys: String, CodingKey {
         case textConfig = "text_config"
         case visionConfig = "vision_config"
+        case audioConfig = "audio_config"
         case imageTokenId = "image_token_id"
+        case videoTokenId = "video_token_id"
         case boiTokenId = "boi_token_id"
         case eoiTokenId = "eoi_token_id"
+        case audioTokenId = "audio_token_id"
+        case boaTokenId = "boa_token_id"
+        case eoaTokenId = "eoa_token_id"
+        case eoaTokenIndex = "eoa_token_index"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -181,8 +204,21 @@ public struct EmbeddingGemma2Configuration: Codable, Sendable {
             let end = try root.decodeIfPresent(Int.self, forKey: .eoiTokenId)
         {
             vision = Vision(
-                encoder: encoder, imageTokenID: image, beginImageTokenID: begin,
-                endImageTokenID: end)
+                encoder: encoder, imageTokenID: image,
+                videoTokenID: try root.decodeIfPresent(Int.self, forKey: .videoTokenId),
+                beginImageTokenID: begin, endImageTokenID: end)
+        }
+        // `embedding_gemma2` checkpoints name the end marker `eoa_token_index`.
+        if let encoder = try root.decodeIfPresent(
+            Gemma4AudioConfiguration.self, forKey: .audioConfig),
+            let token = try root.decodeIfPresent(Int.self, forKey: .audioTokenId),
+            let begin = try root.decodeIfPresent(Int.self, forKey: .boaTokenId),
+            let end = try root.decodeIfPresent(Int.self, forKey: .eoaTokenId)
+                ?? root.decodeIfPresent(Int.self, forKey: .eoaTokenIndex)
+        {
+            audio = Audio(
+                encoder: encoder, audioTokenID: token, beginAudioTokenID: begin,
+                endAudioTokenID: end)
         }
     }
 
@@ -221,7 +257,7 @@ public struct EmbeddingGemma2Configuration: Codable, Sendable {
 // MARK: - Model
 
 /// EmbeddingGemma 2: a bidirectional text encoder with per-layer embeddings that maps
-/// text and image soft tokens into one normalized
+/// text and the soft tokens of images, video frames and audio into one normalized
 /// ``EmbeddingGemma2Configuration/embeddingDim`` space. Load checkpoints with
 /// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)``.
 public final class EmbeddingGemma2: Module, BaseLanguageModel {
@@ -231,6 +267,10 @@ public final class EmbeddingGemma2: Module, BaseLanguageModel {
     @ModuleInfo(key: "language_model") private var languageModel: EmbeddingGemma2TextModel
     @ModuleInfo(key: "vision_tower") private var visionTower: Gemma4VisionModel?
     @ModuleInfo(key: "embed_vision") private var embedVision: Gemma4MultimodalEmbedder?
+    @ModuleInfo(key: "audio_tower") private var audioTower: Gemma4AudioModel?
+    @ModuleInfo(key: "embed_audio") private var embedAudio: Gemma4MultimodalEmbedder?
+
+    private let softTokenIDs: [Int32]
 
     public init(_ config: EmbeddingGemma2Configuration) {
         self.config = config
@@ -241,40 +281,40 @@ public final class EmbeddingGemma2: Module, BaseLanguageModel {
                 embeddingDim: vision.encoder.hiddenSize, textHiddenSize: config.hiddenSize,
                 eps: vision.encoder.rmsNormEps)
         }
+        if let audio = config.audio {
+            self._audioTower.wrappedValue = Gemma4AudioModel(config: audio.encoder)
+            self._embedAudio.wrappedValue = Gemma4MultimodalEmbedder(
+                embeddingDim: audio.encoder.outputProjectionDimensions,
+                textHiddenSize: config.hiddenSize, eps: audio.encoder.rmsNormEps)
+        }
+        self.softTokenIDs = config.softTokenIDs.map(Int32.init)
         super.init()
     }
 
-    /// - Returns: `[soft tokens, hidden]` features that fill one image's placeholder tokens.
-    ///   The vision tower batches only images of one size.
+    /// - Parameter pixels: `[B, 3, H, W]` images or video frames of one size.
+    /// - Returns: `[B, soft tokens, hidden]` features that fill their placeholder tokens,
+    ///   or `nil` when this checkpoint has no vision encoder.
     public func imageFeatures(_ pixels: MLXArray) -> MLXArray? {
         guard let visionTower, let embedVision else { return nil }
         return embedVision(visionTower(pixels))
     }
 
-    /// Features of several images that may differ in size, in input order.
-    ///
-    /// - Returns: `[1, total soft tokens, hidden]`, or `nil` when this checkpoint has no
-    ///   vision encoder.
-    public func imageFeatures(_ pixels: [MLXArray]) -> MLXArray? {
-        guard !pixels.isEmpty, visionTower != nil else { return nil }
-        var rows: [MLXArray] = []
-        rows.reserveCapacity(pixels.count)
-        for item in pixels {
-            guard let features = imageFeatures(item) else { return nil }
-            rows.append(features.reshaped(-1, features.dim(-1)))
-        }
-        return concatenated(rows, axis: 0).expandedDimensions(axis: 0)
+    /// - Parameter features: `[frames, featureSize]` log-mel features of one audio.
+    /// - Returns: `[1, soft tokens, hidden]` features that fill its placeholder tokens, or
+    ///   `nil` when this checkpoint has no audio encoder.
+    public func audioFeatures(_ features: MLXArray) -> MLXArray? {
+        guard let audioTower, let embedAudio else { return nil }
+        return embedAudio(audioTower(features))
     }
 
     /// - Parameters:
-    ///   - inputIds: `[B, L]` tokens. Image placeholders read the padding embedding until
-    ///     `imageFeatures` replaces them.
+    ///   - inputIds: `[B, L]` tokens.
     ///   - attentionMask: `[B, L]`, `1` for real tokens. Attention and pooling ignore padding.
-    ///   - imageFeatures: Features of every image in `inputIds` order, `[1, soft tokens,
-    ///     hidden]` or `[soft tokens, hidden]`; single row only.
+    ///   - softTokens: `[soft tokens, hidden]` features of every image, video and audio
+    ///     placeholder in `inputIds`, in sequence order; single row only.
     /// - Returns: `[B, embeddingDim]` unit-length float32 embeddings.
     public func embed(
-        inputIds: MLXArray, attentionMask: MLXArray?, imageFeatures: MLXArray? = nil
+        inputIds: MLXArray, attentionMask: MLXArray?, softTokens: MLXArray? = nil
     ) -> MLXArray {
         precondition(inputIds.ndim == 2 && inputIds.dim(1) > 0)
         if let attentionMask {
@@ -285,14 +325,15 @@ public final class EmbeddingGemma2: Module, BaseLanguageModel {
         if hidden.dtype == .float16 { hidden = hidden.asType(.float32) }
         // Matches the reference: sqrt(hidden) is rounded to the weight dtype (22.625 in bf16).
         hidden = hidden * MLXArray(Float(config.hiddenSize).squareRoot()).asType(hidden.dtype)
-        if let imageFeatures, let vision = config.vision {
+        if let softTokens, let first = softTokenIDs.first {
             precondition(inputIds.dim(0) == 1)
-            let isImage = inputIds .== Int32(vision.imageTokenID)
-            let index = maximum(cumsum(isImage.asType(.int32), axis: 1) - 1, 0)
-            // The tower batches: [1, soft tokens, hidden] becomes [soft tokens, hidden].
-            let features = imageFeatures.asType(hidden.dtype).reshaped(-1, hidden.dim(-1))
+            let isSoftToken = softTokenIDs.dropFirst().reduce(inputIds .== first) {
+                $0 .|| (inputIds .== $1)
+            }
+            let index = maximum(cumsum(isSoftToken.asType(.int32), axis: 1) - 1, 0)
+            let rows = softTokens.asType(hidden.dtype).reshaped(-1, hidden.dim(-1))
                 .take(index.squeezed(axis: 0), axis: 0).expandedDimensions(axis: 0)
-            hidden = MLX.where(isImage.expandedDimensions(axis: -1), features, hidden)
+            hidden = MLX.where(isSoftToken.expandedDimensions(axis: -1), rows, hidden)
         }
         hidden = languageModel(hidden, attentionMask: attentionMask)
 
@@ -305,17 +346,21 @@ public final class EmbeddingGemma2: Module, BaseLanguageModel {
         return vector / norm
     }
 
-    /// Keeps the text model and, when this checkpoint has one, the vision encoder. Drops
-    /// the audio encoder, which the library does not run.
+    /// Keeps the text model and the encoders this configuration loads. PyTorch checkpoints
+    /// store convolution kernels channels-first; they move to the channels-last layout
+    /// of MLX.
     public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        var prefixes = ["language_model."]
+        if visionTower != nil { prefixes += ["vision_tower.", "embed_vision."] }
+        if audioTower != nil { prefixes += ["audio_tower.", "embed_audio."] }
+        let shapes = Dictionary(
+            uniqueKeysWithValues: parameters().flattened().map { ($0.0, $0.1.shape) })
         var clean: [String: MLXArray] = [:]
-        for (key, value) in weights {
-            if key.hasPrefix("language_model.") {
-                clean[key] = value
-            } else if visionTower != nil,
-                key.hasPrefix("vision_tower.")
-                    || key.hasPrefix("embed_vision.")
-            {
+        for (key, value) in weights where prefixes.contains(where: key.hasPrefix) {
+            if let shape = shapes[key], value.ndim > 2, value.shape != shape {
+                let channelsLast = value.movedAxis(source: 1, destination: -1)
+                clean[key] = channelsLast.shape == shape ? channelsLast : value
+            } else {
                 clean[key] = value
             }
         }
@@ -605,20 +650,29 @@ public struct EmbeddingGemma2ImageProcessor: Sendable {
     /// - Returns: `[1, 3, H, W]` pixels in `0...1` resized to the soft-token budget,
     ///   and their soft-token count.
     public func pixels(for image: UserInput.Image) throws -> (pixels: MLXArray, tokens: Int) {
-        let oriented = try image.asCIImage().settingProperties([
-            CIImageOption.applyOrientationProperty: true
-        ])
+        let image = try Self.prepared(image.asCIImage())
+        let target = configuration.aspectPreservingTargetSize(for: image.extent.size)
+        let (height, width) = (Int(target.height), Int(target.width))
+        return (
+            Self.pixels(image, height: height, width: width),
+            configuration.softTokenCount(height: height, width: width)
+        )
+    }
+
+    /// The oriented image on the sRGB tone curve, as the reference reads it.
+    static func prepared(_ image: CIImage) throws -> CIImage {
+        let oriented = image.settingProperties([CIImageOption.applyOrientationProperty: true])
         guard !oriented.extent.isEmpty, !oriented.extent.isInfinite else {
             throw EmbeddingGemma2Embedding.Error.invalidMedia
         }
-        let srgb = MediaProcessing.inSRGBToneCurveSpace(oriented)
-        let target = configuration.aspectPreservingTargetSize(for: srgb.extent.size)
-        let (height, width) = (Int(target.height), Int(target.width))
-        var pixels = MediaProcessing.asMLXArray(srgb)
-        if pixels.dim(2) != height || pixels.dim(3) != width {
-            pixels = Self.resized(pixels, height: height, width: width)
-        }
-        return (pixels, configuration.softTokenCount(height: height, width: width))
+        return MediaProcessing.inSRGBToneCurveSpace(oriented)
+    }
+
+    /// `[1, 3, height, width]` pixels in `0...1`.
+    static func pixels(_ image: CIImage, height: Int, width: Int) -> MLXArray {
+        let pixels = MediaProcessing.asMLXArray(image)
+        guard pixels.dim(2) != height || pixels.dim(3) != width else { return pixels }
+        return resized(pixels, height: height, width: width)
     }
 
     /// Separable resize as two matrix products, rounded to 8 bits like the reference's
@@ -659,64 +713,389 @@ public struct EmbeddingGemma2ImageProcessor: Sendable {
     }
 }
 
+// MARK: - Video Preparation
+
+/// Prepares video as the reference `EmbeddingGemma2VideoProcessor` does: one frame per
+/// second, spread evenly over at most ``maximumFrames``, each resized like an image to the
+/// smaller frame budget. The audio track is not read.
+public struct EmbeddingGemma2VideoProcessor: Sendable {
+
+    /// Frames sampled per second of video.
+    public let framesPerSecond: Double
+    public let maximumFrames: Int
+    /// Soft tokens per frame.
+    public let budget: Int
+
+    private let images: EmbeddingGemma2ImageProcessor
+
+    private struct Configuration: Decodable {
+        struct VideoProcessor: Decodable {
+            let fps: Double
+            let maxFrames: Int
+            let maxSoftTokens: Int
+            let overflowStrategy: String
+            let addTimestamps: Bool
+        }
+        let videoProcessor: VideoProcessor
+    }
+
+    /// Reads `video_processor` from `processor_config.json`. Throws unless frames spread
+    /// evenly and carry no timestamps, the only layout the library builds.
+    public init(directory: URL) throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let video = try decoder.decode(
+            Configuration.self,
+            from: try Data(contentsOf: directory.appendingPathComponent("processor_config.json"))
+        ).videoProcessor
+        guard video.overflowStrategy == "uniform", !video.addTimestamps, video.fps > 0,
+            video.maxFrames > 0
+        else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: [], debugDescription: "Unsupported video sampling."))
+        }
+        self.framesPerSecond = video.fps
+        self.maximumFrames = video.maxFrames
+        self.budget = video.maxSoftTokens
+        self.images = try EmbeddingGemma2ImageProcessor(directory: directory)
+    }
+
+    /// - Returns: `[frames, 3, H, W]` pixels in `0...1`, every frame at the size of the first.
+    public nonisolated(nonsending) func frames(for video: UserInput.Video) async throws
+        -> MLXArray
+    {
+        let frames = try await sampledFrames(video).map(EmbeddingGemma2ImageProcessor.prepared)
+        guard let first = frames.first else { throw EmbeddingGemma2Embedding.Error.invalidMedia }
+        let target = images.configuration.aspectPreservingTargetSize(
+            for: first.extent.size, budget: budget)
+        let (height, width) = (Int(target.height), Int(target.width))
+        return concatenated(
+            frames.map { EmbeddingGemma2ImageProcessor.pixels($0, height: height, width: width) },
+            axis: 0)
+    }
+
+    private nonisolated(nonsending) func sampledFrames(_ video: UserInput.Video) async throws
+        -> [CIImage]
+    {
+        switch video.source {
+        case .frames(let frames):
+            // Decoded frames carry no frame rate, so all of them count before the cap.
+            return try Self.sampledIndices(
+                frameCount: frames.count, frameRate: nil, framesPerSecond: framesPerSecond,
+                maximumFrames: maximumFrames
+            ).map { try frames[$0].image.asCIImage() }
+        case .url(let url):
+            return try await sampledFrames(AVURLAsset(url: url))
+        case .avAsset(let asset):
+            return try await sampledFrames(asset)
+        }
+    }
+
+    private nonisolated(nonsending) func sampledFrames(_ asset: AVAsset) async throws -> [CIImage] {
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw EmbeddingGemma2Embedding.Error.invalidMedia
+        }
+        let (range, nominalRate) = try await track.load(.timeRange, .nominalFrameRate)
+        let frameRate = Double(nominalRate)
+        guard frameRate > 0 else { throw EmbeddingGemma2Embedding.Error.invalidMedia }
+        let indices = Self.sampledIndices(
+            frameCount: Int((range.duration.seconds * frameRate).rounded()),
+            frameRate: frameRate, framesPerSecond: framesPerSecond, maximumFrames: maximumFrames)
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        // The middle of each frame's interval selects it without rounding to a neighbor.
+        let times = indices.map {
+            CMTime(
+                seconds: range.start.seconds + (Double($0) + 0.5) / frameRate,
+                preferredTimescale: 90_000)
+        }
+        var frames: [CIImage] = []
+        frames.reserveCapacity(times.count)
+        // Like the decoders of the reference, read the decoded RGB values as sRGB.
+        let options: [CIImageOption: Any] =
+            CGColorSpace(name: CGColorSpace.sRGB).map { [.colorSpace: $0] } ?? [:]
+        for await result in generator.images(for: times) {
+            if case .success(_, let image, _) = result {
+                frames.append(CIImage(cgImage: image, options: options))
+            }
+        }
+        return frames
+    }
+
+    /// Indices of the reference `sample_frames`: one frame every `frameRate /
+    /// framesPerSecond` frames, then `maximumFrames` spread evenly over them, as
+    /// `np.linspace` truncates. Without a frame rate every frame is a candidate.
+    static func sampledIndices(
+        frameCount: Int, frameRate: Double?, framesPerSecond: Double, maximumFrames: Int
+    ) -> [Int] {
+        var indices = Array(0 ..< frameCount)
+        if let frameRate, frameCount > 0 {
+            let step = frameRate / framesPerSecond
+            let count = max(1, Int(Double(frameCount) / frameRate * framesPerSecond))
+            indices = (0 ..< count).map { min(frameCount - 1, Int(Double($0) * step)) }
+        }
+        guard indices.count > maximumFrames else { return indices }
+        let step = Double(indices.count - 1) / Double(max(maximumFrames - 1, 1))
+        return (0 ..< maximumFrames).map { position in
+            position > 0 && position == maximumFrames - 1
+                ? indices[indices.count - 1] : indices[Int(Double(position) * step)]
+        }
+    }
+}
+
+// MARK: - Audio Preparation
+
+/// Log-mel features as the reference `Gemma4AudioFeatureExtractor` computes them: a
+/// semicausal short-time Fourier transform under a periodic Hann window, an HTK mel
+/// filter bank, and a log floor. Only frames of real samples are kept, so the audio tower
+/// runs without padding, and audio past ``maximumSampleCount`` is dropped.
+public struct EmbeddingGemma2AudioProcessor: Sendable {
+
+    /// The reference keeps the first 480,000 samples: 30 seconds at 16 kHz.
+    public static let maximumSampleCount = 480_000
+
+    /// Samples per second of the mono audio the features read.
+    public let sampleRate: Int
+    private let frameLength: Int
+    private let hopLength: Int
+    private let fftLength: Int
+    private let featureSize: Int
+    private let melFloor: Float
+    /// Periodic Hann window over one frame.
+    private let window: [Float]
+    /// `[fftLength / 2 + 1, featureSize]` triangular filters, row-major.
+    private let melFilters: [Float]
+
+    private struct Configuration: Decodable {
+        struct FeatureExtractor: Decodable {
+            let featureSize: Int
+            let samplingRate: Int
+            let frameLength: Int
+            let hopLength: Int
+            let fftLength: Int
+            let minFrequency: Double
+            let maxFrequency: Double
+            let melFloor: Float
+            let preemphasis: Double?
+            let inputScaleFactor: Double?
+            let perBinMean: [Double]?
+            let perBinStddev: [Double]?
+        }
+        let featureExtractor: FeatureExtractor
+    }
+
+    /// Reads `feature_extractor` from `processor_config.json`. Throws when it asks for
+    /// pre-emphasis, input scaling or per-bin normalization, which the checkpoint does not use.
+    public init(directory: URL) throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let extractor = try decoder.decode(
+            Configuration.self,
+            from: try Data(contentsOf: directory.appendingPathComponent("processor_config.json"))
+        ).featureExtractor
+        guard (extractor.preemphasis ?? 0) == 0, (extractor.inputScaleFactor ?? 1) == 1,
+            extractor.perBinMean == nil, extractor.perBinStddev == nil,
+            extractor.frameLength <= extractor.fftLength, extractor.hopLength > 0
+        else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: [], debugDescription: "Unsupported audio feature extractor."))
+        }
+        self.sampleRate = extractor.samplingRate
+        self.frameLength = extractor.frameLength
+        self.hopLength = extractor.hopLength
+        self.fftLength = extractor.fftLength
+        self.featureSize = extractor.featureSize
+        self.melFloor = extractor.melFloor
+        self.window = (0 ..< extractor.frameLength).map {
+            Float(0.5 - 0.5 * cos(2 * Double.pi * Double($0) / Double(extractor.frameLength)))
+        }
+        self.melFilters = Self.melFilters(
+            bins: extractor.fftLength / 2 + 1, mels: extractor.featureSize,
+            minFrequency: extractor.minFrequency, maxFrequency: extractor.maxFrequency,
+            sampleRate: extractor.samplingRate)
+    }
+
+    /// Decodes mono audio at ``sampleRate``; `.array` sources must already be.
+    ///
+    /// - Returns: `[frames, featureSize]` log-mel features. Audio shorter than one frame
+    ///   has none.
+    public nonisolated(nonsending) func features(for audio: UserInput.Audio) async throws
+        -> MLXArray
+    {
+        let samples: MLXArray
+        switch audio.source {
+        case .array(let array):
+            samples = array
+        case .url(let url):
+            var processing = UserInput.AudioProcessing()
+            processing.sampleRate = Double(sampleRate)
+            // A new value, not the caller's, crosses into the concurrent decoder.
+            samples = try await UserInput.Audio.url(url).asMLXArray(processing: processing)
+        }
+        guard samples.ndim == 1 else { throw EmbeddingGemma2Embedding.Error.invalidMedia }
+        return features(samples: samples)
+    }
+
+    /// `[frames, featureSize]` features of the frames that hold only real samples.
+    func features(samples: MLXArray) -> MLXArray {
+        let samples = samples[..<min(samples.dim(0), Self.maximumSampleCount)].asType(.float32)
+        // Semicausal padding centres the first frame on the first sample.
+        let padded = concatenated([MLXArray.zeros([frameLength / 2]), samples])
+        // Each reference frame spans one sample more than it transforms.
+        let span = frameLength + 1
+        guard padded.dim(0) >= span else { return MLXArray.zeros([0, featureSize]) }
+        let frames = asStrided(
+            padded, [(padded.dim(0) - span) / hopLength + 1, frameLength],
+            strides: [hopLength, 1])
+        let magnitudes = abs(MLXFFT.rfft(frames * MLXArray(window), n: fftLength, axis: -1))
+        let mel = matmul(magnitudes, MLXArray(melFilters, [fftLength / 2 + 1, featureSize]))
+        return log(mel + melFloor)
+    }
+
+    /// The reference `mel_filter_bank` with HTK mels and no normalization.
+    static func melFilters(
+        bins: Int, mels: Int, minFrequency: Double, maxFrequency: Double, sampleRate: Int
+    ) -> [Float] {
+        func mel(_ hertz: Double) -> Double { 2595 * log10(1 + hertz / 700) }
+        func hertz(_ mel: Double) -> Double { 700 * (pow(10, mel / 2595) - 1) }
+        let (low, high) = (mel(minFrequency), mel(maxFrequency))
+        let edges = (0 ... mels + 1).map {
+            hertz(low + Double($0) * (high - low) / Double(mels + 1))
+        }
+        let nyquist = Double(sampleRate / 2)
+        var filters = [Float](repeating: 0, count: bins * mels)
+        for bin in 0 ..< bins {
+            let frequency = nyquist * Double(bin) / Double(bins - 1)
+            for filter in 0 ..< mels {
+                let rising = (frequency - edges[filter]) / (edges[filter + 1] - edges[filter])
+                let falling =
+                    (edges[filter + 2] - frequency) / (edges[filter + 2] - edges[filter + 1])
+                filters[bin * mels + filter] = Float(max(0, min(rising, falling)))
+            }
+        }
+        return filters
+    }
+}
+
 // MARK: - Sequence Layout
 
-/// Builds the token sequence of one multimodal input, as the reference processor does.
+/// Builds the token sequence of one input, as the reference processor and chat template do.
 public enum EmbeddingGemma2Sequence {
 
-    /// - Parameters:
-    ///   - text: Tokens of the prepared text, starting with `<bos>` and without `<eos>`.
-    ///   - imageTokenCounts: Soft tokens of each image, in input order.
-    ///   - vision: The checkpoint's image token layout; required when images are present.
-    /// - Returns: `text`, then `<boi> <image>×n <eoi>` per image, then `eos`. Text is
-    ///   truncated to fit `limit`.
+    /// One run of an input: text tokens or the soft tokens of one media item.
+    public enum Segment: Equatable, Sendable {
+        case text([Int])
+        case image(tokens: Int)
+        case video(frames: Int, tokensPerFrame: Int)
+        case audio(tokens: Int)
+    }
+
+    /// - Returns: `<bos>`, the segments in order, then `<eos>`. An image and each video
+    ///   frame become `<boi> <placeholder>×n <eoi>`, an audio `<boa> <audio>×n <eoa>`.
+    ///   Text loses its last tokens to fit `limit`; media is never cut.
     public static func tokens(
-        text: [Int], imageTokenCounts: [Int], vision: EmbeddingGemma2Configuration.Vision?,
-        endOfSequence: Int, limit: Int
+        _ segments: [Segment], configuration: EmbeddingGemma2Configuration,
+        beginOfSequence: Int, endOfSequence: Int, limit: Int
     ) throws -> [Int] {
-        let imageLength = imageTokenCounts.reduce(0) { $0 + $1 + 2 }
-        let textLimit = limit - imageLength - 1
-        guard textLimit >= min(text.count, 1) else {
-            throw EmbeddingGemma2Embedding.Error.contextExceeded
-        }
-        var tokens = Array(text.prefix(textLimit))
-        if !imageTokenCounts.isEmpty {
-            guard let vision else { throw EmbeddingGemma2Embedding.Error.imagesUnsupported }
-            for count in imageTokenCounts {
-                tokens.append(vision.beginImageTokenID)
-                tokens.append(contentsOf: repeatElement(vision.imageTokenID, count: count))
-                tokens.append(vision.endImageTokenID)
+        let blocks = try segments.map { try block($0, configuration) }
+        var textBudget = limit - 2 - blocks.reduce(0) { $0 + ($1?.count ?? 0) }
+        guard textBudget >= 0 else { throw EmbeddingGemma2Embedding.Error.contextExceeded }
+        let placeholders = Set(configuration.softTokenIDs)
+        var tokens = [beginOfSequence]
+        for (segment, block) in zip(segments, blocks) {
+            if let block {
+                tokens += block
+            } else if case .text(let text) = segment {
+                // A placeholder in text would take the soft tokens of a media item.
+                if blocks.contains(where: { $0 != nil }),
+                    text.contains(where: placeholders.contains)
+                {
+                    throw EmbeddingGemma2Embedding.Error.placeholderInText
+                }
+                tokens += text.prefix(textBudget)
+                textBudget -= min(text.count, textBudget)
             }
         }
         tokens.append(endOfSequence)
         return tokens
     }
+
+    /// The placeholder block of a media segment; `nil` for text.
+    private static func block(_ segment: Segment, _ configuration: EmbeddingGemma2Configuration)
+        throws -> [Int]?
+    {
+        func marked(_ begin: Int, _ token: Int, _ count: Int, _ end: Int) -> [Int] {
+            [begin] + repeatElement(token, count: count) + [end]
+        }
+        switch segment {
+        case .text:
+            return nil
+        case .image(let count):
+            guard let vision = configuration.vision else {
+                throw EmbeddingGemma2Embedding.Error.unsupportedMedia
+            }
+            return marked(
+                vision.beginImageTokenID, vision.imageTokenID, count, vision.endImageTokenID)
+        case .video(let frames, let count):
+            guard let vision = configuration.vision, let token = vision.videoTokenID else {
+                throw EmbeddingGemma2Embedding.Error.unsupportedMedia
+            }
+            let frame = marked(vision.beginImageTokenID, token, count, vision.endImageTokenID)
+            return Array(repeatElement(frame, count: frames).joined())
+        case .audio(let count):
+            guard let audio = configuration.audio else {
+                throw EmbeddingGemma2Embedding.Error.unsupportedMedia
+            }
+            return marked(
+                audio.beginAudioTokenID, audio.audioTokenID, count, audio.endAudioTokenID)
+        }
+    }
 }
 
 // MARK: - Embedding
 
-/// Text and image embeddings from an EmbeddingGemma 2 checkpoint, in one shared space.
-/// Load the checkpoint once and reuse this actor for every call.
+/// Embeddings of text, images, video and audio from an EmbeddingGemma 2 checkpoint, in
+/// one shared space. Load the checkpoint once and reuse this actor for every call.
 ///
 /// ```swift
 /// let embeddings = try await EmbeddingGemma2Embedding(
 ///     modelDirectory: directory, tokenizerLoader: loader)
-/// let vector = try await embeddings.embed(
-///     [.init(text: "What causes the northern lights?")], task: .searchQuery)[0]
+/// let query = try await embeddings.embed(
+///     .init(text: "What causes the northern lights?"), task: .searchQuery)
+/// let clip = try await embeddings.embed(
+///     .init([.text("Aurora over Tromsø: "), .video(.url(movie)), .audio(.url(narration))]),
+///     task: .document)
 /// ```
 public actor EmbeddingGemma2Embedding {
 
-    /// One independently embedded item.
+    /// One independently embedded item: text and media in reading order.
     public struct Input {
-        public let text: String
+
+        /// One piece of an input.
+        public enum Part {
+            case text(String)
+            case image(UserInput.Image)
+            /// One frame per second, at most 32, without the audio track.
+            case video(UserInput.Video)
+            /// Mono audio; the first 30 seconds count.
+            case audio(UserInput.Audio)
+        }
+
+        public let parts: [Part]
         /// A document title or file name; used by the `.document` task.
         public let title: String?
-        public let images: [UserInput.Image]
 
-        public init(text: String = "", title: String? = nil, images: [UserInput.Image] = []) {
-            self.text = text
+        public init(_ parts: [Part], title: String? = nil) {
+            self.parts = parts
             self.title = title
-            self.images = images
+        }
+
+        /// Text followed by images.
+        public init(text: String = "", title: String? = nil, images: [UserInput.Image] = []) {
+            self.init([.text(text)] + images.map(Part.image), title: title)
         }
     }
 
@@ -731,19 +1110,22 @@ public actor EmbeddingGemma2Embedding {
 
     public enum Error: Swift.Error, LocalizedError, Sendable {
         case emptyInput
-        case imagesUnsupported
+        case unsupportedMedia
         case invalidMedia
+        case placeholderInText
         case contextExceeded
         case invalidEmbedding
 
         public var errorDescription: String? {
             switch self {
             case .emptyInput:
-                "An embedding input must contain text or images."
-            case .imagesUnsupported:
-                "This checkpoint does not support image embeddings."
+                "An embedding input must contain text or media."
+            case .unsupportedMedia:
+                "This checkpoint cannot embed this kind of media."
             case .invalidMedia:
-                "An image could not be decoded."
+                "A media item could not be decoded."
+            case .placeholderInText:
+                "Text next to media must not contain media placeholder tokens."
             case .contextExceeded:
                 "The embedding input exceeds \(EmbeddingGemma2Configuration.contextLength) tokens."
             case .invalidEmbedding:
@@ -755,6 +1137,8 @@ public actor EmbeddingGemma2Embedding {
     private let model: EmbeddingGemma2
     private let tokenizer: any Tokenizer
     private let imageProcessor: EmbeddingGemma2ImageProcessor?
+    private let videoProcessor: EmbeddingGemma2VideoProcessor?
+    private let audioProcessor: EmbeddingGemma2AudioProcessor?
 
     /// - Parameters:
     ///   - modelDirectory: A local `embedding_gemma2` checkpoint directory.
@@ -770,61 +1154,74 @@ public actor EmbeddingGemma2Embedding {
         try Swift.Task.checkCancellation()
         self.model = model
         self.tokenizer = try await tokenizerLoader.load(from: modelDirectory)
-        // A missing processor configuration disables images; text keeps working.
+        // A missing or unsupported processor configuration disables that media only.
         self.imageProcessor =
             config.vision == nil
             ? nil : try? EmbeddingGemma2ImageProcessor(directory: modelDirectory)
+        self.videoProcessor =
+            config.vision?.videoTokenID == nil
+            ? nil : try? EmbeddingGemma2VideoProcessor(directory: modelDirectory)
+        self.audioProcessor =
+            config.audio == nil
+            ? nil : try? EmbeddingGemma2AudioProcessor(directory: modelDirectory)
     }
 
-    /// Embeds independent items in input order, one at a time to bound visual working
-    /// memory. Use the same task for items that will be compared in the same space.
+    /// Embeds independent items in input order, one at a time to bound working memory.
+    /// Use the same task for items that will be compared in the same space.
     public func embed(_ inputs: [Input], task: Task) async throws -> [[Float]] {
-        try Swift.Task.checkCancellation()
         var vectors: [[Float]] = []
         vectors.reserveCapacity(inputs.count)
         for input in inputs {
             try Swift.Task.checkCancellation()
-            vectors.append(try embed(input, task: task))
+            vectors.append(try await embed(input, task: task))
         }
         return vectors
     }
 
     /// Embeds one item; returns a unit-length float32 vector.
-    public func embed(_ input: Input, task: Task) throws -> [Float] {
-        let hasText = !input.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        guard hasText || !input.images.isEmpty else { throw Error.emptyInput }
-        var images: [(pixels: MLXArray, tokens: Int)] = []
-        if !input.images.isEmpty {
-            guard let imageProcessor else { throw Error.imagesUnsupported }
-            images = try input.images.map { try imageProcessor.pixels(for: $0) }
+    ///
+    /// Each media item's soft tokens are evaluated before the next one is prepared, so
+    /// only one encoder's activations are alive at a time.
+    public func embed(_ input: Input, task: Task) async throws -> [Float] {
+        let hasText = input.parts.contains { !($0.text ?? "").allSatisfy(\.isWhitespace) }
+        guard hasText || input.parts.contains(where: { $0.text == nil }) else {
+            throw Error.emptyInput
+        }
+        guard let begin = tokenizer.bosToken.flatMap({ tokenizer.convertTokenToId($0) }),
+            let end = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>")
+        else { throw Error.invalidEmbedding }
+
+        var segments: [EmbeddingGemma2Sequence.Segment] = []
+        var softTokens: [MLXArray] = []
+        // Adjacent text joins before tokenization, as the chat template renders it.
+        var text = ""
+        for part in hasText ? Self.prompted(input, task: task) : input.parts {
+            if let value = part.text {
+                text += value
+                continue
+            }
+            if !text.isEmpty {
+                segments.append(.text(tokenizer.encode(text: text, addSpecialTokens: false)))
+                text = ""
+            }
+            let (segment, features) = try await encode(part)
+            if let features {
+                try MLX.checkedEval(features)
+                softTokens.append(features.reshaped(-1, features.dim(-1)))
+            }
+            segments.append(segment)
+            try Swift.Task.checkCancellation()
+        }
+        if !text.isEmpty {
+            segments.append(.text(tokenizer.encode(text: text, addSpecialTokens: false)))
         }
 
-        // Task prefixes apply to text only; media without text is embedded as-is.
-        let prepared = hasText ? Self.prompt(text: input.text, title: input.title, task: task) : ""
-        guard let endOfSequence = tokenizer.eosTokenId ?? tokenizer.convertTokenToId("<eos>") else {
-            throw Error.invalidEmbedding
-        }
-        var textTokens = tokenizer.encode(text: prepared, addSpecialTokens: true)
-        // The checkpoint's tokenizer configuration omits `add_eos_token`, so the
-        // tokenizer drops the `<eos>` its post-processor declares and the model expects.
-        if textTokens.last == endOfSequence { textTokens.removeLast() }
         let tokens = try EmbeddingGemma2Sequence.tokens(
-            text: textTokens, imageTokenCounts: images.map(\.tokens),
-            vision: model.config.vision, endOfSequence: endOfSequence,
+            segments, configuration: model.config, beginOfSequence: begin, endOfSequence: end,
             limit: EmbeddingGemma2Configuration.contextLength)
-
-        // Each image keeps its own size. The vision tower only batches equal sizes.
-        let features: MLXArray?
-        if images.isEmpty {
-            features = nil
-        } else if let gathered = model.imageFeatures(images.map(\.pixels)) {
-            features = gathered
-        } else {
-            throw Error.imagesUnsupported
-        }
         let vector = model.embed(
-            inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]),
-            attentionMask: nil, imageFeatures: features)
+            inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]), attentionMask: nil,
+            softTokens: softTokens.isEmpty ? nil : concatenated(softTokens, axis: 0))
         try MLX.checkedEval(vector)
         try Swift.Task.checkCancellation()
         let values = vector.asArray(Float.self)
@@ -832,6 +1229,44 @@ public actor EmbeddingGemma2Embedding {
             throw Error.invalidEmbedding
         }
         return values
+    }
+
+    /// The segment of one media part and the soft tokens that fill it, `nil` when empty.
+    private func encode(_ part: Input.Part) async throws -> (
+        EmbeddingGemma2Sequence.Segment, MLXArray?
+    ) {
+        switch part {
+        case .text:
+            preconditionFailure("Text parts have no soft tokens.")
+        case .image(let image):
+            guard let imageProcessor,
+                let features = model.imageFeatures(try imageProcessor.pixels(for: image).pixels)
+            else { throw Error.unsupportedMedia }
+            return (.image(tokens: features.dim(1)), features)
+        case .video(let video):
+            guard let videoProcessor,
+                let features = model.imageFeatures(try await videoProcessor.frames(for: video))
+            else { throw Error.unsupportedMedia }
+            return (.video(frames: features.dim(0), tokensPerFrame: features.dim(1)), features)
+        case .audio(let audio):
+            guard let audioProcessor else { throw Error.unsupportedMedia }
+            let frames = try await audioProcessor.features(for: audio)
+            // Audio shorter than one frame keeps its markers and no soft tokens.
+            guard frames.dim(0) > 0 else { return (.audio(tokens: 0), nil) }
+            guard let features = model.audioFeatures(frames) else {
+                throw Error.unsupportedMedia
+            }
+            return (.audio(tokens: features.dim(1)), features)
+        }
+    }
+
+    /// The parts with the task's instruction prefix joined to the leading text.
+    private static func prompted(_ input: Input, task: Task) -> [Input.Part] {
+        if let first = input.parts.first?.text {
+            return [.text(prompt(text: first, title: input.title, task: task))]
+                + input.parts.dropFirst()
+        }
+        return [.text(prompt(text: "", title: input.title, task: task))] + input.parts
     }
 
     /// The task instruction prefix from the model card. Inputs that already carry one
@@ -853,5 +1288,11 @@ public actor EmbeddingGemma2Embedding {
             }
             return "title: none | text: \(text)"
         }
+    }
+}
+
+extension EmbeddingGemma2Embedding.Input.Part {
+    fileprivate var text: String? {
+        if case .text(let text) = self { text } else { nil }
     }
 }
