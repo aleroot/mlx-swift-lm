@@ -266,6 +266,32 @@ struct EmbeddingGemma2Tests {
         }
     }
 
+    /// Blocked windows give the masked dense result for grouped heads, a padded row and a
+    /// ragged last block.
+    @Test
+    func windowedAttentionMatchesTheMaskedDenseAttention() throws {
+        let (length, radius) = (20, 3)
+        func signal(_ shape: [Int], _ phase: Double) -> MLXArray {
+            MLXArray(
+                (0 ..< shape.reduce(1, *)).map { Float(sin(Double($0) * 0.37 + phase)) }, shape)
+        }
+        let queries = signal([2, 4, length, 8], 0)
+        let keys = signal([2, 2, length, 8], 1)
+        let values = signal([2, 2, length, 8], 2)
+        let valid = MLXArray(
+            (0 ..< 2 * length).map { Int32($0 < length + 13 ? 1 : 0) }, [2, length])
+        let dense = EmbeddingGemma2Span.full(
+            EmbeddingGemma2Masks.combine(
+                pattern: EmbeddingGemma2Masks.slidingWindowPattern(seqLen: length, radius: radius),
+                batch: 2, seqLen: length, paddingMask: valid)
+        ).attention(queries: queries, keys: keys, values: values)
+        let windowed = EmbeddingGemma2Span.window(radius: radius, validKeys: valid)
+            .attention(queries: queries, keys: keys, values: values)
+        try MLX.checkedEval(dense, windowed)
+        #expect(windowed.shape == [2, 4, length, 8])
+        #expect(allClose(windowed, dense, atol: 1e-5).item(Bool.self))
+    }
+
     /// Expected weights are `torch.nn.functional.interpolate(mode: "bicubic", antialias: true)`
     /// applied to unit impulses.
     @Test

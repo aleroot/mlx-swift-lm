@@ -407,23 +407,31 @@ private final class EmbeddingGemma2TextModel: Module {
         let perLayerInputs = ple(x)
 
         let (batch, length) = (x.dim(0), x.dim(1))
-        let globalMask = EmbeddingGemma2Masks.bidirectional(
-            batch: batch, seqLen: length, paddingMask: attentionMask)
-        // The window pattern equals the full mask while the sequence fits inside it.
-        let localMask =
-            length - 1 > slidingWindow
-            ? EmbeddingGemma2Masks.combine(
-                pattern: EmbeddingGemma2Masks.slidingWindowPattern(
-                    seqLen: length, radius: slidingWindow),
-                batch: batch, seqLen: length, paddingMask: attentionMask)
-            : globalMask
+        let global = EmbeddingGemma2Span.full(
+            EmbeddingGemma2Masks.bidirectional(
+                batch: batch, seqLen: length, paddingMask: attentionMask))
+        // The window equals the full span while the sequence fits inside it. Blocks score
+        // `3 * slidingWindow` keys per query and pay off once that is less than the square.
+        let blocks = (length + slidingWindow - 1) / slidingWindow
+        let local: EmbeddingGemma2Span =
+            if 3 * blocks * slidingWindow * slidingWindow < length * length {
+                .window(radius: slidingWindow, validKeys: attentionMask)
+            } else if length - 1 > slidingWindow {
+                .full(
+                    EmbeddingGemma2Masks.combine(
+                        pattern: EmbeddingGemma2Masks.slidingWindowPattern(
+                            seqLen: length, radius: slidingWindow),
+                        batch: batch, seqLen: length, paddingMask: attentionMask))
+            } else {
+                global
+            }
 
         var hidden = x
         for (index, layer) in layers.enumerated() {
             hidden = layer(
                 hidden,
                 perLayerInput: perLayerInputs[0..., 0..., index, 0...],
-                mask: layer.isGlobal ? globalMask : localMask)
+                span: layer.isGlobal ? global : local)
         }
         return norm(hidden)
     }
@@ -487,8 +495,10 @@ private final class EmbeddingGemma2Layer: Module {
         self._layerScalar.wrappedValue = MLXArray.ones([1])
     }
 
-    func callAsFunction(_ x: MLXArray, perLayerInput: MLXArray, mask: MLXArray?) -> MLXArray {
-        var hidden = x + postAttentionLayerNorm(selfAttention(inputLayerNorm(x), mask: mask))
+    func callAsFunction(_ x: MLXArray, perLayerInput: MLXArray, span: EmbeddingGemma2Span)
+        -> MLXArray
+    {
+        var hidden = x + postAttentionLayerNorm(selfAttention(inputLayerNorm(x), span: span))
         hidden = hidden + postFeedforwardLayerNorm(mlp(preFeedforwardLayerNorm(hidden)))
         return pleBlock(hidden, perLayerInput: perLayerInput) * layerScalar
     }
@@ -523,7 +533,7 @@ private final class EmbeddingGemma2Attention: Module {
         self._kNorm.wrappedValue = EmbeddingGemma2RMSNorm(dimensions: headDim, eps: eps)
     }
 
-    func callAsFunction(_ x: MLXArray, mask: MLXArray?) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, span: EmbeddingGemma2Span) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         let q = rope(qNorm(qProj(x).reshaped(batch, length, heads, headDim)).transposed(0, 2, 1, 3))
         let k = rope(
@@ -536,8 +546,7 @@ private final class EmbeddingGemma2Attention: Module {
         )
         .asType(rawValues.dtype)
         .transposed(0, 2, 1, 3)
-        let output = MLXFast.scaledDotProductAttention(
-            queries: q, keys: k, values: v, scale: 1, mask: mask.map { .array($0) } ?? .none)
+        let output = span.attention(queries: q, keys: k, values: v)
         return oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
     }
 }
@@ -597,7 +606,71 @@ private final class EmbeddingGemma2RMSNorm: Module {
     }
 }
 
-// MARK: - Masks
+// MARK: - Spans and Masks
+
+/// The keys each query of a layer reads.
+enum EmbeddingGemma2Span {
+
+    /// Every key, under an optional `[B, 1, L, L]` mask.
+    case full(MLXArray?)
+
+    /// Keys within `radius` on both sides; `validKeys` is `[B, L]`, `1` for real tokens.
+    /// Blocks of `radius` queries read only their own keys and `radius` more on each side,
+    /// so the cost grows linearly with the sequence instead of with its square.
+    case window(radius: Int, validKeys: MLXArray?)
+
+    /// Bidirectional attention with unit scale over `[B, heads, L, headDim]` inputs.
+    func attention(queries: MLXArray, keys: MLXArray, values: MLXArray) -> MLXArray {
+        switch self {
+        case .full(let mask):
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: 1,
+                mask: mask.map { .array($0) } ?? .none)
+        case .window(let radius, let validKeys):
+            let (batch, length) = (queries.dim(0), queries.dim(2))
+            let blocks = (length + radius - 1) / radius
+            let span = 3 * radius
+            // Row `b` of `indices` gathers block `b`'s keys from the sequence padded with
+            // `radius` positions on both sides.
+            let indices =
+                (MLXArray(0 ..< blocks).reshaped(blocks, 1) * radius
+                + MLXArray(0 ..< span).reshaped(1, span)).flattened()
+            let tail = blocks * radius - length
+            let context = IntOrPair((radius, radius + tail))
+            func blocked(_ x: MLXArray) -> MLXArray {
+                MLX.padded(x, widths: [0, 0, context, 0])
+                    .take(indices, axis: 2)
+                    .reshaped(batch, x.dim(1), blocks, span, x.dim(3))
+                    .transposed(0, 2, 1, 3, 4)
+                    .reshaped(batch * blocks, x.dim(1), span, x.dim(3))
+            }
+            let blockQueries = MLX.padded(queries, widths: [0, 0, .init((0, tail)), 0])
+                .reshaped(batch, queries.dim(1), blocks, radius, queries.dim(3))
+                .transposed(0, 2, 1, 3, 4)
+                .reshaped(batch * blocks, queries.dim(1), radius, queries.dim(3))
+            // Key `j` of a block sits `j - radius` positions after its first query.
+            let row = MLXArray(0 ..< radius).reshaped(radius, 1)
+            let column = MLXArray(0 ..< span).reshaped(1, span)
+            let valid = MLX.padded(
+                (validKeys ?? MLXArray.ones([batch, length])).asType(.bool),
+                widths: [0, context], value: MLXArray(false)
+            )
+            .take(indices, axis: 1)
+            .reshaped(batch * blocks, 1, 1, span)
+            // Each query keeps itself, so a padded query never has an empty row.
+            let mask =
+                ((column .>= row) .&& (column .<= row + 2 * radius) .&& valid)
+                .|| (column .== row + radius)
+            let output = MLXFast.scaledDotProductAttention(
+                queries: blockQueries, keys: blocked(keys), values: blocked(values), scale: 1,
+                mask: .array(mask))
+            return output.reshaped(batch, blocks, queries.dim(1), radius, values.dim(3))
+                .transposed(0, 2, 1, 3, 4)
+                .reshaped(batch, queries.dim(1), blocks * radius, values.dim(3))[
+                    0..., 0..., ..<length, 0...]
+        }
+    }
+}
 
 enum EmbeddingGemma2Masks {
 
