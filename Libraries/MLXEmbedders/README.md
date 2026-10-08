@@ -185,30 +185,3 @@ frame cap. Audio is mono at 16 kHz and keeps the first 30 seconds. Text truncati
 preserves complete media blocks; media that exceeds the shared 8,192-token budget
 throws `contextExceeded`. Float16 checkpoint tensors are promoted to float32
 before inference; bfloat16 and float32 checkpoints retain their precision.
-
-### Reproducing parity checks
-
-Install the pinned reference environment in a virtual environment:
-
-```sh
-python3 -m venv /tmp/embeddinggemma2-reference-env
-/tmp/embeddinggemma2-reference-env/bin/pip install -r tools/embeddinggemma2-reference-requirements.txt
-/tmp/embeddinggemma2-reference-env/bin/python tools/generate_embeddinggemma2_reference.py \
-  --mlx-model /path/to/embeddinggemma-2-bf16 --output /tmp/embeddinggemma2-reference
-
-TEST_RUNNER_EG2_TEST_MODEL_DIR=/path/to/embeddinggemma-2-bf16 \
-TEST_RUNNER_EG2_TEST_GOLDEN_DIR=/tmp/embeddinggemma2-reference \
-xcodebuild test -project IntegrationTesting/IntegrationTesting.xcodeproj \
-  -scheme IntegrationTesting -destination 'platform=macOS' -skipPackagePluginValidation \
-  -only-testing:IntegrationTestingTests/EmbeddingGemma2IntegrationTests
-```
-
-The generator converts the local MLX convolution layout for Transformers, then
-records CPU float32 SDPA outputs with Sentence Transformers. It generates its own
-images, decoded video frames, and audio, and records checkpoint/media hashes and
-library versions in `reference.json`. Cases cover text, long text, each modality,
-interleaved input, and an image preceding text. The integration test uses the
-actual tokenizer and the public actor, checks factory text inference, and checks
-normalized 256-dimensional output. It requires both environment variables and
-never downloads weights during the test. The generator can instead download the
-original Google checkpoint at its pinned revision by omitting `--mlx-model`.
