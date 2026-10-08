@@ -3,10 +3,12 @@
 import CoreMedia
 import Foundation
 import MLX
+import MLXEmbedders
 import MLXLMCommon
 import MLXNN
 import Testing
 
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 /// Deterministic-checkpoint tests for ``EmbeddingGemma2``: reference vectors and audio
@@ -46,6 +48,187 @@ struct EmbeddingGemma2Tests {
             })
     }
 
+    @Test(arguments: [false, true])
+    func configurationRoundTripsWithoutLosingEncodersOrAttention(_ media: Bool) throws {
+        let original = try Self.decode(media ? Self.checkpointConfig : Self.tinyConfig)
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(EmbeddingGemma2Configuration.self, from: data)
+        #expect(decoded.attention == original.attention)
+        #expect(decoded.softTokenIDs == original.softTokenIDs)
+        #expect(decoded.embeddingDim == original.embeddingDim)
+        #expect(decoded.vision?.encoder.hiddenSize == original.vision?.encoder.hiddenSize)
+        #expect(decoded.audio?.encoder.hiddenSize == original.audio?.encoder.hiddenSize)
+    }
+
+    @Test
+    func selectingEncodersSurvivesSerialization() throws {
+        let config = try Self.decode(Self.checkpointConfig).selectingEncoders(
+            vision: false, audio: false)
+        let roundTrip = try JSONDecoder().decode(
+            EmbeddingGemma2Configuration.self, from: JSONEncoder().encode(config))
+        #expect(roundTrip.vision == nil)
+        #expect(roundTrip.audio == nil)
+        #expect(roundTrip.attention == config.attention)
+    }
+
+    @Test
+    func rejectsInvalidAttentionLayoutsBeforeAllocatingWeights() throws {
+        for (old, new) in [
+            (#""num_attention_heads":2"#, #""num_attention_heads":0"#),
+            (#""head_dim":4"#, #""head_dim":3"#),
+            (#""sliding_window":2"#, #""sliding_window":0"#),
+            (#""sliding_attention","full_attention""#, #""unknown","full_attention""#),
+        ] {
+            #expect(throws: DecodingError.self) {
+                try Self.decode(Self.tinyConfig.replacingOccurrences(of: old, with: new))
+            }
+        }
+    }
+
+    @Test
+    func rejectsMalformedAudioEncoderBeforeConstruction() {
+        let invalid = Self.tinyAudioConfig(futureContext: 0).replacingOccurrences(
+            of: "[8,4]", with: "[]")
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(Gemma4AudioConfiguration.self, from: Data(invalid.utf8))
+        }
+    }
+
+    @Test
+    func sanitizationPromotesFloat16InEveryEncoder() throws {
+        let model = EmbeddingGemma2(try Self.decode(Self.tinyMediaConfig))
+        let half = MLXArray.ones([1], dtype: .float16)
+        let clean = try model.sanitize(weights: [
+            "language_model.norm.weight": half, "vision_tower.test.weight": half,
+            "audio_tower.test.weight": half,
+        ])
+        #expect(clean.values.allSatisfy { $0.dtype == .float32 })
+    }
+
+    private struct TestTokenizer: MLXLMCommon.Tokenizer {
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+            let tokens = text.unicodeScalars.map { 12 + Int($0.value) % 20 }
+            return addSpecialTokens ? [2] + tokens + [1] : tokens
+        }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? {
+            switch token {
+            case "<bos>": 2
+            case "<eos>": 1
+            default: nil
+            }
+        }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+        var bosToken: String? { "<bos>" }
+        var eosToken: String? { "<eos>" }
+        var unknownToken: String? { nil }
+        func applyChatTemplate(
+            messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] { [] }
+    }
+
+    private struct TestTokenizerLoader: TokenizerLoader {
+        func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer { TestTokenizer() }
+    }
+
+    private static func checkpointDirectory(
+        _ json: String = tinyConfig, modelType: String = "embedding_gemma2"
+    ) throws -> URL {
+        var config = try JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+        if modelType == "embedding_gemma2_text" { config = config["text_config"] as! [String: Any] }
+        config["model_type"] = modelType
+        let directory = try processorDirectory("{}")
+        try JSONSerialization.data(withJSONObject: config).write(
+            to: directory.appendingPathComponent("config.json"))
+        let model = EmbeddingGemma2(try decode(json))
+        var weights = try deterministicWeights(for: model)
+        if modelType == "embedding_gemma2_text" {
+            weights = Dictionary(
+                uniqueKeysWithValues: weights.map {
+                    ($0.key.replacingOccurrences(of: "language_model.", with: ""), $0.value)
+                })
+        }
+        try MLX.save(
+            arrays: weights,
+            url: directory.appendingPathComponent("model.safetensors"))
+        return directory
+    }
+
+    @Test(arguments: ["embedding_gemma2", "embedding_gemma2_text"])
+    func embedderFactoryLoadsCheckpointAndUsesItsPooledOutput(modelType: String) async throws {
+        let directory = try Self.checkpointDirectory(modelType: modelType)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let poolingDirectory = directory.appendingPathComponent("1_Pooling")
+        try FileManager.default.createDirectory(
+            at: poolingDirectory, withIntermediateDirectories: true)
+        try Data(#"{"word_embedding_dimension":12,"pooling_mode_mean_tokens":true}"#.utf8)
+            .write(to: poolingDirectory.appendingPathComponent("config.json"))
+        let context = try await EmbedderModelFactory.shared.load(
+            from: directory, using: TestTokenizerLoader())
+        #expect((context.model as? MLXLMCommon.EmbeddingGemma2) != nil)
+        #expect(context.model.maxPositionEmbeddings == 8192)
+        #expect(context.pooling.strategy == .none)
+        let ids = MLXArray(Array(1 ..< 10).map(Int32.init), [1, 9])
+        let result = context.pooling(
+            context.model(
+                ids, positionIds: nil, tokenTypeIds: nil, attentionMask: nil), normalize: true)
+        try MLX.checkedEval(result)
+        let expected: [Float] = [
+            -0.062816948, 0.280682176, 0.407530546, 0.737360120, 0.214800760, 0.127999231,
+            0.049736522, 0.164332777, 0.185940713, 0.187425271, 0.166393027, 0.134533703,
+        ]
+        #expect(result.shape == [1, 12])
+        #expect(zip(result.asArray(Float.self), expected).allSatisfy { abs($0 - $1) < 0.00001 })
+    }
+
+    @Test
+    func publicActorLoadsWeightsPromptsAndRejectsInvalidRequests() async throws {
+        let directory = try Self.checkpointDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let actor = try await EmbeddingGemma2Embedding(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        let actual = try await actor.embed(.init(text: "Swift"), task: .codeRetrieval)
+        let context = try await EmbedderModelFactory.shared.load(
+            from: directory, using: TestTokenizerLoader())
+        let ids = TestTokenizer().encode(
+            text: "task: code retrieval | query: Swift", addSpecialTokens: true)
+        let expected = context.model(
+            MLXArray(ids.map(Int32.init), [1, ids.count]),
+            positionIds: nil, tokenTypeIds: nil, attentionMask: nil
+        ).pooledOutput!
+        try MLX.checkedEval(expected)
+        #expect(Self.cosine(actual, expected.asArray(Float.self)) > 0.999999)
+        await #expect(throws: EmbeddingGemma2Embedding.Error.invalidDimension) {
+            try await actor.embed(.init(text: "Swift"), task: .searchQuery, dimensions: 7)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.emptyInput) {
+            try await actor.embed(.init(text: "  "), task: .searchQuery)
+        }
+        await #expect(throws: EmbeddingGemma2Embedding.Error.unsupportedMedia) {
+            try await actor.embed(.init([.image(.url(directory))]), task: .document)
+        }
+        let cancelled = Swift.Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await actor.embed(.init(text: "Swift"), task: .searchQuery)
+        }
+        await #expect(throws: CancellationError.self) { try await cancelled.value }
+    }
+
+    @Test
+    func publicActorReportsMissingProcessorConfigurationAtLoadTime() async throws {
+        let directory = try Self.checkpointDirectory(Self.tinyVisionConfig)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await #expect(throws: DecodingError.self) {
+            try await EmbeddingGemma2Embedding(
+                modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        }
+        let textOnly = try await EmbeddingGemma2Embedding(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader(), loadVision: false)
+        #expect(await textOnly.supportedModalities == [.text])
+        #expect(try await textOnly.embed(.init(text: "Swift"), task: .none).count == 12)
+    }
+
     @Test
     func checkpointConfigurationResolvesAttentionAndEncoders() throws {
         let config = try Self.decode(Self.checkpointConfig)
@@ -77,11 +260,11 @@ struct EmbeddingGemma2Tests {
     }
 
     @Test
-    func clippedOrStandardizedVisionEncodersStayTextOnly() throws {
+    func rejectsClippedOrStandardizedVisionEncoders() throws {
         for flag in ["use_clipped_linears", "standardize"] {
             let json = Self.tinyVisionConfig.replacingOccurrences(
                 of: #""\#(flag)":false"#, with: #""\#(flag)":true"#)
-            #expect(try Self.decode(json).vision == nil)
+            #expect(throws: DecodingError.self) { try Self.decode(json) }
         }
     }
 
@@ -565,137 +748,6 @@ struct EmbeddingGemma2Tests {
             EmbeddingGemma2Embedding.prompt(
                 text: "title: Swift | text: hello", title: nil, task: .document)
                 == "title: Swift | text: hello")
-    }
-
-    /// Drives the real checkpoint end to end — config decode, weight loading, the text
-    /// model, the vision and audio towers, and media preparation — against reference
-    /// embeddings recorded from the Transformers float32 implementation, the media ones
-    /// through Sentence Transformers. Set `EG2_TEST_MODEL_DIR` to a local
-    /// `mlx-community/embeddinggemma-2-bf16` snapshot and `EG2_TEST_GOLDEN_DIR` to the
-    /// recorded goldens to run.
-    @Test(
-        .enabled(
-            if: ProcessInfo.processInfo.environment["EG2_TEST_MODEL_DIR"] != nil,
-            "Requires a local embeddinggemma-2 checkpoint."))
-    func downloadedCheckpointMatchesTransformersReference() async throws {
-        let modelDirectory = URL(
-            filePath: try #require(ProcessInfo.processInfo.environment["EG2_TEST_MODEL_DIR"]))
-        let goldenDirectory = URL(
-            filePath: ProcessInfo.processInfo.environment["EG2_TEST_GOLDEN_DIR"] ?? "/tmp/eg2ref")
-        func file(_ name: String) -> URL { goldenDirectory.appendingPathComponent(name) }
-        struct Record: Decodable {
-            let image: String?
-            let tokens: [Int]
-            let embedding: [Float]
-        }
-        let imageProcessor = try EmbeddingGemma2ImageProcessor(directory: modelDirectory)
-
-        let configData = try Data(contentsOf: modelDirectory.appendingPathComponent("config.json"))
-        let config = try JSONDecoder().decode(EmbeddingGemma2Configuration.self, from: configData)
-        let model = EmbeddingGemma2(config)
-        try await loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: try JSONDecoder().decode(
-                BaseConfiguration.self, from: configData
-            ).perLayerQuantization)
-
-        for name in ["golden.json", "vision_golden.json"] {
-            let records = try JSONDecoder().decode(
-                [Record].self, from: try Data(contentsOf: file(name)))
-            for record in records {
-                let features = try record.image.map { name in
-                    try #require(
-                        model.imageFeatures(
-                            try imageProcessor.pixels(for: .url(file("\(name).png"))).pixels))
-                }
-                let vector = model.embed(
-                    inputIds: MLXArray(record.tokens.map(Int32.init), [1, record.tokens.count]),
-                    attentionMask: nil, softTokens: features)
-                try MLX.checkedEval(vector)
-                #expect(Self.cosine(vector.asArray(Float.self), record.embedding) > 0.999)
-            }
-        }
-
-        // Audio, video, and interleaved inputs: the library prepares the media, and the text
-        // runs come from the reference tokens, which the rebuilt sequence must equal.
-        struct MediaRecord: Decodable {
-            let parts: [[String]]
-            let tokens: [Int]
-            let embedding: [Float]
-        }
-        let videoProcessor = try EmbeddingGemma2VideoProcessor(directory: modelDirectory)
-        let audioProcessor = try EmbeddingGemma2AudioProcessor(directory: modelDirectory)
-        let vision = try #require(config.vision)
-        let audio = try #require(config.audio)
-        let begins: Set = [vision.beginImageTokenID, audio.beginAudioTokenID]
-        let records = try JSONDecoder().decode(
-            [MediaRecord].self, from: try Data(contentsOf: file("media_golden.json")))
-        for record in records {
-            var media: [EmbeddingGemma2Sequence.Segment] = []
-            var softTokens: [MLXArray] = []
-            for part in record.parts where part[0] != "text" {
-                let features: MLXArray
-                switch part[0] {
-                case "image":
-                    features = try #require(
-                        model.imageFeatures(
-                            try imageProcessor.pixels(for: .url(file("\(part[1]).png"))).pixels))
-                    media.append(.image(tokens: features.dim(1)))
-                case "video":
-                    // Movie files sample one frame per second; the decoded clip keeps all.
-                    let video: UserInput.Video =
-                        part[1] != "clip"
-                        ? .url(file(part[1]))
-                        : .frames(
-                            (0 ..< 5).map {
-                                UserInput.VideoFrame(
-                                    image: .url(file("frame\($0).png")),
-                                    timeStamp: CMTime(value: Int64($0), timescale: 1))
-                            })
-                    features = try #require(
-                        model.imageFeatures(try await videoProcessor.frames(for: video)))
-                    media.append(.video(frames: features.dim(0), tokensPerFrame: features.dim(1)))
-                default:
-                    features = try #require(
-                        model.audioFeatures(
-                            try await audioProcessor.features(for: .url(file("\(part[1]).wav")))))
-                    media.append(.audio(tokens: features.dim(1)))
-                }
-                softTokens.append(features.reshaped(-1, features.dim(-1)))
-            }
-
-            var segments: [EmbeddingGemma2Sequence.Segment] = []
-            var index = 1
-            while index < record.tokens.count - 1 {
-                if begins.contains(record.tokens[index]), !media.isEmpty {
-                    let segment = media.removeFirst()
-                    segments.append(segment)
-                    let length =
-                        switch segment {
-                        case .video(let frames, let tokens): frames * (tokens + 2)
-                        case .image(let tokens), .audio(let tokens): tokens + 2
-                        case .text(let text): text.count
-                        }
-                    index += length
-                } else {
-                    let end =
-                        record.tokens[index ..< record.tokens.count - 1].firstIndex(
-                            where: begins.contains) ?? record.tokens.count - 1
-                    segments.append(.text(Array(record.tokens[index ..< end])))
-                    index = end
-                }
-            }
-            let tokens = try EmbeddingGemma2Sequence.tokens(
-                segments, configuration: config, beginOfSequence: 2, endOfSequence: 1,
-                limit: EmbeddingGemma2Configuration.contextLength)
-            #expect(tokens == record.tokens)
-
-            let vector = model.embed(
-                inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]), attentionMask: nil,
-                softTokens: softTokens.isEmpty ? nil : concatenated(softTokens, axis: 0))
-            try MLX.checkedEval(vector)
-            #expect(Self.cosine(vector.asArray(Float.self), record.embedding) > 0.999)
-        }
     }
 
     private static func cosine(_ left: [Float], _ right: [Float]) -> Double {

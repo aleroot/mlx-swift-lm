@@ -123,3 +123,92 @@ let modelContainer = try await EmbedderModelFactory.shared.loadContainer(
 Ported to swift from [taylorai/mlx_embedding_models](https://github.com/taylorai/mlx_embedding_models/tree/main)[^1]
 
 [^1]: Modified by [CodebyCR](https://github.com/CodebyCR) to match test case.
+
+
+## EmbeddingGemma 2
+
+`EmbedderModelFactory` loads `embedding_gemma2` and `embedding_gemma2_text`
+checkpoints through the usual local-directory or downloader APIs:
+
+```swift
+let container = try await EmbedderModelFactory.shared.loadContainer(
+    from: #hubDownloader(), using: #huggingFaceTokenizerLoader(),
+    configuration: EmbedderRegistry.embeddinggemma2)
+
+let vector = try await container.perform { context in
+    let text = "task: search result | query: What causes the northern lights?"
+    let ids = context.tokenizer.encode(text: text)
+    let output = context.model(
+        MLXArray(ids)[.newAxis], positionIds: nil, tokenTypeIds: nil, attentionMask: nil)
+    let pooled = context.pooling(output, normalize: true)
+    try MLX.checkedEval(pooled)
+    return pooled.asArray(Float.self)
+}
+```
+
+The model returns a projected, normalized vector in `pooledOutput`; the factory
+uses `.none` pooling even when the checkpoint includes Sentence Transformers'
+mean-pooling configuration. For padded batches, pass the padding mask to the
+model. The token-level API truncates sequences to 8,192 tokens. It does not add
+task prefixes: use `task: search result | query: ` for retrieval queries and
+`title: none | text: ` for documents without titles.
+
+The factory retains every encoder present in `config.json`. Its token-level
+`EmbeddingModel` interface embeds text. For prepared media tensors, the shared
+`MLXLMCommon.EmbeddingGemma2` model also exposes `imageFeatures`, `audioFeatures`,
+and `embed(inputIds:attentionMask:softTokens:)`. For media decoding, prompting,
+and interleaving, use `MLXVLM.EmbeddingGemma2Embedding`:
+
+```swift
+let embeddings = try await EmbeddingGemma2Embedding(
+    modelDirectory: directory, tokenizerLoader: #huggingFaceTokenizerLoader())
+let vector = try await embeddings.embed(
+    .init([.text("Product demo: "), .image(.url(imageURL)), .audio(.url(audioURL))]),
+    task: .document, dimensions: 256)
+```
+
+`dimensions` accepts 128, 256, 512, or the checkpoint's full output size (768 for
+the released model). Truncated vectors are normalized again. Task options include
+search, documents, classification, clustering, code retrieval, question answering,
+fact checking, sentence similarity, and `.none` for unprompted input. Media-only
+inputs receive no task prefix.
+
+To reduce memory, construct the actor with `loadVision: false` or
+`loadAudio: false`; unused encoders are omitted before loading weights. Inspect
+`supportedModalities` before preparing input. Required processor configuration
+errors fail loading. Unsupported input fails before any media encoder runs.
+
+The actor processes batch items sequentially to bound working memory. Images and
+video use the checkpoint's token budgets. Video defaults to 1 FPS and at most 32
+frames, without its audio track; predecoded frames keep their order before the
+frame cap. Audio is mono at 16 kHz and keeps the first 30 seconds. Text truncation
+preserves complete media blocks; media that exceeds the shared 8,192-token budget
+throws `contextExceeded`. Float16 checkpoint tensors are promoted to float32
+before inference; bfloat16 and float32 checkpoints retain their precision.
+
+### Reproducing parity checks
+
+Install the pinned reference environment in a virtual environment:
+
+```sh
+python3 -m venv /tmp/embeddinggemma2-reference-env
+/tmp/embeddinggemma2-reference-env/bin/pip install -r tools/embeddinggemma2-reference-requirements.txt
+/tmp/embeddinggemma2-reference-env/bin/python tools/generate_embeddinggemma2_reference.py \
+  --mlx-model /path/to/embeddinggemma-2-bf16 --output /tmp/embeddinggemma2-reference
+
+TEST_RUNNER_EG2_TEST_MODEL_DIR=/path/to/embeddinggemma-2-bf16 \
+TEST_RUNNER_EG2_TEST_GOLDEN_DIR=/tmp/embeddinggemma2-reference \
+xcodebuild test -project IntegrationTesting/IntegrationTesting.xcodeproj \
+  -scheme IntegrationTesting -destination 'platform=macOS' -skipPackagePluginValidation \
+  -only-testing:IntegrationTestingTests/EmbeddingGemma2IntegrationTests
+```
+
+The generator converts the local MLX convolution layout for Transformers, then
+records CPU float32 SDPA outputs with Sentence Transformers. It generates its own
+images, decoded video frames, and audio, and records checkpoint/media hashes and
+library versions in `reference.json`. Cases cover text, long text, each modality,
+interleaved input, and an image preceding text. The integration test uses the
+actual tokenizer and the public actor, checks factory text inference, and checks
+normalized 256-dimensional output. It requires both environment variables and
+never downloads weights during the test. The generator can instead download the
+original Google checkpoint at its pinned revision by omitting `--mlx-model`.
