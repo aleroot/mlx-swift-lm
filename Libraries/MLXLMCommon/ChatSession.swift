@@ -1196,7 +1196,8 @@ public final class ChatSession {
                                     currentConversation.uncommittedTokens,
                                 structuredToolCallCount: structuredToolCallCount,
                                 usesSpeculativeDecoding: speculativeDecoding != nil,
-                                canSplitPreparedMedia: model is PreparedInputSplitting)
+                                canSplitPreparedMedia: model is PreparedInputSplitting,
+                                canRewindModelState: model is ModelStateRewinding)
                             let cacheState = PromptCacheState(
                                 cachedTokens: cachedTokenIds,
                                 processedTokenCount: kvCache.processedTokenCount,
@@ -1209,8 +1210,10 @@ public final class ChatSession {
                             var decision = promptCachePolicy.decide(turn: turn, cache: cacheState)
 
                             // Rewinding is the one decision that can fail while being
-                            // applied: a cache may trim fewer tokens than requested.
-                            // Verify and downgrade to a rebuild before prefilling.
+                            // applied: a cache may trim fewer tokens than requested,
+                            // and carried state must follow the cache back, which the
+                            // model may decline for this prefix. Verify and downgrade
+                            // to a rebuild before prefilling.
                             if case .trimToCommonPrefix(let commonPrefixLength, let trimCount) =
                                 decision
                             {
@@ -1224,14 +1227,22 @@ public final class ChatSession {
                                         draftTrimmed == trimCount
                                             && draftCache.processedTokenCount == commonPrefixLength
                                     } ?? true
+                                let rewoundState = lmState.flatMap { _ in
+                                    (model as? ModelStateRewinding)?.rewoundState(
+                                        forPrefix: Array(promptTokenIds[..<commonPrefixLength]))
+                                }
+                                let stateIsRewound = lmState == nil || rewoundState != nil
 
-                                if !(mainTrimIsAligned && draftTrimIsAligned) {
+                                if !(mainTrimIsAligned && draftTrimIsAligned && stateIsRewound) {
                                     decision = .rebuild
-                                } else if !currentConversation.transcriptBuiltCache {
-                                    // A fork shares its source's arrays. A copy keeps only
-                                    // the prefix, so the next write does not copy the rest.
-                                    kvCache = kvCache.copy()
-                                    draftKVCache = draftKVCache?.copy()
+                                } else {
+                                    lmState = rewoundState
+                                    if !currentConversation.transcriptBuiltCache {
+                                        // A fork shares its source's arrays. A copy keeps only
+                                        // the prefix, so the next write does not copy the rest.
+                                        kvCache = kvCache.copy()
+                                        draftKVCache = draftKVCache?.copy()
+                                    }
                                 }
                             }
 
