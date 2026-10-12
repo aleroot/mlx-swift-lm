@@ -402,10 +402,8 @@ final class Qwen38Tests: XCTestCase {
     }
 
     func testQwen38VLMReadsVisionWeightsOnlyForMedia() throws {
-        let configuration = qwen38VLMConfigJSON().replacingOccurrences(
-            of: "\"image_token_id\": 248056", with: "\"image_token_id\": 1")
         let config = try JSONDecoder.json5().decode(
-            MLXVLM.Qwen35Configuration.self, from: Data(configuration.utf8))
+            MLXVLM.Qwen35Configuration.self, from: Data(qwen38VLMConfigJSON().utf8))
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -424,10 +422,11 @@ final class Qwen38Tests: XCTestCase {
 
         let pixels = MLXArray.zeros([4, 3 * 2 * 16 * 16])
         let input = LMInput(
-            text: .init(tokens: MLXArray([Int32(config.imageTokenIndex)])),
+            text: .init(tokens: MLXArray([1] as [Int32])),
             image: .init(pixels: pixels, frames: [THW(1, 2, 2)]))
-        _ = try model.prepare(
-            input, cache: model.newCache(parameters: nil), state: nil, prefill: .init())
+        XCTAssertThrowsError(
+            try model.prepare(
+                input, cache: model.newCache(parameters: nil), state: nil, prefill: .init()))
         XCTAssertTrue(model.onDemandComponents[0].isLoaded)
         XCTAssertFalse(model.parameters().flattened().contains { $0.0.hasPrefix("vision_tower") })
     }
