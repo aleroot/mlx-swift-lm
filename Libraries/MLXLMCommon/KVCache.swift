@@ -1687,13 +1687,16 @@ public final class RewindableConvolutionCache: MambaCache {
         positions >= 0 && positions <= rollbackCapacity
     }
 
+    fileprivate func canRewind(_ positions: Int) -> Bool {
+        guard positions >= 0 else { return false }
+        if positions == 0 { return true }
+        guard let history = self[1] else { return false }
+        return positions <= min(offset, history.dim(1) - stateLength)
+    }
+
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        guard n >= 0 else { return 0 }
-        guard n > 0 else { return 0 }
-        guard let history = self[1] else { return 0 }
-        let available = min(offset, history.dim(1) - stateLength)
-        guard n <= available else { return 0 }
+        guard n > 0, canRewind(n), let history = self[1] else { return 0 }
 
         let retained = history[0..., ..<(history.dim(1) - n), 0...]
         self[0] = contiguous(retained[0..., (retained.dim(1) - stateLength)..., 0...])
@@ -1832,6 +1835,7 @@ public class CacheList: BaseKVCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        guard caches.allSatisfy({ canRewindConvolutionCache($0, positions: n) }) else { return 0 }
         var result = 0
         for cache in caches {
             result = cache.trim(n)
@@ -2599,12 +2603,24 @@ public func canTrimPromptCache(_ cache: [KVCache]) -> Bool {
 /// number of tokens that were trimmed.
 @discardableResult
 public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
-    guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
+    guard canTrimPromptCache(cache), !cache.isEmpty,
+        cache.allSatisfy({ canRewindConvolutionCache($0, positions: numTokens) })
+    else { return 0 }
     cache.dropFirst().forEach { $0.trim(numTokens) }
     return cache.first?.trim(numTokens) ?? 0
 }
 
-/// Rewind a one-token speculative tail in a hybrid attention/recurrent cache.
+private func canRewindConvolutionCache(_ cache: KVCache, positions: Int) -> Bool {
+    if let cache = cache as? RewindableConvolutionCache {
+        return cache.canRewind(positions)
+    }
+    if let cache = cache as? CacheList {
+        return cache.children.allSatisfy { canRewindConvolutionCache($0, positions: positions) }
+    }
+    return true
+}
+
+/// Rewind a speculative tail in a hybrid attention/recurrent cache.
 /// Attention entries trim normally; Mamba entries restore the checkpoint the
 /// model captured after the round's committed bonus token.
 @discardableResult
@@ -2615,6 +2631,7 @@ package func rewindSpeculativePromptCache(
         cache.allSatisfy({ entry in
             if entry.isTrimmable {
                 return entry.offset >= numTokens && entry.isTrimmable(after: numTokens)
+                    && canRewindConvolutionCache(entry, positions: numTokens)
             }
             // A recurrent checkpoint records one atomic verify step. Models
             // that support wider rollback use bounded trimmable recurrent
