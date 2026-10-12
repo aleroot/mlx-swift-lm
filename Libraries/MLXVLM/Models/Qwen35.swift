@@ -1562,16 +1562,28 @@ private func qwen35VLMSharedKVOffsets(
 
 // MARK: - Model
 
+/// The vision tower at the path it has in ``Qwen35`` when it loads separately.
+private final class Qwen35Vision: Module {
+    @ModuleInfo(key: "vision_tower") var model: Qwen3VLVision.VisionModel
+
+    init(_ config: Qwen35Configuration) {
+        _model.wrappedValue = Qwen3VLVision.VisionModel(config.visionConfiguration)
+        super.init()
+    }
+}
+
 public class Qwen35: Module, VLMModel {
-    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
+    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
     @ModuleInfo(key: "language_model") var languageModel: Qwen35Language.LanguageModel
 
     public let config: Qwen35Configuration
+    private let onDemandVision: OnDemandComponent<Qwen35Vision>
 
     public init(_ config: Qwen35Configuration) {
         self.config = config
         _visionModel.wrappedValue = Qwen3VLVision.VisionModel(config.visionConfiguration)
         _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
+        onDemandVision = OnDemandComponent(.vision) { Qwen35Vision(config) }
         super.init()
     }
 
@@ -1587,6 +1599,11 @@ public class Qwen35: Module, VLMModel {
 
     public func prepare() throws {
         try languageModel.prepare()
+    }
+
+    private func vision() throws -> Qwen3VLVision.VisionModel {
+        if let visionModel { return visionModel }
+        return try onDemandVision.load().model
     }
 
     private func mergeInputIdsWithImageFeatures(
@@ -1660,30 +1677,29 @@ public class Qwen35: Module, VLMModel {
         var imageFrames: [THW]?
         var videoFrames: [THW]?
 
-        let visionDType = visionModel.patchEmbed.proj.weight.dtype
         var pixelParts: [MLXArray] = []
 
         if let image = input.image {
-            pixelParts.append(image.pixels.asType(visionDType))
+            pixelParts.append(image.pixels)
             imageFrames = image.frames
         }
         if let video = input.video {
-            pixelParts.append(video.pixels.asType(visionDType))
+            pixelParts.append(video.pixels)
             videoFrames = video.frames
-        }
-        if !pixelParts.isEmpty {
-            pixelValues = concatenated(pixelParts)
         }
 
         var inputEmbeddings: MLXArray?
 
-        if let pixelValues,
+        if !pixelParts.isEmpty,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         {
+            let vision = try vision()
+            let typedPixels = concatenated(pixelParts).asType(vision.patchEmbed.proj.weight.dtype)
+            pixelValues = typedPixels
             let inputIds = input.text.tokens
             let textEmbeds = languageModel.model.embedTokens(inputIds)
-            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            let (visionHidden, _) = vision(typedPixels, gridTHW: frames)
             let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
@@ -1954,8 +1970,24 @@ public class Qwen35: Module, VLMModel {
             sanitized[key] = value
         }
 
-        return visionModel.sanitize(weights: sanitized)
+        return Qwen3VLVision.VisionModel.sanitize(
+            weights: sanitized, config: config.visionConfiguration)
     }
+}
+
+extension Qwen35: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        [
+            .vision: [
+                CheckpointComponent(
+                    name: "vision_tower",
+                    namespaces: ["vision_tower", "model.visual", "visual"],
+                    destination: "vision_tower")
+            ]
+        ]
+    }
+
+    public var onDemandComponents: [AnyOnDemandComponent] { [onDemandVision] }
 }
 
 extension Qwen35: SpeculativeCacheRewindModel {
