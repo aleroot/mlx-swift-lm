@@ -20,6 +20,9 @@ public struct ModelComponent: Hashable, Sendable, CustomStringConvertible {
 
     /// Image and video encoders, with the projectors that feed them to the language model.
     public static let vision = ModelComponent("vision")
+
+    /// Audio encoders, with the projectors that feed them to the language model.
+    public static let audio = ModelComponent("audio")
 }
 
 /// When a load reads the components that a model can load on first use.
