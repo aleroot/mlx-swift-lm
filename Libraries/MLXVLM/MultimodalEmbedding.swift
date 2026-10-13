@@ -81,7 +81,7 @@ public enum MultimodalEmbeddingFactory {
 
     /// Loads the checkpoint in `modelDirectory`. Media encoders load on first use, so the
     /// files must stay readable while the embedding is in use.
-    /// - Throws: ``ModelFactoryError/unsupportedModelType(_:)`` for other model types.
+    /// - Throws: `ModelFactoryError.unsupportedModelType(_:)` for other model types.
     public static func load(
         modelDirectory: URL, tokenizerLoader: any TokenizerLoader
     ) async throws -> any MultimodalEmbedding {

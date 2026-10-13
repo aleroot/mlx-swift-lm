@@ -757,22 +757,35 @@ struct EmbeddingGemma2Tests {
                 == "title: Swift | text: hello")
     }
 
-    @Test
-    func imagesTurnUprightByTheirExifOrientationOnce() throws {
-        let image = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 40, height: 20))
+    @Test(arguments: UInt32(1) ... UInt32(8))
+    func imagesTurnUprightByTheirExifOrientationOnce(orientation: UInt32) throws {
+        let background = CIImage(color: .red).cropped(
+            to: CGRect(x: 0, y: 0, width: 40, height: 20))
+        let image = CIImage(color: .blue).cropped(
+            to: CGRect(x: 0, y: 0, width: 10, height: 10)
+        ).composited(over: background)
         let cgImage = try #require(CIContext().createCGImage(image, from: image.extent))
         let data = NSMutableData()
         let destination = try #require(
             CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil))
         CGImageDestinationAddImage(
-            destination, cgImage, [kCGImagePropertyOrientation: 6] as CFDictionary)
+            destination, cgImage, [kCGImagePropertyOrientation: orientation] as CFDictionary)
         #expect(CGImageDestinationFinalize(destination))
         let tagged = try #require(CIImage(data: data as Data))
         let decodedUpright = try #require(
             CIImage(data: data as Data, options: [.applyOrientationProperty: true]))
-        let upright = CGSize(width: 20, height: 40)
-        #expect(try EmbeddingGemma2ImageProcessor.prepared(tagged).extent.size == upright)
-        #expect(try EmbeddingGemma2ImageProcessor.prepared(decodedUpright).extent.size == upright)
+        let upright =
+            orientation >= 5
+            ? CGSize(width: 20, height: 40) : CGSize(width: 40, height: 20)
+        let prepared = try EmbeddingGemma2ImageProcessor.prepared(tagged)
+        let decoded = try EmbeddingGemma2ImageProcessor.prepared(decodedUpright)
+        #expect(prepared.extent.size == upright)
+        #expect(decoded.extent.size == upright)
+        let actual = EmbeddingGemma2ImageProcessor.pixels(
+            prepared, height: Int(upright.height), width: Int(upright.width))
+        let expected = EmbeddingGemma2ImageProcessor.pixels(
+            decoded, height: Int(upright.height), width: Int(upright.width))
+        #expect(actual.asArray(Float.self) == expected.asArray(Float.self))
         #expect(try EmbeddingGemma2ImageProcessor.prepared(image).extent.size == image.extent.size)
     }
 
