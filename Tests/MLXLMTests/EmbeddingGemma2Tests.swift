@@ -814,6 +814,35 @@ struct EmbeddingGemma2Tests {
         #expect(try await actor.embed([], task: .document).isEmpty)
     }
 
+    @Test(arguments: ["embedding_gemma2", "embedding_gemma2_text"])
+    func factoryLoadsEitherLayoutAsTheSharedContract(modelType: String) async throws {
+        let directory = try Self.checkpointDirectory(modelType: modelType)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        #expect(
+            MultimodalEmbeddingFactory.modelTypes == ["embedding_gemma2", "embedding_gemma2_text"])
+        let embedding = try await MultimodalEmbeddingFactory.load(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        #expect(embedding is EmbeddingGemma2Embedding)
+        #expect(await embedding.supportedModalities == [.text])
+        let shared = try await embedding.embed([.init(text: "Swift")], task: .codeRetrieval)
+        let direct = try await EmbeddingGemma2Embedding(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader()
+        ).embed(.init(text: "Swift"), task: .codeRetrieval)
+        #expect(Self.cosine(shared[0], direct) > 0.999999)
+    }
+
+    @Test
+    func factoryRejectsOtherModelTypesBeforeLoadingWeights() async throws {
+        let directory = try Self.processorDirectory("{}")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(#"{"model_type":"bert"}"#.utf8).write(
+            to: directory.appendingPathComponent("config.json"))
+        await #expect(throws: ModelFactoryError.self) {
+            try await MultimodalEmbeddingFactory.load(
+                modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        }
+    }
+
     private static func cosine(_ left: [Float], _ right: [Float]) -> Double {
         precondition(left.count == right.count)
         var (dot, leftNorm, rightNorm) = (0.0, 0.0, 0.0)

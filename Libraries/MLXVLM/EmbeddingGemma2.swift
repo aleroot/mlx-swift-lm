@@ -489,58 +489,17 @@ package enum EmbeddingGemma2Sequence {
 ///     .init([.text("Aurora over Tromsø: "), .video(.url(movie)), .audio(.url(narration))]),
 ///     task: .document)
 /// ```
-public actor EmbeddingGemma2Embedding {
+public actor EmbeddingGemma2Embedding: MultimodalEmbedding {
 
-    /// Input kinds accepted by this loaded checkpoint.
-    public enum Modality: Hashable, Sendable {
-        case text, image, video, audio
-    }
+    public typealias Modality = EmbeddingModality
+    /// Media keeps its own budget: video samples one frame per second, at most 32, without
+    /// the audio track; audio is mono and keeps its first 30 seconds.
+    public typealias Input = EmbeddingInput
+    public typealias Task = EmbeddingTask
 
     /// Modalities declared by the checkpoint and allowed by the loading policy.
     /// Encoders and processors load on first use.
     public let supportedModalities: Set<Modality>
-
-    /// One independently embedded item: text and media in reading order.
-    public struct Input {
-
-        /// One piece of an input.
-        public enum Part {
-            case text(String)
-            case image(UserInput.Image)
-            /// One frame per second, at most 32, without the audio track.
-            case video(UserInput.Video)
-            /// Mono audio; the first 30 seconds count.
-            case audio(UserInput.Audio)
-        }
-
-        public let parts: [Part]
-        /// A document title or file name; used by the `.document` task.
-        public let title: String?
-
-        public init(_ parts: [Part], title: String? = nil) {
-            self.parts = parts
-            self.title = title
-        }
-
-        /// Text followed by images.
-        public init(text: String = "", title: String? = nil, images: [UserInput.Image] = []) {
-            self.init([.text(text)] + images.map(Part.image), title: title)
-        }
-    }
-
-    /// The task an embedding is prepared for. Use `.searchQuery` for queries and
-    /// `.document` for corpus items; compared items must share a task's space.
-    public enum Task: Sendable {
-        case searchQuery
-        case document
-        case clustering
-        case classification
-        case questionAnswering
-        case factChecking
-        case codeRetrieval
-        case sentenceSimilarity
-        case none
-    }
 
     public enum Error: Swift.Error, LocalizedError, Sendable {
         case emptyInput
@@ -672,6 +631,11 @@ public actor EmbeddingGemma2Embedding {
         _ input: Input, task: Task, dimensions: Int? = nil
     ) async throws -> [Float] {
         try await embed([input], task: task, dimensions: dimensions)[0]
+    }
+
+    /// Embeds independent items at the checkpoint's full output size.
+    public func embed(_ inputs: sending [Input], task: Task) async throws -> [[Float]] {
+        try await embed(inputs, task: task, dimensions: nil)
     }
 
     private func outputDimension(_ requested: Int?) throws -> Int {
