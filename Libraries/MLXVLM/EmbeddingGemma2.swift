@@ -48,9 +48,13 @@ package struct EmbeddingGemma2ImageProcessor: Sendable {
         )
     }
 
-    /// The oriented image on the sRGB tone curve, as the reference reads it.
+    /// The image turned upright by its EXIF orientation, on the sRGB tone curve, as the
+    /// reference reads it. An image decoded with `applyOrientationProperty` carries no
+    /// orientation and stays as it is.
     static func prepared(_ image: CIImage) throws -> CIImage {
-        let oriented = image.settingProperties([CIImageOption.applyOrientationProperty: true])
+        let orientation = (image.properties[kCGImagePropertyOrientation as String] as? UInt32)
+            .flatMap(CGImagePropertyOrientation.init(rawValue:))
+        let oriented = orientation.map(image.oriented) ?? image
         guard !oriented.extent.isEmpty, !oriented.extent.isInfinite else {
             throw EmbeddingGemma2Embedding.Error.invalidMedia
         }
@@ -422,6 +426,23 @@ package enum EmbeddingGemma2Sequence {
         return tokens
     }
 
+    /// Groups sequences into batches of similar length. A batch pads to its longest row and
+    /// holds at most `limit` tokens, padding included; a longer sequence forms a batch alone.
+    /// - Returns: Indices into `lengths`, shortest first.
+    package static func batches(lengths: [Int], limit: Int) -> [[Int]] {
+        let order = lengths.indices.sorted { (lengths[$0], $0) < (lengths[$1], $1) }
+        var batches: [[Int]] = []
+        for index in order {
+            // Ascending order makes this sequence the longest row of the batch.
+            if let last = batches.last, (last.count + 1) * lengths[index] <= limit {
+                batches[batches.count - 1].append(index)
+            } else {
+                batches.append([index])
+            }
+        }
+        return batches
+    }
+
     /// The placeholder block of a media segment; `nil` for text.
     private static func block(_ segment: Segment, _ configuration: EmbeddingGemma2Configuration)
         throws -> [Int]?
@@ -551,6 +572,10 @@ public actor EmbeddingGemma2Embedding {
     }
 
     private let model: EmbeddingGemma2
+    /// Tokens in one text batch, padding included. Larger batches use more memory and are
+    /// not faster: on an M2, 64 document chunks took 2.45 s with 1,024 tokens per batch,
+    /// 2.81 s with 8,192, and 4.20 s one at a time.
+    private static let batchTokens = 1_024
     private let tokenizer: any Tokenizer
     private let modelDirectory: URL
     private var imageProcessor: EmbeddingGemma2ImageProcessor?
@@ -594,33 +619,75 @@ public actor EmbeddingGemma2Embedding {
         self.supportedModalities = modalities
     }
 
-    /// Embeds independent items in input order, one at a time to bound working memory.
+    /// Embeds independent items in input order; returns unit-length float32 vectors.
     /// Retrieval uses `.searchQuery` for queries and `.document` for corpus items.
+    ///
+    /// Items with media run one at a time. Each media item's soft tokens are evaluated
+    /// before the next one is prepared, so only one encoder's activations are alive at a
+    /// time. Text runs in padded batches of similar length, at most 1,024 tokens each;
+    /// a longer text runs alone.
     public func embed(
         _ inputs: [Input], task: Task, dimensions: Int? = nil
     ) async throws -> [[Float]] {
-        var vectors: [[Float]] = []
-        vectors.reserveCapacity(inputs.count)
-        for input in inputs {
+        let dimension = try outputDimension(dimensions)
+        var vectors = [[Float]](repeating: [], count: inputs.count)
+        var texts: [(index: Int, tokens: [Int])] = []
+        for (index, input) in inputs.enumerated() {
             try Swift.Task.checkCancellation()
-            vectors.append(try await embed(input, task: task, dimensions: dimensions))
+            let (tokens, softTokens) = try await sequence(input, task: task)
+            guard let softTokens else {
+                texts.append((index, tokens))
+                continue
+            }
+            let vector = model.embed(
+                inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]),
+                attentionMask: nil, softTokens: softTokens)
+            vectors[index] = try Self.unitRows(vector, dimension: dimension)[0]
         }
+        let batches = EmbeddingGemma2Sequence.batches(
+            lengths: texts.map(\.tokens.count), limit: Self.batchTokens)
+        for batch in batches {
+            try Swift.Task.checkCancellation()
+            let rows = batch.map { texts[$0].tokens }
+            let width = rows.map(\.count).max() ?? 0
+            // Padding is masked out of attention and pooling, so its token does not matter.
+            let ids = rows.flatMap { $0 + repeatElement(0, count: width - $0.count) }
+            let mask = rows.flatMap {
+                [Int32](repeating: 1, count: $0.count) + repeatElement(0, count: width - $0.count)
+            }
+            let output = model.embed(
+                inputIds: MLXArray(ids.map(Int32.init), [rows.count, width]),
+                attentionMask: rows.allSatisfy { $0.count == width }
+                    ? nil : MLXArray(mask, [rows.count, width]))
+            for (row, vector) in zip(batch, try Self.unitRows(output, dimension: dimension)) {
+                vectors[texts[row].index] = vector
+            }
+        }
+        try Swift.Task.checkCancellation()
         return vectors
     }
 
     /// Embeds one item; returns a unit-length float32 vector.
-    ///
-    /// Each media item's soft tokens are evaluated before the next one is prepared, so
-    /// only one encoder's activations are alive at a time.
     public func embed(
         _ input: Input, task: Task, dimensions: Int? = nil
     ) async throws -> [Float] {
-        try Swift.Task.checkCancellation()
-        let dimension = dimensions ?? model.config.embeddingDim
+        try await embed([input], task: task, dimensions: dimensions)[0]
+    }
+
+    private func outputDimension(_ requested: Int?) throws -> Int {
+        let dimension = requested ?? model.config.embeddingDim
         guard
             dimension == model.config.embeddingDim
                 || ([128, 256, 512].contains(dimension) && dimension <= model.config.embeddingDim)
         else { throw Error.invalidDimension }
+        return dimension
+    }
+
+    /// The token sequence of one input, and the soft tokens that fill its media; `nil`
+    /// when it has none.
+    private func sequence(_ input: Input, task: Task) async throws -> (
+        tokens: [Int], softTokens: MLXArray?
+    ) {
         for part in input.parts {
             switch part {
             case .image where !supportedModalities.contains(.image),
@@ -666,19 +733,24 @@ public actor EmbeddingGemma2Embedding {
         let tokens = try EmbeddingGemma2Sequence.tokens(
             segments, configuration: model.config, beginOfSequence: begin, endOfSequence: end,
             limit: EmbeddingGemma2Configuration.contextLength)
-        let vector = model.embed(
-            inputIds: MLXArray(tokens.map(Int32.init), [1, tokens.count]), attentionMask: nil,
-            softTokens: softTokens.isEmpty ? nil : concatenated(softTokens, axis: 0))
-        try MLX.checkedEval(vector)
-        try Swift.Task.checkCancellation()
-        let values = vector.asArray(Float.self)
-        let truncated = Array(values.prefix(dimension))
-        guard values.allSatisfy(\.isFinite), values.contains(where: { $0 != 0 }) else {
-            throw Error.invalidEmbedding
+        return (tokens, softTokens.isEmpty ? nil : concatenated(softTokens, axis: 0))
+    }
+
+    /// The rows of `[B, embeddingDim]` vectors, truncated to `dimension` at unit length.
+    private static func unitRows(_ vectors: MLXArray, dimension: Int) throws -> [[Float]] {
+        try MLX.checkedEval(vectors)
+        let width = vectors.dim(1)
+        let values = vectors.asArray(Float.self)
+        return try stride(from: 0, to: values.count, by: width).map { start in
+            let row = values[start ..< start + width]
+            guard row.allSatisfy(\.isFinite), row.contains(where: { $0 != 0 }) else {
+                throw Error.invalidEmbedding
+            }
+            let truncated = row.prefix(dimension)
+            let norm = truncated.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
+            guard norm.isFinite, norm > 0 else { throw Error.invalidEmbedding }
+            return truncated.map { Float(Double($0) / norm) }
         }
-        let norm = truncated.reduce(0.0) { $0 + Double($1) * Double($1) }.squareRoot()
-        guard norm.isFinite, norm > 0 else { throw Error.invalidEmbedding }
-        return truncated.map { Float(Double($0) / norm) }
     }
 
     /// The segment of one media part and the soft tokens that fill it, `nil` when empty.

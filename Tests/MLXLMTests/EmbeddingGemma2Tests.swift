@@ -1,7 +1,9 @@
 // Copyright © 2026 Apple Inc.
 
+import CoreImage
 import CoreMedia
 import Foundation
+import ImageIO
 import MLX
 import MLXEmbedders
 import MLXLMCommon
@@ -753,6 +755,63 @@ struct EmbeddingGemma2Tests {
             EmbeddingGemma2Embedding.prompt(
                 text: "title: Swift | text: hello", title: nil, task: .document)
                 == "title: Swift | text: hello")
+    }
+
+    @Test
+    func imagesTurnUprightByTheirExifOrientationOnce() throws {
+        let image = CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 40, height: 20))
+        let cgImage = try #require(CIContext().createCGImage(image, from: image.extent))
+        let data = NSMutableData()
+        let destination = try #require(
+            CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil))
+        CGImageDestinationAddImage(
+            destination, cgImage, [kCGImagePropertyOrientation: 6] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+        let tagged = try #require(CIImage(data: data as Data))
+        let decodedUpright = try #require(
+            CIImage(data: data as Data, options: [.applyOrientationProperty: true]))
+        let upright = CGSize(width: 20, height: 40)
+        #expect(try EmbeddingGemma2ImageProcessor.prepared(tagged).extent.size == upright)
+        #expect(try EmbeddingGemma2ImageProcessor.prepared(decodedUpright).extent.size == upright)
+        #expect(try EmbeddingGemma2ImageProcessor.prepared(image).extent.size == image.extent.size)
+    }
+
+    @Test
+    func textBatchesKeepEveryInputOnceWithinTheTokenLimit() {
+        let lengths = [5, 300, 7, 9, 300, 1, 4_000, 8_192, 64]
+        let batches = EmbeddingGemma2Sequence.batches(lengths: lengths, limit: 1_024)
+        #expect(batches.flatMap { $0 }.sorted() == Array(lengths.indices))
+        #expect(batches.flatMap { $0 }.map { lengths[$0] } == lengths.sorted())
+        for batch in batches where batch.count > 1 {
+            #expect(batch.count * (batch.map { lengths[$0] }.max() ?? 0) <= 1_024)
+        }
+        #expect(
+            batches.map { $0.map { lengths[$0] } }
+                == [[1, 5, 7, 9, 64], [300, 300], [4_000], [8_192]])
+        #expect(EmbeddingGemma2Sequence.batches(lengths: [], limit: 1_024).isEmpty)
+    }
+
+    /// Lengths straddle the sliding window, so padding meets both the windowed and the
+    /// global attention masks.
+    @Test
+    func batchedTextMatchesEachInputAlone() async throws {
+        let directory = try Self.checkpointDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let actor = try await EmbeddingGemma2Embedding(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        let items: [(text: String, title: String?)] = [
+            (String(repeating: "aurora ", count: 9), nil), ("Swift", nil), ("Swift", "Notes.md"),
+            ("northern lights", nil), ("task: none | query: verbatim", nil),
+        ]
+        let batched = try await actor.embed(
+            items.map { .init(text: $0.text, title: $0.title) }, task: .document)
+        #expect(batched.count == items.count)
+        for (item, vector) in zip(items, batched) {
+            let alone = try await actor.embed(
+                .init(text: item.text, title: item.title), task: .document)
+            #expect(Self.cosine(vector, alone) > 0.99999)
+        }
+        #expect(try await actor.embed([], task: .document).isEmpty)
     }
 
     private static func cosine(_ left: [Float], _ right: [Float]) -> Double {

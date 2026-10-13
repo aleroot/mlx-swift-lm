@@ -193,8 +193,10 @@ To load all configured encoders immediately, pass `componentLoading: .immediate`
 The low-level `loadWeights` API accepts the same policies; factory users can set
 `ModelConfiguration.excludedComponents`. Conversion loads components immediately.
 
-The actor processes batch items sequentially to bound working memory. Images and
-video use the checkpoint's token budgets. Video defaults to 1 FPS and at most 32
+The actor embeds items with media one at a time. Text-only items run in padded
+batches of similar length, at most 1,024 tokens each; a longer item runs alone.
+Images turn upright by their EXIF orientation. Images and video use the
+checkpoint's token budgets. Video defaults to 1 FPS and at most 32
 frames, without its audio track; predecoded frames keep their order before the
 frame cap. Audio is mono at 16 kHz and keeps the first 30 seconds. Text truncation
 preserves complete media blocks; media that exceeds the shared 8,192-token budget
