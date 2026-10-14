@@ -1188,8 +1188,10 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     ) throws
         -> PrepareResult
     {
+        var tokens = input.text.tokens
+        if tokens.ndim == 1 { tokens = tokens.expandedDimensions(axis: 0) }
         let embeddings = try getInputEmbeddings(
-            inputIds: input.text.tokens,
+            inputIds: tokens,
             pixelValues: input.image?.pixels,
             mask: input.text.mask
         )
