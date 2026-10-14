@@ -164,15 +164,80 @@ struct MessageContentPartsTests {
                 ])
     }
 
-    @Test("Empty text gives no part")
-    func emptyTextGivesNoPart() {
+    @Test("Empty text still gives a text part")
+    func emptyTextStillGivesAPart() {
         let message = Chat.Message.user("", images: [image(nil)])
         #expect(
             generator.contentParts(for: message, layout: .imagesThenText)
-                == [["type": "image"]])
+                == [["type": "image"], ["type": "text", "text": ""]])
     }
 
-    @Test("A tool call without text has empty content in every content-parts generator")
+    @Test("Empty messages without tool calls keep a text part in every layout")
+    func emptyMessagesWithoutToolCallsKeepText() {
+        for role: Chat.Message.Role in [.user, .assistant, .system, .tool] {
+            for tool: Chat.Message.Tool? in [nil, .calls([]), .result(id: "call_1")] {
+                let message = Chat.Message(role: role, content: "", tool: tool)
+                for layout: MessageContentLayout in [
+                    .imagesThenVideosThenText, .imagesThenText, .textThenImages,
+                ] {
+                    #expect(
+                        generator.contentParts(for: message, layout: layout)
+                            == [["type": "text", "text": ""]])
+                }
+            }
+        }
+    }
+
+    @Test("Only assistant tool calls omit empty text, and nonempty text is preserved")
+    func toolCallTextByRole() {
+        let call = ToolCall(function: .init(name: "get_weather", arguments: [:]))
+        for role: Chat.Message.Role in [.user, .assistant, .system, .tool] {
+            for text in ["", " ", "Checking the weather."] {
+                let message = Chat.Message(role: role, content: text, tool: .calls([call]))
+                for layout: MessageContentLayout in [
+                    .imagesThenVideosThenText, .imagesThenText, .textThenImages,
+                ] {
+                    let expected =
+                        role == .assistant && text.isEmpty
+                        ? [] : [["type": "text", "text": text]]
+                    #expect(generator.contentParts(for: message, layout: layout) == expected)
+                }
+            }
+        }
+    }
+
+    @Test("Omitting tool-call text preserves image labels and media")
+    func toolCallsKeepMedia() {
+        let call = ToolCall(function: .init(name: "get_weather", arguments: [:]))
+        let message = Chat.Message.assistant(
+            "", images: [image("A"), image(nil)],
+            videos: [.url(URL(fileURLWithPath: "/tmp/example.mov"))], toolCalls: [call])
+        for layout: MessageContentLayout in [
+            .imagesThenVideosThenText, .imagesThenText, .textThenImages,
+        ] {
+            var expected = [
+                ["type": "text", "text": "[A]"], ["type": "image"], ["type": "image"],
+            ]
+            if case .imagesThenVideosThenText = layout {
+                expected.append(["type": "video"])
+            }
+            #expect(generator.contentParts(for: message, layout: layout) == expected)
+        }
+    }
+
+    @Test("Qwen reasoning with no answer omits text only when tool calls are present")
+    func reasoningOnlyAssistantContent() {
+        let call = ToolCall(function: .init(name: "get_weather", arguments: [:]))
+        for calls: [ToolCall]? in [nil, [], [call]] {
+            let message = Qwen3VLMessageGenerator().generate(
+                message: .assistant("<think>Check the weather.</think>", toolCalls: calls))
+            #expect(message["reasoning_content"] as? String == "Check the weather.")
+            let expected = calls?.isEmpty == false ? [] : [["type": "text", "text": ""]]
+            #expect(message["content"] as? [[String: String]] == expected)
+        }
+    }
+
+    @Test("Content-parts generators omit empty text only for actual tool calls")
     func toolCallWithoutTextHasEmptyContent() {
         let call = ToolCall(
             function: .init(name: "get_weather", arguments: ["city": .string("Rome")]))
@@ -181,6 +246,13 @@ struct MessageContentPartsTests {
             Mistral3MessageGenerator(), FastVLMMessageGenerator(), GlmOcrMessageGenerator(),
         ]
         for generator in generators {
+            for input: Chat.Message in [.user(""), .assistant(""), .assistant("", toolCalls: [])] {
+                let message = generator.generate(message: input)
+                #expect(
+                    (message["content"] as? [[String: String]])
+                        == [["type": "text", "text": ""]],
+                    "\(type(of: generator)) changed an empty message without tool calls")
+            }
             let message = generator.generate(message: .assistant("", toolCalls: [call]))
             #expect(
                 (message["content"] as? [[String: String]])?.isEmpty == true,
