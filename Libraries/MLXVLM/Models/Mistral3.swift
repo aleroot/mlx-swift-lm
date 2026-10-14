@@ -1022,9 +1022,8 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
                 tools: input.tools,
                 additionalContext: input.additionalContext
             )
-            let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         }
 
         guard input.images.count == 1 else {
