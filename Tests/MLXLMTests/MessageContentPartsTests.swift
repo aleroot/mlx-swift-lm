@@ -2,6 +2,7 @@
 
 import Foundation
 import MLXLMCommon
+import MLXVLM
 import Testing
 
 @Suite("Message content parts")
@@ -163,14 +164,28 @@ struct MessageContentPartsTests {
                 ])
     }
 
-    @Test("Empty text still gives a text part")
-    func emptyTextStillGivesAPart() {
+    @Test("Empty text gives no part")
+    func emptyTextGivesNoPart() {
         let message = Chat.Message.user("", images: [image(nil)])
         #expect(
             generator.contentParts(for: message, layout: .imagesThenText)
-                == [
-                    ["type": "image"],
-                    ["type": "text", "text": ""],
-                ])
+                == [["type": "image"]])
+    }
+
+    @Test("A tool call without text has empty content in every content-parts generator")
+    func toolCallWithoutTextHasEmptyContent() {
+        let call = ToolCall(
+            function: .init(name: "get_weather", arguments: ["city": .string("Rome")]))
+        let generators: [any MessageGenerator] = [
+            Qwen2VLMessageGenerator(), Qwen3VLMessageGenerator(), Gemma4MessageGenerator(),
+            Mistral3MessageGenerator(), FastVLMMessageGenerator(), GlmOcrMessageGenerator(),
+        ]
+        for generator in generators {
+            let message = generator.generate(message: .assistant("", toolCalls: [call]))
+            #expect(
+                (message["content"] as? [[String: String]])?.isEmpty == true,
+                "\(type(of: generator)) gave \(String(describing: message["content"]))")
+            #expect(message["tool_calls"] != nil, "\(type(of: generator)) lost the tool call")
+        }
     }
 }

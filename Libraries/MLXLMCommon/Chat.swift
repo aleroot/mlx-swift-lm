@@ -187,12 +187,15 @@ extension MessageGenerator {
         }
     }
 
+    /// Empty text gives no part: templates test `content` for truth, and a list
+    /// holding an empty text part is true where the empty string is false.
     package func contentParts(
         for message: Chat.Message, layout: MessageContentLayout
     ) -> [[String: String]] {
         var parts: [[String: String]] = []
 
         func appendText(_ text: String) {
+            guard !text.isEmpty else { return }
             parts.append(["type": "text", "text": text])
         }
 
