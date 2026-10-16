@@ -831,10 +831,9 @@ struct EmbeddingGemma2Tests {
     func factoryLoadsEitherLayoutAsTheSharedContract(modelType: String) async throws {
         let directory = try Self.checkpointDirectory(modelType: modelType)
         defer { try? FileManager.default.removeItem(at: directory) }
-        #expect(
-            MultimodalEmbeddingFactory.modelTypes == ["embedding_gemma2", "embedding_gemma2_text"])
-        let embedding = try await MultimodalEmbeddingFactory.load(
-            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        #expect(await MultimodalEmbeddingTypeRegistry.shared.contains(modelType))
+        let embedding = try await MultimodalEmbeddingFactory.shared.loadContainer(
+            from: directory, using: TestTokenizerLoader())
         #expect(embedding is EmbeddingGemma2Embedding)
         #expect(await embedding.supportedModalities == [.text])
         let shared = try await embedding.embed([.init(text: "Swift")], task: .codeRetrieval)
@@ -842,6 +841,9 @@ struct EmbeddingGemma2Tests {
             modelDirectory: directory, tokenizerLoader: TestTokenizerLoader()
         ).embed(.init(text: "Swift"), task: .codeRetrieval)
         #expect(Self.cosine(shared[0], direct) > 0.999999)
+        let local = try await MultimodalEmbeddingFactory.load(
+            modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        #expect(try await local.embed([.init(text: "Swift")], task: .codeRetrieval) == shared)
     }
 
     @Test
@@ -853,6 +855,93 @@ struct EmbeddingGemma2Tests {
         await #expect(throws: ModelFactoryError.self) {
             try await MultimodalEmbeddingFactory.load(
                 modelDirectory: directory, tokenizerLoader: TestTokenizerLoader())
+        }
+    }
+
+    private struct RegisteredEmbedding: MultimodalEmbedding {
+        let supportedModalities: Set<EmbeddingModality> = [.text]
+        let vector: [Float]
+
+        func embed(_ inputs: sending [EmbeddingInput], task: EmbeddingTask) async throws
+            -> [[Float]]
+        {
+            inputs.map { _ in vector }
+        }
+    }
+
+    @Test
+    func factoryAcceptsApplicationDefinedRegistries() async throws {
+        let directory = try Self.processorDirectory("{}")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let data = Data(#"{"model_type":"application_embedding","vector":[0,1]}"#.utf8)
+        try data.write(to: directory.appendingPathComponent("config.json"))
+        let types = ModelTypeRegistry<MultimodalEmbeddingLoader>()
+        await types.registerModelType("application_embedding") { data in
+            struct Configuration: Decodable { let vector: [Float] }
+            let config = try JSONDecoder().decode(Configuration.self, from: data)
+            return { _, _ in RegisteredEmbedding(vector: config.vector) }
+        }
+        let model = ModelConfiguration(id: "application/embedding")
+        let factory = MultimodalEmbeddingFactory(
+            typeRegistry: types, modelRegistry: AbstractModelRegistry(modelConfigurations: [model]))
+        #expect(factory.contains(id: model.name))
+        #expect(factory.configuration(id: model.name).name == model.name)
+        let embedding = try await factory.load(from: directory, using: TestTokenizerLoader())
+        #expect(try await embedding.embed([.init(text: "Swift")], task: .document) == [[0, 1]])
+        #expect(await embedding.supportedModalities == [.text])
+    }
+
+    private struct CheckpointDownloader: Downloader {
+        let directory: URL
+
+        func download(
+            id: String, revision: String?, matching patterns: [String], useLatest: Bool,
+            progressHandler: @Sendable @escaping (Progress) -> Void
+        ) async throws -> URL {
+            #expect(id == "application/embedding" && revision == "test-revision")
+            #expect(useLatest)
+            #expect(patterns.contains("*.safetensors"))
+            return directory
+        }
+    }
+
+    private struct DirectoryCheckingTokenizerLoader: TokenizerLoader {
+        let expectedDirectory: URL
+
+        func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+            #expect(directory == expectedDirectory)
+            return TestTokenizer()
+        }
+    }
+
+    @Test
+    func factoryPreservesResolvedLoadingOptions() async throws {
+        let directory = try Self.checkpointDirectory(Self.tinyVisionConfig)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let weightsURL = directory.appendingPathComponent("model.safetensors")
+        var weights = try loadArrays(url: weightsURL)
+        let key = try #require(weights.keys.sorted().first { $0.hasPrefix("language_model.") })
+        let value = try #require(weights[key])
+        weights[key] = nil
+        eval(Array(weights.values), value)
+        try save(arrays: weights, url: weightsURL)
+        try save(arrays: [key: value], url: directory.appendingPathComponent("extra.safetensors"))
+        let tokenizerDirectory = directory.appendingPathComponent("separate-tokenizer")
+        var config = ModelConfiguration(
+            id: "application/embedding", revision: "test-revision",
+            tokenizerSource: .directory(tokenizerDirectory))
+        config.weightFileSelection = .allFilesPresent
+        config.excludedComponents = [.vision]
+        let embedding = try await MultimodalEmbeddingFactory.shared.loadContainer(
+            from: CheckpointDownloader(directory: directory),
+            using: DirectoryCheckingTokenizerLoader(expectedDirectory: tokenizerDirectory),
+            configuration: config, useLatest: true)
+        #expect(await embedding.supportedModalities == [.text])
+        let vectors = try await embedding.embed([.init(text: "Swift")], task: .none)
+        #expect(vectors.count == 1 && vectors[0].count == 12)
+        #expect(vectors[0].allSatisfy { $0.isFinite })
+        await #expect(throws: EmbeddingGemma2Embedding.Error.unsupportedMedia) {
+            try await embedding.embed([.init(images: [.url(directory)])], task: .none)
         }
     }
 

@@ -3,16 +3,13 @@
 import Foundation
 import MLXLMCommon
 
-// MARK: - Contract
-
 /// A kind of input that an embedding model places in the same vector space as text.
 public enum EmbeddingModality: Hashable, Sendable {
     case text, image, video, audio
 }
 
 /// The task an embedding is prepared for. Each model renders it as its own instruction.
-/// Use `.searchQuery` for queries and `.document` for corpus items; compared items must
-/// share a task's space.
+/// Use `.searchQuery` for queries and `.document` for corpus items.
 public enum EmbeddingTask: Hashable, Sendable {
     case searchQuery
     case document
@@ -61,47 +58,4 @@ public protocol MultimodalEmbedding: Sendable {
 
     /// Embeds independent items; returns one vector per item, in input order.
     func embed(_ inputs: sending [EmbeddingInput], task: EmbeddingTask) async throws -> [[Float]]
-}
-
-// MARK: - Factory
-
-/// Loads a ``MultimodalEmbedding`` from a local checkpoint by its `model_type`, so callers
-/// need no model-specific code.
-///
-/// ```swift
-/// let embedding = try await MultimodalEmbeddingFactory.load(
-///     modelDirectory: directory, tokenizerLoader: loader)
-/// let vectors = try await embedding.embed(
-///     [.init(text: "Aurora over Balestrino", images: [.url(photo)])], task: .document)
-/// ```
-public enum MultimodalEmbeddingFactory {
-
-    /// The `model_type` values in `config.json` that the factory loads.
-    public static var modelTypes: Set<String> { Set(loaders.keys) }
-
-    /// Loads the checkpoint in `modelDirectory`. Media encoders load on first use, so the
-    /// files must stay readable while the embedding is in use.
-    /// - Throws: `ModelFactoryError.unsupportedModelType(_:)` for other model types.
-    public static func load(
-        modelDirectory: URL, tokenizerLoader: any TokenizerLoader
-    ) async throws -> any MultimodalEmbedding {
-        let configuration = try Data(contentsOf: modelDirectory.appending(component: "config.json"))
-        let modelType = try JSONDecoder.json5().decode(
-            BaseConfiguration.self, from: configuration
-        ).modelType
-        guard let load = loaders[modelType] else {
-            throw ModelFactoryError.unsupportedModelType(modelType)
-        }
-        return try await load(modelDirectory, tokenizerLoader)
-    }
-
-    private typealias Loader =
-        @Sendable (URL, any TokenizerLoader) async throws -> any MultimodalEmbedding
-
-    private static let loaders: [String: Loader] = {
-        let embeddingGemma2: Loader = {
-            try await EmbeddingGemma2Embedding(modelDirectory: $0, tokenizerLoader: $1)
-        }
-        return ["embedding_gemma2": embeddingGemma2, "embedding_gemma2_text": embeddingGemma2]
-    }()
 }

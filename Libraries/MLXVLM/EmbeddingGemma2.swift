@@ -554,21 +554,35 @@ public actor EmbeddingGemma2Embedding: MultimodalEmbedding {
         excludedComponents: Set<ModelComponent> = [],
         componentLoading: ComponentLoading = .onFirstUse
     ) async throws {
+        var configuration = ResolvedModelConfiguration(directory: modelDirectory)
+        configuration.excludedComponents = excludedComponents
+        if !loadVision { configuration.excludedComponents.insert(.vision) }
+        if !loadAudio { configuration.excludedComponents.insert(.audio) }
+        try await self.init(
+            configuration: configuration, tokenizerLoader: tokenizerLoader,
+            componentLoading: componentLoading)
+    }
+
+    package init(
+        configuration: ResolvedModelConfiguration, tokenizerLoader: any TokenizerLoader,
+        componentLoading: ComponentLoading = .onFirstUse
+    ) async throws {
+        let modelDirectory = configuration.modelDirectory
         let configData = try Data(contentsOf: modelDirectory.appendingPathComponent("config.json"))
-        let config = try JSONDecoder().decode(EmbeddingGemma2Configuration.self, from: configData)
+        let config = try JSONDecoder.json5().decode(
+            EmbeddingGemma2Configuration.self, from: configData)
         let model = EmbeddingGemma2(config)
-        let base = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
-        var excluded = excludedComponents
-        if !loadVision { excluded.insert(.vision) }
-        if !loadAudio { excluded.insert(.audio) }
+        let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: base.perLayerQuantization,
-            excludedComponents: excluded, componentLoading: componentLoading)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents, componentLoading: componentLoading
+        )
         try Swift.Task.checkCancellation()
         self.model = model
         self.modelDirectory = modelDirectory
-        self.tokenizer = try await tokenizerLoader.load(from: modelDirectory)
+        self.tokenizer = try await tokenizerLoader.load(from: configuration.tokenizerDirectory)
         var modalities: Set<Modality> = [.text]
         if model.supportedComponents.contains(.vision) {
             modalities.insert(.image)

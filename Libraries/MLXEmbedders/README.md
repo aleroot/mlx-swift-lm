@@ -211,10 +211,13 @@ for models that place text and media in one space. Each model renders the shared
 checkpoint by its `model_type`, so apps need no model-specific code:
 
 ```swift
-let embedding = try await MultimodalEmbeddingFactory.load(
-    modelDirectory: directory, tokenizerLoader: #huggingFaceTokenizerLoader())
+let embedding = try await MultimodalEmbeddingFactory.shared.loadContainer(
+    from: directory, using: #huggingFaceTokenizerLoader())
 if await embedding.supportedModalities.contains(.image) {
     let vectors = try await embedding.embed(
         [.init(text: "Aurora over Tromsø", images: [.url(photoURL)])], task: .document)
 }
 ```
+
+Register custom architectures with
+`MultimodalEmbeddingTypeRegistry.shared.registerModelType(_:creator:)`.
