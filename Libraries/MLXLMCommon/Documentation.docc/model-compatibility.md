@@ -91,17 +91,17 @@ the path of a module and whose namespaces cover every serialized name of that
 module. It lists the parts that can load later as ``OnDemandComponent`` values,
 which live outside the module tree. Their destinations must be optional modules.
 
-A model family declares its components once, as a ``CheckpointLayout``, and every
-model of the family returns the same layout. The loader then reads each part in
-one of three ways. An on-demand part loads on first use. A part whose module the
-model has loads with it. A part the model does not have is never read, such as
-the vision encoder of a VLM checkpoint that a text model loads:
+Models that load the same checkpoints return the same components, so a family
+names its modules once. The loader then reads each part in one of three ways. An
+on-demand part loads on first use. A part whose module the model has loads with
+it. A part the model does not have is never read, such as the vision encoder of a
+VLM checkpoint that a text model loads:
 
 ```swift
-package enum Gemma4Checkpoint: CheckpointLayout {
+package enum Gemma4Checkpoint {
     package static let components: [ModelComponent: [CheckpointComponent]] = [
-        .vision: modules("vision_tower", "vision_embedder", "embed_vision"),
-        .audio: modules("audio_tower", "embed_audio"),
+        .vision: .modules("vision_tower", "vision_embedder", "embed_vision"),
+        .audio: .modules("audio_tower", "embed_audio"),
     ]
 }
 
@@ -124,7 +124,8 @@ share one load. The checkpoint files must stay readable until then.
 Model conversion loads with ``ComponentLoading/immediate`` because it saves every
 weight. It rebuilds modules that an earlier on-demand load removed. List an
 on-demand component in ``ModelConfiguration/excludedComponents`` to never load
-it. Inputs that need it then fail with an error.
+it. Inputs that need it then fail with an error. A built-in component still
+loads, and the loader logs a warning.
 
 ``BaseLanguageModel/excludedCheckpointNamespaces`` is the same read filter for
 namespaces that a model never loads. An embedded Qwen MTP drafter excludes the

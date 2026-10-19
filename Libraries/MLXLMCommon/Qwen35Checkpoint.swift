@@ -41,6 +41,11 @@ package struct Qwen35CheckpointPolicy: Sendable {
         name: "vision_tower", namespaces: ["vision_tower", "model.visual", "visual"],
         destination: "vision_tower")
 
+    /// The components a Qwen 3.5 checkpoint can carry.
+    package static let components: [ModelComponent: [CheckpointComponent]] = [
+        .vision: [visionComponent]
+    ]
+
     /// Target namespaces an embedded head drops on selection, so the loader need not read them.
     package var excludedCheckpointNamespaces: [String] {
         layout == .embedded ? Self.mtpComponent.excludedNamespaces : []
@@ -263,10 +268,4 @@ package struct Qwen35CheckpointPolicy: Sendable {
             }
         }
     }
-}
-
-extension Qwen35CheckpointPolicy: CheckpointLayout {
-    package static let components: [ModelComponent: [CheckpointComponent]] = [
-        .vision: [visionComponent]
-    ]
 }

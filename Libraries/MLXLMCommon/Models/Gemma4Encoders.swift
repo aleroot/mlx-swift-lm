@@ -1102,9 +1102,9 @@ final class Gemma4AudioEncoderLayer: Module {
 
 /// The encoders a Gemma 4 checkpoint can carry. `vision_embedder` is the encoder-free vision
 /// module of `gemma4_unified`.
-package enum Gemma4Checkpoint: CheckpointLayout {
+package enum Gemma4Checkpoint {
     package static let components: [ModelComponent: [CheckpointComponent]] = [
-        .vision: modules("vision_tower", "vision_embedder", "embed_vision"),
-        .audio: modules("audio_tower", "embed_audio"),
+        .vision: .modules("vision_tower", "vision_embedder", "embed_vision"),
+        .audio: .modules("audio_tower", "embed_audio"),
     ]
 }

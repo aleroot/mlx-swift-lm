@@ -25,6 +25,8 @@ public struct ModelComponent: Hashable, Sendable, CustomStringConvertible {
     public static let audio = ModelComponent("audio")
 }
 
+private let logger = Logger(subsystem: "mlx-swift-lm", category: "model-component")
+
 /// When a load reads the components that a model can load on first use.
 public enum ComponentLoading: Sendable {
     /// Load each of ``ModelComponentsProviding/onDemandComponents`` the first time an input needs
@@ -48,9 +50,6 @@ public enum ComponentLoading: Sendable {
 ///
 /// The module tree does not change after the load. An on-demand component loads later through
 /// the same ``BaseLanguageModel/prepareCheckpoint(_:)``, quantization and validation as the model.
-///
-/// Declare the components of a model family once, as a ``CheckpointLayout``, and return its
-/// ``CheckpointLayout/components`` from every model of the family.
 public protocol ModelComponentsProviding: BaseLanguageModel {
     /// The checkpoint components that make up each model component.
     ///
@@ -58,6 +57,19 @@ public protocol ModelComponentsProviding: BaseLanguageModel {
     /// optional when the component loads on demand. Its ``CheckpointComponent/namespaces`` list
     /// every serialized prefix of the module's tensors, as they appear before
     /// ``BaseLanguageModel/prepareCheckpoint(_:)``.
+    ///
+    /// Models that load the same checkpoints return the same value, so a family names its
+    /// modules once:
+    ///
+    /// ```swift
+    /// enum CaptionerCheckpoint {
+    ///     static let components: [ModelComponent: [CheckpointComponent]] = [
+    ///         .vision: .modules("vision_tower", "embed_vision")
+    ///     ]
+    /// }
+    ///
+    /// var modelComponents: [ModelComponent: [CheckpointComponent]] { CaptionerCheckpoint.components }
+    /// ```
     var modelComponents: [ModelComponent: [CheckpointComponent]] { get }
 
     /// Components that load the first time an input needs them. The default is empty.
@@ -68,27 +80,10 @@ extension ModelComponentsProviding {
     public var onDemandComponents: [AnyOnDemandComponent] { [] }
 }
 
-/// The components that the checkpoints of a model family can carry.
-///
-/// Every model of the family returns the same layout, whichever components it runs:
-///
-/// ```swift
-/// enum CaptionerCheckpoint: CheckpointLayout {
-///     static let components: [ModelComponent: [CheckpointComponent]] = [
-///         .vision: modules("vision_tower", "embed_vision")
-///     ]
-/// }
-///
-/// var modelComponents: [ModelComponent: [CheckpointComponent]] { CaptionerCheckpoint.components }
-/// ```
-public protocol CheckpointLayout {
-    static var components: [ModelComponent: [CheckpointComponent]] { get }
-}
-
-extension CheckpointLayout {
+extension [CheckpointComponent] {
     /// Top-level modules that checkpoints store under their own name, with or without the
     /// `model.` scope.
-    public static func modules(_ names: String...) -> [CheckpointComponent] {
+    public static func modules(_ names: String...) -> Self {
         names.map {
             CheckpointComponent(name: $0, namespaces: [$0, "model.\($0)"], destination: $0)
         }
@@ -267,8 +262,16 @@ func prepareComponents(
     var unread = [String]()
     for (component, parts) in model.modelComponents {
         let holder = onDemand[component]
-        // A built-in component always loads.
+        let isBuiltIn = holder == nil && parts.contains { attached.contains($0.destination) }
         let isExcluded = holder != nil && excluded.contains(component)
+        if isBuiltIn && excluded.contains(component) {
+            logger.warning(
+                """
+                \(type(of: model)) loads its built-in \(component) component: \
+                excludedComponents only skips on-demand components.
+                """
+            )
+        }
         let deferred = holder != nil && loading == .onFirstUse && !isExcluded
         holder?.setSource(
             deferred

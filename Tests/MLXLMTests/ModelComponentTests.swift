@@ -18,7 +18,7 @@ private final class Connector: Module {
 }
 
 /// A vision tower, and a vision projection nested in a module that the text model shares.
-private enum CaptionerCheckpoint: CheckpointLayout {
+private enum CaptionerCheckpoint {
     static let components: [ModelComponent: [CheckpointComponent]] = [
         .vision: [
             CheckpointComponent(
