@@ -1282,16 +1282,17 @@ extension MuseGlimmer: LoRAModel {
     }
 }
 
+// The bf16 vision stack is ~3.7 GB. With it, the 4-bit model exceeds the wired limit of a
+// 24 GB Mac.
+enum MuseGlimmerCheckpoint: CheckpointLayout {
+    static let components: [ModelComponent: [CheckpointComponent]] = [
+        .vision: modules("vision_tower", "vision_adapter", "vision_projection")
+    ]
+}
+
 extension MuseGlimmer: ModelComponentsProviding {
-    // The bf16 vision stack is ~3.7 GB. With it, the 4-bit model exceeds the wired limit of a
-    // 24 GB Mac.
     public var modelComponents: [ModelComponent: [CheckpointComponent]] {
-        let modules = ["vision_tower", "vision_adapter", "vision_projection"]
-        return [
-            .vision: modules.map {
-                CheckpointComponent(name: $0, namespaces: [$0, "model.\($0)"], destination: $0)
-            }
-        ]
+        MuseGlimmerCheckpoint.components
     }
 
     public var onDemandComponents: [AnyOnDemandComponent] { [onDemandVision] }
