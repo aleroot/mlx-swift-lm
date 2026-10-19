@@ -12,6 +12,14 @@ public typealias EmbeddingGemma2Configuration = MLXLMCommon.EmbeddingGemma2Confi
 /// The shared EmbeddingGemma 2 encoder.
 public typealias EmbeddingGemma2 = MLXLMCommon.EmbeddingGemma2
 
+#if compiler(>=6.2)
+private let embeddingImageContext = CIContext(options: [.cacheIntermediates: false])
+#else
+nonisolated(unsafe) private let embeddingImageContext = CIContext(options: [
+    .cacheIntermediates: false
+])
+#endif
+
 // MARK: - Image Preparation
 
 /// Prepares images as the reference `Gemma4ImageProcessor` does: the target size and
@@ -63,19 +71,84 @@ package struct EmbeddingGemma2ImageProcessor: Sendable {
 
     /// `[1, 3, height, width]` pixels in `0...1`.
     static func pixels(_ image: CIImage, height: Int, width: Int) -> MLXArray {
-        let pixels = MediaProcessing.asMLXArray(image)
-        guard pixels.dim(2) != height || pixels.dim(3) != width else { return pixels }
+        let bounds = image.extent
+        let sourceWidth = Int(bounds.width.rounded())
+        let sourceHeight = Int(bounds.height.rounded())
+        // Half precision keeps JPEG's extended range without a full-size float32 buffer.
+        var data = Data(count: sourceWidth * sourceHeight * 8)
+        data.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            embeddingImageContext.render(
+                image, toBitmap: base, rowBytes: sourceWidth * 8, bounds: bounds,
+                format: .RGBAh, colorSpace: nil)
+            embeddingImageContext.clearCaches()
+        }
+        let pixels = MLXArray(data, [1, sourceHeight, sourceWidth, 4], type: Float16.self)[
+            0..., 0..., 0..., ..<3
+        ].transposed(0, 3, 1, 2)
+        guard sourceHeight != height || sourceWidth != width else {
+            return pixels.asType(.float32)
+        }
         return resized(pixels, height: height, width: width)
     }
 
     /// Separable resize as two matrix products, rounded to 8 bits like the reference's
-    /// `uint8` output.
+    /// `uint8` output. Each pass reads only the nonzero weights and casts pixels as it reads.
     static func resized(_ pixels: MLXArray, height: Int, width: Int) -> MLXArray {
-        let rows = bicubicWeights(input: pixels.dim(2), output: height)
-        let columns = bicubicWeights(input: pixels.dim(3), output: width)
-        let resized = matmul(matmul(rows, pixels), columns.transposed())
-        return round(clip(resized * 255, min: 0, max: 255)) / 255
+        if Device.defaultDevice().deviceType == .cpu {
+            let rows = bicubicWeights(input: pixels.dim(2), output: height)
+            let columns = bicubicWeights(input: pixels.dim(3), output: width)
+            let resized = matmul(matmul(rows, pixels.asType(.float32)), columns.transposed())
+            return round(clip(resized * 255, min: 0, max: 255)) / 255
+        }
+        var pixels = pixels
+        for (axis, length) in [(2, height), (3, width)] where pixels.dim(axis) != length {
+            let weights = bicubicWeights(input: pixels.dim(axis), output: length)
+            let parameters = MLXArray([
+                Int32(pixels.dim(2)), Int32(pixels.dim(3)), Int32(length),
+                Int32(axis),
+            ])
+            var shape = pixels.shape
+            shape[axis] = length
+            pixels =
+                resizeAxis(
+                    [pixels, weights, parameters],
+                    grid: (shape[3], shape[2], shape[0] * shape[1]),
+                    threadGroup: (32, 8, 1), outputShapes: [shape], outputDTypes: [.float32]
+                )[0]
+        }
+        return round(clip(pixels * 255, min: 0, max: 255)) / 255
     }
+
+    private static let resizeAxis = MLXFast.metalKernel(
+        name: "embedding_gemma2_resize_axis",
+        inputNames: ["pixels", "weights", "parameters"], outputNames: ["output"],
+        source: """
+            const int x = thread_position_in_grid.x;
+            const int y = thread_position_in_grid.y;
+            const int channel = thread_position_in_grid.z;
+            const int inH = parameters[0], inW = parameters[1], length = parameters[2];
+            const bool vertical = parameters[3] == 2;
+            const int outH = vertical ? length : inH, outW = vertical ? inW : length;
+            if (x >= outW || y >= outH) return;
+            const int inputLength = vertical ? inH : inW;
+            const int position = vertical ? y : x;
+            const float scale = float(inputLength) / float(length);
+            const float support = 2.0f * max(scale, 1.0f);
+            const float center = (float(position) + 0.5f) * scale;
+            const int first = max(0, int(center - support) - 1);
+            const int last = min(inputLength, int(center + support) + 2);
+            float value = 0;
+            for (int i = first; i < last; ++i) {
+                const int offset = vertical
+                    ? (channel * inH + i) * inW + x
+                    : (channel * inH + y) * inW + i;
+                const float sample = float(pixels[offset]);
+                value += sample * weights[position * inputLength + i];
+            }
+            output[(channel * outH + y) * outW + x] = value;
+            """
+    )
 
     /// `[output, input]` interpolation weights of the antialiased bicubic filter
     /// (a = -0.5) of Pillow and torchvision.

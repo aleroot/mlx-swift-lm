@@ -505,6 +505,63 @@ struct EmbeddingGemma2Tests {
         }
     }
 
+    @Test(
+        arguments: [
+            (37, 53, 11, 17), (37, 53, 37, 17), (37, 53, 11, 53),
+            (7, 11, 19, 23), (1, 53, 1, 17), (37, 1, 11, 1),
+        ], [false, true])
+    func compactResizeMatchesDenseFloatReference(size: (Int, Int, Int, Int), cpu: Bool) throws {
+        let (sourceHeight, sourceWidth, height, width) = size
+        let bytes = (0 ..< 3 * sourceHeight * sourceWidth).map { UInt8(($0 * 37 + $0 / 13) % 256) }
+        let pixels = MLXArray(bytes, [1, 3, sourceHeight, sourceWidth]).asType(.float32) / 255
+        let compact = pixels.asType(.float16)
+        let rows = EmbeddingGemma2ImageProcessor.bicubicWeights(input: sourceHeight, output: height)
+        let columns = EmbeddingGemma2ImageProcessor.bicubicWeights(
+            input: sourceWidth, output: width)
+        let dense = matmul(matmul(rows, pixels), columns.transposed())
+        let expected = round(clip(dense * 255, min: 0, max: 255)) / 255
+        let actual = Device.withDefaultDevice(cpu ? .cpu : .gpu) {
+            EmbeddingGemma2ImageProcessor.resized(compact, height: height, width: width)
+        }
+        try MLX.checkedEval(actual, expected)
+        #expect(actual.shape == [1, 3, height, width])
+        #expect(abs(actual - expected).max().item(Float.self) <= 1.0 / 255 + 1e-7)
+    }
+
+    @Test(arguments: ["public.png", "public.jpeg"])
+    func compactImageRenderPreservesFloatPipelinePixels(type: String) throws {
+        let width = 53
+        let height = 37
+        let bytes = Data((0 ..< width * height * 4).map { UInt8(($0 * 37 + $0 / 13) % 256) })
+        let bitmap = CIImage(
+            bitmapData: bytes, bytesPerRow: width * 4,
+            size: CGSize(width: width, height: height), format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        let cgImage = try #require(CIContext().createCGImage(bitmap, from: bitmap.extent))
+        let encoded = NSMutableData()
+        let destination = try #require(
+            CGImageDestinationCreateWithData(encoded, type as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        #expect(CGImageDestinationFinalize(destination))
+        let image = try EmbeddingGemma2ImageProcessor.prepared(
+            #require(CIImage(data: encoded as Data)))
+        let original = MediaProcessing.asMLXArray(image)
+        for (targetHeight, targetWidth) in [(height, width), (11, 17)] {
+            let rows = EmbeddingGemma2ImageProcessor.bicubicWeights(
+                input: height, output: targetHeight)
+            let columns = EmbeddingGemma2ImageProcessor.bicubicWeights(
+                input: width, output: targetWidth)
+            let dense = matmul(matmul(rows, original), columns.transposed())
+            let expected =
+                targetHeight == height && targetWidth == width
+                ? original : round(clip(dense * 255, min: 0, max: 255)) / 255
+            let actual = EmbeddingGemma2ImageProcessor.pixels(
+                image, height: targetHeight, width: targetWidth)
+            try MLX.checkedEval(actual, expected)
+            #expect(abs(actual - expected).max().item(Float.self) <= 1.0 / 255 + 1e-7)
+        }
+    }
+
     /// Expected rows come from the Transformers float32 implementation with the same
     /// deterministic weights, followed by masked mean pooling and L2 normalization.
     @Test
