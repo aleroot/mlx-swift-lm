@@ -512,7 +512,11 @@ struct EmbeddingGemma2Tests {
         ], [false, true])
     func compactResizeMatchesDenseFloatReference(size: (Int, Int, Int, Int), cpu: Bool) throws {
         let (sourceHeight, sourceWidth, height, width) = size
-        let bytes = (0 ..< 3 * sourceHeight * sourceWidth).map { UInt8(($0 * 37 + $0 / 13) % 256) }
+        let byteCount = 3 * sourceHeight * sourceWidth
+        let bytes: [UInt8] = (0 ..< byteCount).map { (index: Int) -> UInt8 in
+            let value = index * 37 + index / 13
+            return UInt8(value % 256)
+        }
         let pixels = MLXArray(bytes, [1, 3, sourceHeight, sourceWidth]).asType(.float32) / 255
         let compact = pixels.asType(.float16)
         let rows = EmbeddingGemma2ImageProcessor.bicubicWeights(input: sourceHeight, output: height)
@@ -532,7 +536,12 @@ struct EmbeddingGemma2Tests {
     func compactImageRenderPreservesFloatPipelinePixels(type: String) throws {
         let width = 53
         let height = 37
-        let bytes = Data((0 ..< width * height * 4).map { UInt8(($0 * 37 + $0 / 13) % 256) })
+        let byteCount = width * height * 4
+        let pixelBytes: [UInt8] = (0 ..< byteCount).map { (index: Int) -> UInt8 in
+            let value = index * 37 + index / 13
+            return UInt8(value % 256)
+        }
+        let bytes = Data(pixelBytes)
         let bitmap = CIImage(
             bitmapData: bytes, bytesPerRow: width * 4,
             size: CGSize(width: width, height: height), format: .RGBA8,
