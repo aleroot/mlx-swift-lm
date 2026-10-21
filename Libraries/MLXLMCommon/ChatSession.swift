@@ -176,14 +176,6 @@ public final class ChatSession {
             let prefill: PrefillCheckpoint
         }
 
-        /// The checkpoint, while the ledger still holds its tokens and `cache` can return to it.
-        func checkpoint(restorableIn cache: KVCacheStorage) -> Checkpoint? {
-            guard let checkpoint, cachedTokens.starts(with: checkpoint.tokens),
-                cache.canRestore(checkpoint.prefill.cache)
-            else { return nil }
-            return checkpoint
-        }
-
         @discardableResult
         mutating func record(
             _ assistant: AssistantGeneration,
@@ -197,6 +189,7 @@ public final class ChatSession {
                 // the ledger and rebuild from the retained messages.
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoint = nil
                 return false
             }
 
@@ -215,6 +208,7 @@ public final class ChatSession {
                 // un-emitted lookahead).
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+                checkpoint = nil
             }
 
             var message = Chat.Message.assistant(
@@ -1058,6 +1052,7 @@ public final class ChatSession {
                             // rather than silently continuing with the old cache policy.
                             restored.cachedTokens.removeAll()
                             restored.uncommittedTokens.removeAll()
+                            restored.checkpoint = nil
                             kvCache = KVCacheStorage(
                                 try model.newCache(parameters: generateParameters),
                                 plan: kvCachePlan)
@@ -1204,7 +1199,6 @@ public final class ChatSession {
                                 structuredToolCallCount: structuredToolCallCount,
                                 usesSpeculativeDecoding: speculativeDecoding != nil,
                                 canSplitPreparedMedia: model is PreparedInputSplitting)
-                            let checkpoint = currentConversation.checkpoint(restorableIn: kvCache)
                             let cacheState = PromptCacheState(
                                 cachedTokens: cachedTokenIds,
                                 processedTokenCount: kvCache.processedTokenCount,
@@ -1213,7 +1207,7 @@ public final class ChatSession {
                                 draftCacheIsAligned: draftCacheIsAligned,
                                 maxTrimCount: (kvCache.cache + (draftKVCache?.cache ?? []))
                                     .map(\.maxTrimCount).min() ?? 0,
-                                checkpointLength: checkpoint?.tokens.count)
+                                checkpointLength: currentConversation.checkpoint?.tokens.count)
 
                             var decision = promptCachePolicy.decide(turn: turn, cache: cacheState)
 
@@ -1236,7 +1230,10 @@ public final class ChatSession {
                                     decision = .rebuild
                                 }
                             case .restoreCheckpoint:
-                                if let checkpoint, kvCache.restore(checkpoint.prefill.cache) {
+                                if let checkpoint = currentConversation.checkpoint,
+                                    cachedTokenIds.starts(with: checkpoint.tokens),
+                                    kvCache.restore(checkpoint.prefill.cache)
+                                {
                                     lmState = checkpoint.prefill.state
                                 } else {
                                     decision = .rebuild
@@ -1307,6 +1304,7 @@ public final class ChatSession {
                                 cachedPromptTokenCount = prefixLength
 
                             case .rebuild:
+                                currentConversation.checkpoint = nil
                                 kvCache = KVCacheStorage(
                                     try model.newCache(parameters: generateParameters),
                                     plan: kvCachePlan)
@@ -1339,10 +1337,11 @@ public final class ChatSession {
                             // any prefilled reasoning block and the token sampled from.
                             let heldBack = max(1, prefilledReasoning?.tokenCount ?? 0)
                             if templateMessages.last?.role == .user,
-                                !kvCache.canRewindToAnyPosition,
-                                input.image == nil, input.video == nil, input.audio == nil,
+                                generateParameters.prefill.chunking == .balanced,
+                                !containsNewMedia, !carriesPreparedMedia, draftKVCache == nil,
                                 input.text.mask == nil,
-                                input.text.cacheSequenceLength >= heldBack
+                                input.text.cacheSequenceLength >= heldBack,
+                                kvCache.needsCheckpoint
                             {
                                 checkpointPosition = input.text.cacheSequenceLength - heldBack
                             }
