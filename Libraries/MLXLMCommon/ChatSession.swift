@@ -210,11 +210,22 @@ public final class ChatSession {
     }
 
     private struct GenerationRun {
-        let stream: AsyncStream<Generation>
+        enum Events {
+            case details(AsyncStream<Generation>)
+            case probabilities(AsyncStream<LogProbabilityGeneration<Generation>>)
+        }
+
+        let events: Events
         let task: Task<[Int], Never>
 
         init(_ pair: (AsyncStream<Generation>, Task<[Int], Never>)) {
-            (stream, task) = pair
+            events = .details(pair.0)
+            task = pair.1
+        }
+
+        init(_ pair: (AsyncStream<LogProbabilityGeneration<Generation>>, Task<[Int], Never>)) {
+            events = .probabilities(pair.0)
+            task = pair.1
         }
     }
 
@@ -940,6 +951,56 @@ public final class ChatSession {
         }
     }
 
+    /// Errors from the token log-probability stream.
+    public enum LogProbabilityError: LocalizedError {
+        /// The selected speculative iterator cannot report token log probabilities.
+        case unsupportedSpeculativeDecoding
+
+        public var errorDescription: String? {
+            switch self {
+            case .unsupportedSpeculativeDecoding:
+                "Token log probabilities are unavailable with active speculative decoding. Use standard decoding for observation."
+            }
+        }
+    }
+
+    /// Stream details and token log probabilities from this response in generation order.
+    ///
+    /// `logProbabilities` is the number of top candidates; `0` reports only the chosen
+    /// token. It overrides the session's reporting setting for this call, including
+    /// automatic tool restarts. Excluded stop tokens and lookahead are omitted.
+    /// Each pass ends with a wrapped completion event before the next pass starts.
+    /// Active speculative decoding throws
+    /// ``LogProbabilityError/unsupportedSpeculativeDecoding``.
+    public func streamDetails(
+        to prompt: String,
+        role: Chat.Message.Role = .user,
+        images: consuming [UserInput.Image] = [],
+        videos: consuming [UserInput.Video] = [],
+        audios: consuming [UserInput.Audio] = [],
+        logProbabilities: Int
+    ) -> AsyncThrowingStream<LogProbabilityGeneration<Generation>, Error> {
+        streamMap(
+            to: prompt, role: role, images: images, videos: videos, audios: audios,
+            logProbabilities: logProbabilities,
+            transformProbability: { .probability($0) }
+        ) { .generation($0) }
+    }
+
+    /// Stream details and token log probabilities after appending structured messages.
+    ///
+    /// Reporting has the same behavior as the prompt overload and applies only to
+    /// this call. The session retains its transcript and KV cache.
+    public func streamDetails(
+        to messages: consuming [Chat.Message],
+        logProbabilities: Int
+    ) -> AsyncThrowingStream<LogProbabilityGeneration<Generation>, Error> {
+        streamMap(
+            messages: messages, logProbabilities: logProbabilities,
+            transformProbability: { .probability($0) }
+        ) { .generation($0) }
+    }
+
     /// Produces a streaming response to a prompt by transforming the
     /// raw `Generation` values.
     ///
@@ -956,6 +1017,8 @@ public final class ChatSession {
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = [],
         failOnRejectedToolCall: Bool = false,
+        logProbabilities: Int? = nil,
+        transformProbability: (@Sendable (GenerateTokenLogProbabilities) -> R)? = nil,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         streamMap(
@@ -963,6 +1026,8 @@ public final class ChatSession {
                 .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
             ],
             failOnRejectedToolCall: failOnRejectedToolCall,
+            logProbabilities: logProbabilities,
+            transformProbability: transformProbability,
             transform: transform
         )
     }
@@ -970,6 +1035,8 @@ public final class ChatSession {
     private func streamMap<R: Sendable>(
         messages: consuming [Chat.Message],
         failOnRejectedToolCall: Bool = false,
+        logProbabilities: Int? = nil,
+        transformProbability: (@Sendable (GenerateTokenLogProbabilities) -> R)? = nil,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
@@ -978,11 +1045,15 @@ public final class ChatSession {
         // and are only being sent to the inner async
         let inputMessages = SendableBox<[Chat.Message]>(messages)
 
+        var parameters = generateParameters
+        if let logProbabilities { parameters.logProbabilities = logProbabilities }
+
         let task = Task {
             [
                 model,
                 instructions, processing, tools, toolDispatch,
-                additionalContext, cache, loadedDraftModel, generateParameters, components,
+                additionalContext, cache, loadedDraftModel, generateParameters = parameters,
+                components,
                 speculativeDecoding
             ] in
             do {
@@ -1337,6 +1408,24 @@ public final class ChatSession {
                                 parameters: generateParameters, components: components)
                             lmState = iterator.state
 
+                            if logProbabilities != nil {
+                                return GenerationRun(
+                                    MLXLMCommon.generateTaskRecordingTokens(
+                                        promptTokenCount: input.text.tokens.size,
+                                        modelConfiguration: modelConfiguration,
+                                        tokenizer: tokenizer,
+                                        iterator: iterator,
+                                        handler: LogProbabilityTokenLoopHandler(
+                                            TextToolTokenLoopHandler(
+                                                tokenizer: tokenizer,
+                                                stopStrings: modelConfiguration
+                                                    .effectiveStopStrings,
+                                                format: modelConfiguration.toolCallFormat ?? .json,
+                                                tools: toolValidationSchemas,
+                                                toolCallPolicy: generateParameters.toolCallPolicy)))
+                                )
+                            }
+
                             return GenerationRun(
                                 MLXLMCommon.generateTaskRecordingTokens(
                                     promptTokenCount: input.text.tokens.size,
@@ -1410,6 +1499,10 @@ public final class ChatSession {
 
                                     generation = try defaultGeneration()
                                 } else {
+                                    if logProbabilities != nil {
+                                        throw LogProbabilityError.unsupportedSpeculativeDecoding
+                                    }
+
                                     if cachedDraftContainer == nil {
                                         await loadedDraftModel.update { storedDraftModel in
                                             if storedDraftModel == nil {
@@ -1480,7 +1573,16 @@ public final class ChatSession {
                         var assistant = AssistantGeneration(
                             prefilledReasoningStartDelimiter: prefilledReasoningStartDelimiter)
 
-                        for await item in generation.stream {
+                        func emit(_ value: R) -> Bool {
+                            if case .terminated = continuation.yield(value) {
+                                assistant.wasTerminatedByConsumer = true
+                                generation.task.cancel()
+                                return false
+                            }
+                            return true
+                        }
+
+                        func consume(_ item: Generation) -> Bool {
                             let item = item.attributingCachedPromptTokens(cachedPromptTokenCount)
                             assistant.consume(item)
 
@@ -1490,10 +1592,25 @@ public final class ChatSession {
                             if let toolCall = item.toolCall, toolDispatch != nil {
                                 pendingToolCalls.append(toolCall)
                             } else if let value = transform(item) {
-                                if case .terminated = continuation.yield(value) {
-                                    assistant.wasTerminatedByConsumer = true
-                                    generation.task.cancel()
-                                    break
+                                return emit(value)
+                            }
+                            return true
+                        }
+
+                        switch generation.events {
+                        case .details(let events):
+                            for await item in events {
+                                if !consume(item) { break }
+                            }
+                        case .probabilities(let events):
+                            observed: for await event in events {
+                                switch event {
+                                case .generation(let item):
+                                    if !consume(item) { break observed }
+                                case .probability(let values):
+                                    if let value = transformProbability?(values), !emit(value) {
+                                        break observed
+                                    }
                                 }
                             }
                         }

@@ -217,6 +217,44 @@ public class ChatSessionToolRoundTripTests: XCTestCase {
         XCTAssertEqual(function["name"] as? String, "get_weather")
     }
 
+    func testTokenObservationOrdersEachAutomaticToolPassBeforeItsCompletion() async throws {
+        let log = MessageLog()
+        let dispatched = DispatchLog()
+        let context = Self.makeContext(
+            tokenizer: ScriptedToolCallTokenizer(),
+            messageGenerator: RecordingMessageGenerator(log: log))
+        let session = ChatSession(
+            context, generateParameters: GenerateParameters(maxTokens: 24, temperature: 0),
+            tools: [Self.weatherTool],
+            toolDispatch: { call in
+                dispatched.record(call)
+                return #"{"forecast": "sunny"}"#
+            })
+        var passTokens = 0
+        var completions = 0
+        var reply = ""
+        for try await event in session.streamDetails(
+            to: "What's the weather in Paris?", logProbabilities: 2)
+        {
+            switch event {
+            case .probability:
+                passTokens += 1
+            case .generation(let generation):
+                if let chunk = generation.chunk { reply += chunk }
+                if let info = generation.info {
+                    XCTAssertEqual(passTokens, info.generationTokenCount)
+                    XCTAssertGreaterThan(passTokens, 0)
+                    passTokens = 0
+                    completions += 1
+                }
+            }
+        }
+        XCTAssertFalse(reply.isEmpty)
+        XCTAssertEqual(dispatched.all.count, 1)
+        XCTAssertEqual(completions, 2)
+        XCTAssertEqual(passTokens, 0)
+    }
+
     func testGenerationPolicyControlsValidationBeforeAutomaticDispatch() async throws {
         let restrictedTool: ToolSpec = [
             "type": "function",

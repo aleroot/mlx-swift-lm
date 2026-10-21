@@ -550,6 +550,227 @@ public class ChatSessionTests: XCTestCase {
 
     private let targetLength = 1
 
+    func testExistingSessionAPIAndExhaustiveEventSwitchesRemainCompatible() async throws {
+        func classify(_ error: ChatSessionError) -> Int {
+            switch error {
+            case .noCacheAvailable: 0
+            case .emptyPreparedInput: 1
+            case .kvCacheConfigurationChanged: 2
+            }
+        }
+        func classify(_ event: Generation) -> Int {
+            switch event {
+            case .chunk: 0
+            case .toolCall: 1
+            case .rejectedToolCall: 2
+            case .info: 3
+            }
+        }
+        func classify(_ event: TokenGeneration) -> Int {
+            switch event {
+            case .token: 0
+            case .info: 1
+            }
+        }
+        XCTAssertEqual(classify(ChatSessionError.noCacheAvailable), 0)
+        XCTAssertEqual(classify(ChatSessionError.emptyPreparedInput), 1)
+        XCTAssertEqual(
+            classify(ChatSessionError.kvCacheConfigurationChanged(previous: nil, requested: nil)), 2
+        )
+        XCTAssertEqual(classify(Generation.chunk("text")), 0)
+        XCTAssertEqual(classify(TokenGeneration.token(1)), 0)
+
+        let session = ChatSession(
+            model(), generateParameters: GenerateParameters(maxTokens: 1, temperature: 0),
+            components: GenerationComponents { ForceTokenProcessor(token: 1) })
+        let promptDetails:
+            (String, Chat.Message.Role, [UserInput.Image], [UserInput.Video], [UserInput.Audio]) ->
+                AsyncThrowingStream<Generation, Error> = session.streamDetails
+        let messageDetails: ([Chat.Message]) -> AsyncThrowingStream<Generation, Error> = session
+            .streamDetails
+        let prompt = try await collectGeneration(promptDetails("first", .user, [], [], []))
+        let messages = try await collectGeneration(messageDetails([.user("second")]))
+        XCTAssertEqual(prompt.info.generationTokenCount, 1)
+        XCTAssertEqual(messages.info.generationTokenCount, 1)
+    }
+
+    private func collectObservedGeneration(
+        _ stream: AsyncThrowingStream<LogProbabilityGeneration<Generation>, Error>
+    ) async throws -> (
+        text: String, info: GenerateCompletionInfo, probabilities: [GenerateTokenLogProbabilities]
+    ) {
+        var text = ""
+        var info: GenerateCompletionInfo?
+        var probabilities: [GenerateTokenLogProbabilities] = []
+        for try await event in stream {
+            switch event {
+            case .probability(let values): probabilities.append(values)
+            case .generation(let generation):
+                if let chunk = generation.chunk { text += chunk }
+                if let completion = generation.info { info = completion }
+            }
+        }
+        return (text, try XCTUnwrap(info), probabilities)
+    }
+
+    func testTokenObservationPreservesCachedContinuationAndIsScopedToTheCall() async throws {
+        let (_, continuation) = AsyncStream<Int>.makeStream()
+        defer { continuation.finish() }
+        let processor = TestInputProcessor(
+            tokenizer: PrefixPreservingTokenizer(renderedLengthContinuation: continuation),
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let container = ModelContainer(context: model(processor: processor))
+        let parameters = GenerateParameters(maxTokens: 3, temperature: 0)
+        let components = GenerationComponents { ForceTokenProcessor(token: 1) }
+        let plain = ChatSession(container, generateParameters: parameters, components: components)
+        let observed = ChatSession(
+            container, generateParameters: parameters, components: components)
+        for prompt in ["first", "second"] {
+            let expected = try await collectGeneration(plain.streamDetails(to: prompt))
+            let actual = try await collectObservedGeneration(
+                observed.streamDetails(to: prompt, logProbabilities: 4))
+            XCTAssertEqual(actual.text, expected.text)
+            XCTAssertEqual(actual.info.generationTokenCount, expected.info.generationTokenCount)
+            XCTAssertEqual(actual.info.cachedPromptTokenCount, expected.info.cachedPromptTokenCount)
+            if prompt == "second" { XCTAssertGreaterThan(actual.info.cachedPromptTokenCount, 0) }
+            XCTAssertEqual(actual.probabilities.count, 3)
+            XCTAssertTrue(
+                actual.probabilities.allSatisfy {
+                    $0.chosen.token == 1 && $0.chosen.logProbability == 0
+                        && $0.topLogProbabilities.count == 4
+                })
+            XCTAssertNil(observed.generateParameters.logProbabilities)
+        }
+        let ordinary = try await collectGeneration(
+            observed.streamDetails(to: "without observation"))
+        XCTAssertEqual(ordinary.info.generationTokenCount, 3)
+    }
+
+    func testTokenObservationOmitsStopAndLookaheadForBothEntryPoints() async throws {
+        for limit in [1, 3, 4, 10] {
+            let session = rejectionSession(output: "abc")
+            session.generateParameters.maxTokens = limit
+            let stream =
+                limit.isMultiple(of: 2)
+                ? session.streamDetails(to: [.user("test")], logProbabilities: 0)
+                : session.streamDetails(to: "test", logProbabilities: 0)
+            let result = try await collectObservedGeneration(stream)
+            XCTAssertEqual(result.text, String("abc".prefix(min(limit, 3))))
+            XCTAssertEqual(result.probabilities.count, result.info.generationTokenCount)
+            XCTAssertEqual(result.probabilities.count, min(limit, 3))
+            XCTAssertTrue(
+                result.probabilities.allSatisfy {
+                    $0.topLogProbabilities.isEmpty && $0.chosen.logProbability == 0
+                })
+            XCTAssertFalse(result.probabilities.contains { $0.chosen.token == 99 })
+        }
+    }
+
+    func testTokenObservationOverridesReportingOnlyForThisCall() async throws {
+        let session = rejectionSession(output: "abc")
+        session.generateParameters.logProbabilities = 3
+        let result = try await collectObservedGeneration(
+            session.streamDetails(to: "test", logProbabilities: 0))
+        XCTAssertEqual(result.text, "abc")
+        XCTAssertEqual(result.probabilities.count, 3)
+        XCTAssertTrue(result.probabilities.allSatisfy { $0.topLogProbabilities.isEmpty })
+        XCTAssertEqual(session.generateParameters.logProbabilities, 3)
+    }
+
+    @MainActor
+    func testTokenObservationStopsAfterCancellationAndReleasesTheCache() async throws {
+        let session = ChatSession(
+            model(), generateParameters: GenerateParameters(maxTokens: 1000, temperature: 0),
+            components: GenerationComponents { ForceTokenProcessor(token: 1) })
+        let (observations, continuation) = AsyncStream<Void>.makeStream()
+        var count = 0
+        let task = Task {
+            for try await event in session.streamDetails(to: "test", logProbabilities: 1) {
+                if case .probability = event {
+                    count += 1
+                    continuation.yield(())
+                }
+            }
+        }
+        var iterator = observations.makeAsyncIterator()
+        let first = await iterator.next()
+        XCTAssertNotNil(first)
+        task.cancel()
+        _ = await task.result
+        continuation.finish()
+        session.generateParameters.maxTokens = 1
+        var completion: GenerateCompletionInfo?
+        for try await event in session.streamDetails(to: "again") {
+            if let info = event.info { completion = info }
+        }
+        XCTAssertEqual(completion?.generationTokenCount, 1)
+        XCTAssertGreaterThan(count, 0)
+        XCTAssertLessThan(count, 1000)
+    }
+
+    func testTokenObservationRejectsActiveSpeculationButAllowsMemoryFallback() async throws {
+        for fallback in [false, true] {
+            let session = ChatSession(
+                model(),
+                speculativeDecoding: SpeculativeDecodingConfig(
+                    draftModel: ModelContainer(context: model()), numDraftTokens: 2,
+                    memoryPolicy: fallback
+                        ? SpeculativeDecodingMemoryPolicy(limitBytes: 0, action: .fallbackToDefault)
+                        : nil),
+                generateParameters: GenerateParameters(maxTokens: 3, temperature: 0),
+                components: GenerationComponents { ForceTokenProcessor(token: 1) })
+            let warm = try await collectGeneration(session.streamDetails(to: "warm"))
+            XCTAssertEqual(warm.info.generationTokenCount, 3)
+            do {
+                let result = try await collectObservedGeneration(
+                    session.streamDetails(to: "test", logProbabilities: 1))
+                XCTAssertTrue(fallback)
+                XCTAssertEqual(result.probabilities.count, result.info.generationTokenCount)
+                XCTAssertEqual(result.probabilities.count, 3)
+            } catch ChatSession.LogProbabilityError.unsupportedSpeculativeDecoding {
+                XCTAssertFalse(fallback)
+            }
+            let resumed = try await collectGeneration(session.streamDetails(to: "resume"))
+            XCTAssertEqual(resumed.info.generationTokenCount, 3)
+        }
+    }
+
+    func testTokenObservationPreservesRejectionAndPreventsPartialToolDispatch() async throws {
+        for automatic in [false, true] {
+            let dispatched = CallCounter()
+            let dispatch: @Sendable (ToolCall) async throws -> String = { _ in
+                dispatched.increment()
+                return "unexpected"
+            }
+            let session = rejectionSession(
+                output: #"<tool_call>{"name":"allowed","arguments":{}}</tool_call><tool_call>{"#,
+                tools: [["function": ["name": "allowed"] as [String: any Sendable]]],
+                toolDispatch: automatic ? dispatch : nil)
+            var rejection: RejectedToolCall?
+            var completion: GenerateCompletionInfo?
+            var tokenCount = 0
+            do {
+                for try await event in session.streamDetails(to: "test", logProbabilities: 0) {
+                    switch event {
+                    case .probability: tokenCount += 1
+                    case .generation(let generation):
+                        if let value = generation.rejectedToolCall { rejection = value }
+                        if let value = generation.info { completion = value }
+                    }
+                }
+                XCTAssertFalse(automatic)
+            } catch let error as RejectedToolCallError {
+                XCTAssertTrue(automatic)
+                XCTAssertEqual(error.rejection.reason, .incompleteOutput)
+            }
+            XCTAssertEqual(rejection?.reason, .incompleteOutput)
+            XCTAssertEqual(completion?.rejectedToolCallCount, 1)
+            XCTAssertEqual(tokenCount, completion?.generationTokenCount)
+            XCTAssertEqual(dispatched.value, 0)
+        }
+    }
+
     func testChatSessionSync() async throws {
         let model = model()
         let session = ChatSession(model, generateParameters: generationParameters)

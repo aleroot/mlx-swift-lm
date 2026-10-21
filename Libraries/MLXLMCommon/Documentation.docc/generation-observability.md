@@ -2,6 +2,42 @@
 
 Compose a token handler to observe generation without changing ordinary text or tool-call events.
 
+## Cached chat sessions
+
+Observe a ``ChatSession`` response while retaining its transcript and KV cache.
+The `streamDetails` overload with `logProbabilities` returns
+``LogProbabilityGeneration`` events in generation order:
+
+```swift
+let session = ChatSession(modelContainer)
+for try await event in session.streamDetails(to: "Explain gravity.", logProbabilities: 5) {
+    switch event {
+    case .generation(let generation):
+        if let text = generation.chunk { print(text, terminator: "") }
+    case .probability(let values):
+        print(values.chosen.token, values.chosen.logProbability)
+    }
+}
+```
+
+The argument is the number of top candidates; `0` reports only the chosen token.
+It overrides the session's reporting setting for this call. It does not change
+`generateParameters` or later calls, including calls on forks.
+
+Probability events precede the token's decoded events. They include reasoning and
+tool syntax and omit excluded stop tokens and unused lookahead. A wrapped
+completion event ends each pass before automatic tool dispatch starts the next
+pass, so observations can be grouped without a separate callback channel.
+
+The ordinary `streamDetails` overload, `respond`, and `streamResponse` retain their
+output and handler. Leave `GenerateParameters.logProbabilities` as `nil` when
+unused to avoid probability computation and readback.
+
+Active speculative decoding throws
+``ChatSession/LogProbabilityError/unsupportedSpeculativeDecoding`` for this
+overload. A configuration that falls back to standard decoding can still report
+probabilities. Observation does not silently change the decoding strategy.
+
 ## Overview
 
 ``Generation`` and ``TokenGeneration`` keep their existing cases. For token-level
