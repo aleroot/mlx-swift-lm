@@ -234,12 +234,11 @@ public class ChatSessionToolRoundTripTests: XCTestCase {
         var completions = 0
         var reply = ""
         for try await event in session.streamDetails(
-            to: "What's the weather in Paris?", logProbabilities: 2)
+            to: "What's the weather in Paris?",
+            observing: .init(logProbabilities: .init(topCount: 2)))
         {
-            switch event {
-            case .probability:
-                passTokens += 1
-            case .generation(let generation):
+            if event.logProbabilities != nil { passTokens += 1 }
+            if let generation = event.generation {
                 if let chunk = generation.chunk { reply += chunk }
                 if let info = generation.info {
                     XCTAssertEqual(passTokens, info.generationTokenCount)

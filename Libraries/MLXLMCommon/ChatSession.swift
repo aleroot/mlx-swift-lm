@@ -209,10 +209,15 @@ public final class ChatSession {
         }
     }
 
+    private struct StreamObservation<Output: Sendable>: Sendable {
+        let options: GenerationObservationOptions
+        let transform: @Sendable (GenerationEvent) -> Output?
+    }
+
     private struct GenerationRun {
         enum Events {
             case details(AsyncStream<Generation>)
-            case probabilities(AsyncStream<LogProbabilityGeneration<Generation>>)
+            case observed(AsyncStream<LogProbabilityGeneration<Generation>>)
         }
 
         let events: Events
@@ -224,7 +229,7 @@ public final class ChatSession {
         }
 
         init(_ pair: (AsyncStream<LogProbabilityGeneration<Generation>>, Task<[Int], Never>)) {
-            events = .probabilities(pair.0)
+            events = .observed(pair.0)
             task = pair.1
         }
     }
@@ -951,8 +956,8 @@ public final class ChatSession {
         }
     }
 
-    /// Errors from the token log-probability stream.
-    public enum LogProbabilityError: LocalizedError {
+    /// Errors from a generation observation request.
+    public enum ObservationError: LocalizedError {
         /// The selected speculative iterator cannot report token log probabilities.
         case unsupportedSpeculativeDecoding
 
@@ -964,41 +969,40 @@ public final class ChatSession {
         }
     }
 
-    /// Stream details and token log probabilities from this response in generation order.
+    /// Stream generation details and the requested observations in generation order.
     ///
-    /// `logProbabilities` is the number of top candidates; `0` reports only the chosen
-    /// token. It overrides the session's reporting setting for this call, including
-    /// automatic tool restarts. Excluded stop tokens and lookahead are omitted.
-    /// Each pass ends with a wrapped completion event before the next pass starts.
-    /// Active speculative decoding throws
-    /// ``LogProbabilityError/unsupportedSpeculativeDecoding``.
+    /// `observing` selects observations for this call, including automatic tool
+    /// restarts. It does not change the session's generation parameters.
+    /// Excluded stop tokens and lookahead are omitted. Each pass ends with a
+    /// completion event before the next pass starts. Requesting log probabilities
+    /// with active speculative decoding throws
+    /// ``ObservationError/unsupportedSpeculativeDecoding``.
     public func streamDetails(
         to prompt: String,
         role: Chat.Message.Role = .user,
         images: consuming [UserInput.Image] = [],
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = [],
-        logProbabilities: Int
-    ) -> AsyncThrowingStream<LogProbabilityGeneration<Generation>, Error> {
+        observing options: GenerationObservationOptions
+    ) -> AsyncThrowingStream<GenerationEvent, Error> {
         streamMap(
             to: prompt, role: role, images: images, videos: videos, audios: audios,
-            logProbabilities: logProbabilities,
-            transformProbability: { .probability($0) }
-        ) { .generation($0) }
+            observation: StreamObservation(options: options, transform: { $0 })
+        ) { GenerationEvent(generation: $0) }
     }
 
-    /// Stream details and token log probabilities after appending structured messages.
+    /// Stream generation details and observations after appending structured messages.
     ///
     /// Reporting has the same behavior as the prompt overload and applies only to
     /// this call. The session retains its transcript and KV cache.
     public func streamDetails(
         to messages: consuming [Chat.Message],
-        logProbabilities: Int
-    ) -> AsyncThrowingStream<LogProbabilityGeneration<Generation>, Error> {
+        observing options: GenerationObservationOptions
+    ) -> AsyncThrowingStream<GenerationEvent, Error> {
         streamMap(
-            messages: messages, logProbabilities: logProbabilities,
-            transformProbability: { .probability($0) }
-        ) { .generation($0) }
+            messages: messages,
+            observation: StreamObservation(options: options, transform: { $0 })
+        ) { GenerationEvent(generation: $0) }
     }
 
     /// Produces a streaming response to a prompt by transforming the
@@ -1017,8 +1021,7 @@ public final class ChatSession {
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = [],
         failOnRejectedToolCall: Bool = false,
-        logProbabilities: Int? = nil,
-        transformProbability: (@Sendable (GenerateTokenLogProbabilities) -> R)? = nil,
+        observation: StreamObservation<R>? = nil,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         streamMap(
@@ -1026,8 +1029,7 @@ public final class ChatSession {
                 .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
             ],
             failOnRejectedToolCall: failOnRejectedToolCall,
-            logProbabilities: logProbabilities,
-            transformProbability: transformProbability,
+            observation: observation,
             transform: transform
         )
     }
@@ -1035,8 +1037,7 @@ public final class ChatSession {
     private func streamMap<R: Sendable>(
         messages: consuming [Chat.Message],
         failOnRejectedToolCall: Bool = false,
-        logProbabilities: Int? = nil,
-        transformProbability: (@Sendable (GenerateTokenLogProbabilities) -> R)? = nil,
+        observation: StreamObservation<R>? = nil,
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
@@ -1046,7 +1047,9 @@ public final class ChatSession {
         let inputMessages = SendableBox<[Chat.Message]>(messages)
 
         var parameters = generateParameters
-        if let logProbabilities { parameters.logProbabilities = logProbabilities }
+        if let observation {
+            parameters.logProbabilities = observation.options.logProbabilities?.topCount
+        }
 
         let task = Task {
             [
@@ -1408,7 +1411,7 @@ public final class ChatSession {
                                 parameters: generateParameters, components: components)
                             lmState = iterator.state
 
-                            if logProbabilities != nil {
+                            if observation?.options.logProbabilities != nil {
                                 return GenerationRun(
                                     MLXLMCommon.generateTaskRecordingTokens(
                                         promptTokenCount: input.text.tokens.size,
@@ -1499,8 +1502,8 @@ public final class ChatSession {
 
                                     generation = try defaultGeneration()
                                 } else {
-                                    if logProbabilities != nil {
-                                        throw LogProbabilityError.unsupportedSpeculativeDecoding
+                                    if observation?.options.logProbabilities != nil {
+                                        throw ObservationError.unsupportedSpeculativeDecoding
                                     }
 
                                     if cachedDraftContainer == nil {
@@ -1602,13 +1605,15 @@ public final class ChatSession {
                             for await item in events {
                                 if !consume(item) { break }
                             }
-                        case .probabilities(let events):
+                        case .observed(let events):
                             observed: for await event in events {
                                 switch event {
                                 case .generation(let item):
                                     if !consume(item) { break observed }
                                 case .probability(let values):
-                                    if let value = transformProbability?(values), !emit(value) {
+                                    if let value = observation?.transform(
+                                        GenerationEvent(logProbabilities: values)), !emit(value)
+                                    {
                                         break observed
                                     }
                                 }

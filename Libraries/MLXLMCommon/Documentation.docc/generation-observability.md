@@ -5,37 +5,44 @@ Compose a token handler to observe generation without changing ordinary text or 
 ## Cached chat sessions
 
 Observe a ``ChatSession`` response while retaining its transcript and KV cache.
-The `streamDetails` overload with `logProbabilities` returns
-``LogProbabilityGeneration`` events in generation order:
+The `streamDetails` overload with `observing` accepts
+``GenerationObservationOptions`` and returns ``GenerationEvent`` values in
+generation order:
 
 ```swift
 let session = ChatSession(modelContainer)
-for try await event in session.streamDetails(to: "Explain gravity.", logProbabilities: 5) {
-    switch event {
-    case .generation(let generation):
-        if let text = generation.chunk { print(text, terminator: "") }
-    case .probability(let values):
+let observations = GenerationObservationOptions(logProbabilities: .init(topCount: 5))
+for try await event in session.streamDetails(to: "Explain gravity.", observing: observations) {
+    if let generation = event.generation, let text = generation.chunk {
+        print(text, terminator: "")
+    }
+    if let values = event.logProbabilities {
         print(values.chosen.token, values.chosen.logProbability)
     }
 }
 ```
 
-The argument is the number of top candidates; `0` reports only the chosen token.
-It overrides the session's reporting setting for this call. It does not change
-`generateParameters` or later calls, including calls on forks.
+`topCount` is the number of top candidates; `0` reports only the chosen token.
+The options override the session's reporting setting for this call, including
+automatic tool restarts. They do not change `generateParameters` or later calls,
+including calls on forks. Empty options return generation events without
+computing or reading back probabilities, even if the session enables reporting.
+
+Each event carries one typed payload. Access the properties you need. The request
+options and event properties can grow without adding method parameters or changing
+the existing ``Generation`` enum. These options do not enable layer activations.
 
 Probability events precede the token's decoded events. They include reasoning and
-tool syntax and omit excluded stop tokens and unused lookahead. A wrapped
-completion event ends each pass before automatic tool dispatch starts the next
-pass, so observations can be grouped without a separate callback channel.
+tool syntax and omit excluded stop tokens and unused lookahead. A completion
+event ends each pass before automatic tool dispatch starts the next pass, so
+observations can be grouped without a separate callback channel.
 
 The ordinary `streamDetails` overload, `respond`, and `streamResponse` retain their
 output and handler. Leave `GenerateParameters.logProbabilities` as `nil` when
 unused to avoid probability computation and readback.
 
-Active speculative decoding throws
-``ChatSession/LogProbabilityError/unsupportedSpeculativeDecoding`` for this
-overload. A configuration that falls back to standard decoding can still report
+Requesting log probabilities with active speculative decoding throws
+``ChatSession/ObservationError/unsupportedSpeculativeDecoding``. A configuration that falls back to standard decoding can still report
 probabilities. Observation does not silently change the decoding strategy.
 
 ## Overview
