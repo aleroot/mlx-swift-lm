@@ -233,9 +233,9 @@ public class ChatSessionToolRoundTripTests: XCTestCase {
         var passTokens = 0
         var completions = 0
         var reply = ""
-        for try await event in session.streamDetails(
+        for try await event in session.observe(
             to: "What's the weather in Paris?",
-            observing: .init(logProbabilities: .init(topCount: 2)))
+            using: .logProbabilities(topCount: 2))
         {
             if event.logProbabilities != nil { passTokens += 1 }
             if let generation = event.generation {
@@ -252,6 +252,48 @@ public class ChatSessionToolRoundTripTests: XCTestCase {
         XCTAssertEqual(dispatched.all.count, 1)
         XCTAssertEqual(completions, 2)
         XCTAssertEqual(passTokens, 0)
+    }
+
+    func testCustomTransformerGetsFreshHandlerForEachAutomaticToolPass() async throws {
+        let dispatched = DispatchLog()
+        let context = Self.makeContext(
+            tokenizer: ScriptedToolCallTokenizer(), messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            context, generateParameters: GenerateParameters(maxTokens: 24, temperature: 0),
+            tools: [Self.weatherTool],
+            toolDispatch: { call in
+                dispatched.record(call)
+                return #"{"forecast": "sunny"}"#
+            })
+        let factories = TransformerFactoryCount()
+        var tokens = 0
+        var completions = 0
+        var reply = ""
+        for try await event in session.observe(
+            to: "What's the weather in Paris?",
+            using: TokenCountingTransformer(factories: factories))
+        {
+            switch event {
+            case .token(let index):
+                tokens += 1
+                XCTAssertEqual(index, tokens)
+            case .output(let generation, let count):
+                XCTAssertNil(generation.toolCall)
+                if let chunk = generation.chunk { reply += chunk }
+                if let info = generation.info {
+                    XCTAssertEqual(tokens, count)
+                    XCTAssertEqual(tokens, info.generationTokenCount)
+                    XCTAssertGreaterThan(tokens, 0)
+                    tokens = 0
+                    completions += 1
+                }
+            }
+        }
+        XCTAssertFalse(reply.isEmpty)
+        XCTAssertEqual(dispatched.all.count, 1)
+        XCTAssertEqual(factories.value, 2)
+        XCTAssertEqual(completions, 2)
+        XCTAssertEqual(tokens, 0)
     }
 
     func testGenerationPolicyControlsValidationBeforeAutomaticDispatch() async throws {

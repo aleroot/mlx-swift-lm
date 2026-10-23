@@ -5,14 +5,12 @@ Compose a token handler to observe generation without changing ordinary text or 
 ## Cached chat sessions
 
 Observe a ``ChatSession`` response while retaining its transcript and KV cache.
-The `streamDetails` overload with `observing` accepts
-``GenerationObservationOptions`` and returns ``GenerationEvent`` values in
-generation order:
+The `observe` method accepts a ``GenerationTransformer`` that configures
+this request and wraps a fresh text/tool handler for every generation pass:
 
 ```swift
 let session = ChatSession(modelContainer)
-let observations = GenerationObservationOptions(logProbabilities: .init(topCount: 5))
-for try await event in session.streamDetails(to: "Explain gravity.", observing: observations) {
+for try await event in session.observe(to: "Explain gravity.", using: .logProbabilities(topCount: 5)) {
     if let generation = event.generation, let text = generation.chunk {
         print(text, terminator: "")
     }
@@ -23,14 +21,25 @@ for try await event in session.streamDetails(to: "Explain gravity.", observing: 
 ```
 
 `topCount` is the number of top candidates; `0` reports only the chosen token.
-The options override the session's reporting setting for this call, including
-automatic tool restarts. They do not change `generateParameters` or later calls,
-including calls on forks. Empty options return generation events without
-computing or reading back probabilities, even if the session enables reporting.
+``LogProbabilityGenerationTransformer`` configures a copy of the session's
+parameters. This applies to the entire request, including automatic tool restarts,
+without changing `generateParameters`, later calls, or forks.
 
-Each event carries one typed payload. Access the properties you need. The request
-options and event properties can grow without adding method parameters or changing
-the existing ``Generation`` enum. These options do not enable layer activations.
+## Custom transformers
+
+A transformer's ``GenerationTransformer/configure(_:)`` enables the computation
+its handler needs. Its ``GenerationTransformer/makeHandler(wrapping:)`` creates
+fresh decoding state for each pass. The output can be any
+``GenerationProviding`` type, including custom events unrelated to probabilities.
+Observation-only events return `nil` from ``GenerationProviding/generation``.
+``TextGenerationTransformer`` passes through the standard handler and parameters.
+
+Wrap the supplied ``TextToolTokenLoopHandler`` and forward each base event exactly
+once, in order. Preserve its stop-token properties, dispositions, final output,
+and completion metadata. The session uses those events to update its transcript
+and cache and dispatch tools. Automatically dispatched tool-call events are
+consumed by the session; other transformed events reach the caller unchanged.
+Cached-prompt counts are attached before the transformer sees completion events.
 
 Probability events precede the token's decoded events. They include reasoning and
 tool syntax and omit excluded stop tokens and unused lookahead. A completion
@@ -38,7 +47,7 @@ event ends each pass before automatic tool dispatch starts the next pass, so
 observations can be grouped without a separate callback channel.
 
 The ordinary `streamDetails` overload, `respond`, and `streamResponse` retain their
-output and handler. Leave `GenerateParameters.logProbabilities` as `nil` when
+output and handler through the text transformer. Leave `GenerateParameters.logProbabilities` as `nil` when
 unused to avoid probability computation and readback.
 
 Requesting log probabilities with active speculative decoding throws

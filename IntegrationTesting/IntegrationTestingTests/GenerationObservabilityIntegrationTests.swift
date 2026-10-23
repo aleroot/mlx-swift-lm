@@ -103,8 +103,8 @@ struct GenerationObservabilityIntegrationTests {
             var probabilities: [GenerateTokenLogProbabilities] = []
             var actual = ""
             var actualInfo: GenerateCompletionInfo?
-            for try await event in observed.streamDetails(
-                to: prompt, observing: .init(logProbabilities: .init(topCount: 4)))
+            for try await event in observed.observe(
+                to: prompt, using: .logProbabilities(topCount: 4))
             {
                 if let value = event.logProbabilities { probabilities.append(value) }
                 if let generation = event.generation {

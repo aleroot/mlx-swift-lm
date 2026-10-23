@@ -595,7 +595,7 @@ public class ChatSessionTests: XCTestCase {
     }
 
     private func collectObservedGeneration(
-        _ stream: AsyncThrowingStream<GenerationEvent, Error>
+        _ stream: AsyncThrowingStream<LogProbabilityGeneration<Generation>, Error>
     ) async throws -> (
         text: String, info: GenerateCompletionInfo, probabilities: [GenerateTokenLogProbabilities]
     ) {
@@ -629,8 +629,8 @@ public class ChatSessionTests: XCTestCase {
         for prompt in ["first", "second"] {
             let expected = try await collectGeneration(plain.streamDetails(to: prompt))
             let actual = try await collectObservedGeneration(
-                observed.streamDetails(
-                    to: prompt, observing: .init(logProbabilities: .init(topCount: 4))))
+                observed.observe(
+                    to: prompt, using: .logProbabilities(topCount: 4)))
             XCTAssertEqual(actual.text, expected.text)
             XCTAssertEqual(actual.info.generationTokenCount, expected.info.generationTokenCount)
             XCTAssertEqual(actual.info.cachedPromptTokenCount, expected.info.cachedPromptTokenCount)
@@ -654,10 +654,11 @@ public class ChatSessionTests: XCTestCase {
             session.generateParameters.maxTokens = limit
             let stream =
                 limit.isMultiple(of: 2)
-                ? session.streamDetails(
-                    to: [.user("test")], observing: .init(logProbabilities: .init(topCount: 0)))
-                : session.streamDetails(
-                    to: "test", observing: .init(logProbabilities: .init(topCount: 0)))
+                ? session.observe(
+                    to: [.user("test")],
+                    using: .logProbabilities(topCount: 0))
+                : session.observe(
+                    to: "test", using: .logProbabilities(topCount: 0))
             let result = try await collectObservedGeneration(stream)
             XCTAssertEqual(result.text, String("abc".prefix(min(limit, 3))))
             XCTAssertEqual(result.probabilities.count, result.info.generationTokenCount)
@@ -674,48 +675,48 @@ public class ChatSessionTests: XCTestCase {
         let session = rejectionSession(output: "abc")
         session.generateParameters.logProbabilities = 3
         let result = try await collectObservedGeneration(
-            session.streamDetails(
-                to: "test", observing: .init(logProbabilities: .init(topCount: 0))))
+            session.observe(
+                to: "test", using: .logProbabilities(topCount: 0)))
         XCTAssertEqual(result.text, "abc")
         XCTAssertEqual(result.probabilities.count, 3)
         XCTAssertTrue(result.probabilities.allSatisfy { $0.topLogProbabilities.isEmpty })
         XCTAssertEqual(session.generateParameters.logProbabilities, 3)
     }
 
-    func testEmptyObservationOptionsDisableReportingForBothEntryPoints() async throws {
+    func testTextTransformerPreservesReportingForBothEntryPoints() async throws {
         let session = rejectionSession(output: "abc")
         session.generateParameters.logProbabilities = 3
         let validations = CallCounter()
         session.components.parameterValidator = { parameters in
-            XCTAssertNil(parameters.logProbabilities)
+            XCTAssertEqual(parameters.logProbabilities, 3)
             validations.increment()
         }
         for structured in [false, true] {
             let stream =
                 structured
-                ? session.streamDetails(to: [.user("test")], observing: .init())
-                : session.streamDetails(to: "test", observing: .init())
-            let result = try await collectObservedGeneration(stream)
+                ? session.observe(
+                    to: [.user("test")], using: .text)
+                : session.observe(to: "test", using: .text)
+            let result = try await collectGeneration(stream)
             XCTAssertEqual(result.text, "abc")
             XCTAssertEqual(result.info.generationTokenCount, 3)
-            XCTAssertTrue(result.probabilities.isEmpty)
             XCTAssertEqual(session.generateParameters.logProbabilities, 3)
         }
         XCTAssertEqual(validations.value, 2)
         session.components.parameterValidator = nil
         let observed = try await collectObservedGeneration(
-            session.streamDetails(to: "test", observing: .init(logProbabilities: .init())))
+            session.observe(to: "test", using: .logProbabilities()))
         XCTAssertEqual(observed.probabilities.count, 3)
     }
 
-    func testObservationOptionsAreCapturedForEachRequest() async throws {
+    func testTransformersAreCapturedForEachRequest() async throws {
         let session = rejectionSession(output: "abc")
-        var options = GenerationObservationOptions(logProbabilities: .init())
-        let stream = session.streamDetails(to: "first", observing: options)
-        options.logProbabilities?.topCount = 2
+        var transformer = LogProbabilityGenerationTransformer()
+        let stream = session.observe(to: "first", using: transformer)
+        transformer.topCount = 2
         let first = try await collectObservedGeneration(stream)
         let second = try await collectObservedGeneration(
-            session.streamDetails(to: "second", observing: options))
+            session.observe(to: "second", using: transformer))
         XCTAssertEqual(first.probabilities.count, 3)
         XCTAssertEqual(second.probabilities.count, 3)
         XCTAssertTrue(first.probabilities.allSatisfy { $0.topLogProbabilities.isEmpty })
@@ -723,7 +724,22 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertNil(session.generateParameters.logProbabilities)
     }
 
-    func testEmptyObservationOptionsAllowActiveSpeculation() async throws {
+    func testOrdinarySpeculationDoesNotRequireUnusedLogProbabilities() async throws {
+        let session = ChatSession(
+            model(),
+            speculativeDecoding: SpeculativeDecodingConfig(
+                draftModel: ModelContainer(context: model()), numDraftTokens: 2),
+            generateParameters: GenerateParameters(
+                maxTokens: 3, temperature: 0, logProbabilities: 2),
+            components: GenerationComponents { ForceTokenProcessor(token: 1) })
+        for prompt in ["first", "second"] {
+            let result = try await collectGeneration(session.streamDetails(to: prompt))
+            XCTAssertEqual(result.info.generationTokenCount, 3)
+        }
+        XCTAssertEqual(session.generateParameters.logProbabilities, 2)
+    }
+
+    func testTextTransformerAllowsActiveSpeculation() async throws {
         let session = ChatSession(
             model(),
             speculativeDecoding: SpeculativeDecodingConfig(
@@ -731,10 +747,66 @@ public class ChatSessionTests: XCTestCase {
             generateParameters: GenerateParameters(maxTokens: 3, temperature: 0),
             components: GenerationComponents { ForceTokenProcessor(token: 1) })
         _ = try await collectGeneration(session.streamDetails(to: "warm"))
-        let result = try await collectObservedGeneration(
-            session.streamDetails(to: "test", observing: .init()))
+        let result = try await collectGeneration(
+            session.observe(to: "test", using: .text))
         XCTAssertEqual(result.info.generationTokenCount, 3)
-        XCTAssertTrue(result.probabilities.isEmpty)
+    }
+
+    func testCustomTransformerConfiguresOnlyItsRequestAndPreservesCustomOutput() async throws {
+        let session = rejectionSession(output: "abc")
+        session.generateParameters.maxTokens = 10
+        let factories = TransformerFactoryCount()
+        for structured in [false, true] {
+            let transformer = TokenCountingTransformer(factories: factories, maxTokens: 2)
+            let stream =
+                structured
+                ? session.observe(to: [.user("test")], using: transformer)
+                : session.observe(to: "test", using: transformer)
+            var indices: [Int] = []
+            var text = ""
+            var completion: GenerateCompletionInfo?
+            for try await event in stream {
+                switch event {
+                case .token(let index): indices.append(index)
+                case .output(let generation, let count):
+                    if let chunk = generation.chunk { text += chunk }
+                    if let info = generation.info {
+                        completion = info
+                        XCTAssertEqual(count, 2)
+                    }
+                }
+            }
+            XCTAssertEqual(indices, [1, 2])
+            XCTAssertEqual(text, "ab")
+            XCTAssertEqual(completion?.generationTokenCount, 2)
+            XCTAssertEqual(session.generateParameters.maxTokens, 10)
+        }
+        XCTAssertEqual(factories.value, 2)
+        let ordinary = try await collectGeneration(session.streamDetails(to: "ordinary"))
+        XCTAssertEqual(ordinary.text, "abc")
+    }
+
+    func testCustomTransformerWorksWithActiveSpeculation() async throws {
+        let session = ChatSession(
+            model(),
+            speculativeDecoding: SpeculativeDecodingConfig(
+                draftModel: ModelContainer(context: model()), numDraftTokens: 2),
+            generateParameters: GenerateParameters(maxTokens: 3, temperature: 0),
+            components: GenerationComponents { ForceTokenProcessor(token: 1) })
+        let factories = TransformerFactoryCount()
+        for prompt in ["first", "second"] {
+            var indices: [Int] = []
+            var completion: GenerateCompletionInfo?
+            for try await event in session.observe(
+                to: prompt, using: TokenCountingTransformer(factories: factories))
+            {
+                if case .token(let index) = event { indices.append(index) }
+                if let info = event.generation?.info { completion = info }
+            }
+            XCTAssertEqual(indices, [1, 2, 3])
+            XCTAssertEqual(completion?.generationTokenCount, 3)
+        }
+        XCTAssertEqual(factories.value, 2)
     }
 
     @MainActor
@@ -745,8 +817,8 @@ public class ChatSessionTests: XCTestCase {
         let (observations, continuation) = AsyncStream<Void>.makeStream()
         var count = 0
         let task = Task {
-            for try await event in session.streamDetails(
-                to: "test", observing: .init(logProbabilities: .init(topCount: 1)))
+            for try await event in session.observe(
+                to: "test", using: .logProbabilities(topCount: 1))
             {
                 if event.logProbabilities != nil {
                     count += 1
@@ -785,8 +857,8 @@ public class ChatSessionTests: XCTestCase {
             XCTAssertEqual(warm.info.generationTokenCount, 3)
             do {
                 let result = try await collectObservedGeneration(
-                    session.streamDetails(
-                        to: "test", observing: .init(logProbabilities: .init(topCount: 1))))
+                    session.observe(
+                        to: "test", using: .logProbabilities(topCount: 1)))
                 XCTAssertTrue(fallback)
                 XCTAssertEqual(result.probabilities.count, result.info.generationTokenCount)
                 XCTAssertEqual(result.probabilities.count, 3)
@@ -813,8 +885,8 @@ public class ChatSessionTests: XCTestCase {
             var completion: GenerateCompletionInfo?
             var tokenCount = 0
             do {
-                for try await event in session.streamDetails(
-                    to: "test", observing: .init(logProbabilities: .init(topCount: 0)))
+                for try await event in session.observe(
+                    to: "test", using: .logProbabilities(topCount: 0))
                 {
                     if event.logProbabilities != nil { tokenCount += 1 }
                     if let generation = event.generation {

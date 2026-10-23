@@ -69,6 +69,7 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
     private static let logger = Logger(
         subsystem: "mlx-swift-lm", category: "TokenStreamProtocol")
     private var decoder: any TokenStreamDecoder
+    var cachedPromptTokenCount = 0
 
     public init(
         tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
@@ -117,7 +118,8 @@ public struct TextToolTokenLoopHandler: TokenLoopHandler {
         .info(
             info.withToolCallCounts(
                 rejected: decoder.rejectedToolCallCount,
-                recovered: decoder.recoveredToolCallCount))
+                recovered: decoder.recoveredToolCallCount)
+        ).attributingCachedPromptTokens(cachedPromptTokenCount)
     }
 
     private mutating func process(
